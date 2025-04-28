@@ -1,6 +1,6 @@
 package golem:embed@1.0.0;
 
-interface embed {
+world embed {
   // --- Enums ---
 
   enum task-type {
@@ -60,7 +60,7 @@ interface embed {
     model: option<string>,
     task-type: option<task-type>,
     dimensions: option<u32>,
-    truncation: option<boolean>,
+    truncation: option<bool>,
     output-format: option<output-format>,
     output-dtype: option<output-dtype>,
     user: option<string>,
@@ -76,7 +76,7 @@ interface embed {
 
   record embedding {
     index: u32,
-    vector: list<float32>,
+    vector: list<f32>,
   }
 
   record embedding-response {
@@ -90,7 +90,7 @@ interface embed {
 
   record rerank-result {
     index: u32,
-    relevance-score: float32,
+    relevance-score: f32,
     document: option<string>,
   }
 
@@ -111,12 +111,12 @@ interface embed {
 
   // --- Core Functions ---
 
-  generate: func(
+  export generate: func(
     inputs: list<content-part>,
     config: config
   ) -> result<embedding-response, error>;
 
-  rerank: func(
+  export rerank: func(
     query: string,
     documents: list<string>,
     config: config

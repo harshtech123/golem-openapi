@@ -6,15 +6,15 @@ fn main() {
     );
 
     // 1) Generate the `embed` WIT bindings (async)
-    wit_bindgen_preview2::generate!({
+    wit_bindgen::generate!({
         path: "wit/embed.wit",
         world: "embed",
         async: true,
     });
 
     // 2) Import the host durability interface
-    wit_bindgen_preview2::import!({
-        path: "../wit/deps/golem-durability/golem-durability.wit",
+    wit_bindgen::generate!({
+        path: "../wit/deps/golem-durability/golem-durability-1.2.wit",
         world: "durability",
     });
 }
