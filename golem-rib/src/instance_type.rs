@@ -68,12 +68,6 @@ pub enum InstanceType {
     },
 }
 
-// impl Debug for InstanceType {
-//     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-//
-//     }
-// }
-
 impl InstanceType {
     pub fn set_worker_name(&mut self, worker_name: Expr) {
         match self {
@@ -368,13 +362,17 @@ impl InstanceType {
             }),
             Some(type_parameter) => match type_parameter {
                 TypeParameter::Interface(interface_name) => {
-                    let function_dict = FunctionDictionary {
-                        name_and_types: function_dict
-                            .name_and_types
-                            .into_iter()
-                            .filter(|(f, _)| f.interface_name() == Some(interface_name.clone()))
-                            .collect::<Vec<_>>(),
-                    };
+                    let name_and_types = function_dict
+                        .name_and_types
+                        .into_iter()
+                        .filter(|(f, _)| f.interface_name() == Some(interface_name.clone()))
+                        .collect::<Vec<_>>();
+
+                    if name_and_types.is_empty() {
+                        return Err(format!("interface `{}` not found", interface_name));
+                    }
+
+                    let function_dict = FunctionDictionary { name_and_types };
 
                     Ok(InstanceType::Interface {
                         worker_name: worker_name.cloned().map(Box::new),
@@ -383,13 +381,17 @@ impl InstanceType {
                     })
                 }
                 TypeParameter::PackageName(package_name) => {
-                    let function_dict = FunctionDictionary {
-                        name_and_types: function_dict
-                            .name_and_types
-                            .into_iter()
-                            .filter(|(f, _)| f.package_name() == Some(package_name.clone()))
-                            .collect(),
-                    };
+                    let name_and_types = function_dict
+                        .name_and_types
+                        .into_iter()
+                        .filter(|(f, _)| f.package_name() == Some(package_name.clone()))
+                        .collect::<Vec<_>>();
+
+                    if name_and_types.is_empty() {
+                        return Err(format!("package `{}` not found", package_name));
+                    }
+
+                    let function_dict = FunctionDictionary { name_and_types };
 
                     Ok(InstanceType::Package {
                         worker_name: worker_name.cloned().map(Box::new),
@@ -398,17 +400,20 @@ impl InstanceType {
                     })
                 }
                 TypeParameter::FullyQualifiedInterface(fq_interface) => {
-                    let function_dict = FunctionDictionary {
-                        name_and_types: function_dict
-                            .name_and_types
-                            .into_iter()
-                            .filter(|(f, _)| {
-                                f.package_name() == Some(fq_interface.package_name.clone())
-                                    && f.interface_name()
-                                        == Some(fq_interface.interface_name.clone())
-                            })
-                            .collect(),
-                    };
+                    let name_and_types = function_dict
+                        .name_and_types
+                        .into_iter()
+                        .filter(|(f, _)| {
+                            f.package_name() == Some(fq_interface.package_name.clone())
+                                && f.interface_name() == Some(fq_interface.interface_name.clone())
+                        })
+                        .collect::<Vec<_>>();
+
+                    if name_and_types.is_empty() {
+                        return Err(format!("`{}` not found", fq_interface));
+                    }
+
+                    let function_dict = FunctionDictionary { name_and_types };
 
                     Ok(InstanceType::PackageInterface {
                         worker_name: worker_name.cloned().map(Box::new),
@@ -493,7 +498,7 @@ impl FunctionDictionary {
                         interface_name,
                         function_name,
                     } => {
-                        let type_parameter = TypeParameter::from_str(interface_name.as_str())?;
+                        let type_parameter = TypeParameter::from_text(interface_name.as_str())?;
 
                         let interface_name = type_parameter.get_interface_name();
                         let package_name = type_parameter.get_package_name();
@@ -629,17 +634,17 @@ pub struct FullyQualifiedResourceConstructor {
 
 #[derive(Debug, Hash, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FullyQualifiedFunctionName {
-    package_name: Option<PackageName>,
-    interface_name: Option<InterfaceName>,
-    function_name: String,
+    pub package_name: Option<PackageName>,
+    pub interface_name: Option<InterfaceName>,
+    pub function_name: String,
 }
 
 #[derive(Debug, Hash, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FullyQualifiedResourceMethod {
-    package_name: Option<PackageName>,
-    interface_name: Option<InterfaceName>,
-    resource_name: String,
-    method_name: String,
+    pub package_name: Option<PackageName>,
+    pub interface_name: Option<InterfaceName>,
+    pub resource_name: String,
+    pub method_name: String,
 }
 
 impl FullyQualifiedResourceMethod {
@@ -708,8 +713,8 @@ impl Display for FullyQualifiedFunctionName {
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FunctionType {
-    parameter_types: Vec<InferredType>,
-    return_type: Vec<InferredType>,
+    pub parameter_types: Vec<InferredType>,
+    pub return_type: Vec<InferredType>,
 }
 
 impl FunctionType {

@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -642,22 +642,33 @@ async fn test_api_def_with_request_path_only_1() {
     assert_eq!(result, expected);
 }
 
-// A test where the input path is a number, but the rib script refers to request.path.* as a string (which is by default)
+// A test where the input path, query and header values are numbers,
+// but the rib script requires these inputs to be string
 #[test]
 async fn test_api_def_with_request_path_only_2() {
-    let api_request = get_gateway_request("/foo/1", None, &HeaderMap::new(), Value::Null);
+    let mut header_map = HeaderMap::new();
+    header_map.insert("project-id", HeaderValue::from_static("4"));
 
-    // Anything under request.path is a string
+    let api_request = get_gateway_request("/foo/1/2?account-id=3", None, &header_map, Value::Null);
+
     let response_mapping = r#"
-       let id = request.path.user-id;
+       let user-id = request.path.user-id;
+       let cart-id: string = request.path.cart-id;
+       let account-id: string = request.query.account-id;
+       let project-id: string = request.headers.project-id;
+       let id = "${user-id}-${cart-id}-${account-id}-${project-id}";
        let worker-name = "shopping-cart-${id}";
        let worker-instance = instance(worker-name);
        let response = worker-instance.get-cart-contents(id, "b");
       response
     "#;
 
-    let api_specification: HttpApiDefinition =
-        get_api_def_with_worker_binding("/foo/{user-id}", None, response_mapping).await;
+    let api_specification: HttpApiDefinition = get_api_def_with_worker_binding(
+        "/foo/{user-id}/{cart-id}?{account-id}",
+        None,
+        response_mapping,
+    )
+    .await;
 
     let session_store: Arc<dyn GatewaySession + Sync + Send> = internal::get_session_store();
 
@@ -676,7 +687,7 @@ async fn test_api_def_with_request_path_only_2() {
     let expected = (
         "golem:it/api.{get-cart-contents}".to_string(),
         Value::Array(vec![
-            Value::String("1".to_string()),
+            Value::String("1-2-3-4".to_string()),
             Value::String("b".to_string()),
         ]),
     );

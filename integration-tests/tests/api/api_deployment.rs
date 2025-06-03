@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -228,6 +228,7 @@ async fn create_api_deployment_and_update_component(deps: &EnvBasedTestDependenc
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await
         .unwrap_err()
@@ -252,6 +253,7 @@ async fn create_api_deployment_and_update_component(deps: &EnvBasedTestDependenc
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -324,6 +326,7 @@ async fn create_multiple_api_deployments_and_update_component_1(deps: &EnvBasedT
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await
         .unwrap_err()
@@ -348,6 +351,7 @@ async fn create_multiple_api_deployments_and_update_component_1(deps: &EnvBasedT
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await
         .unwrap_err()
@@ -371,6 +375,7 @@ async fn create_multiple_api_deployments_and_update_component_1(deps: &EnvBasedT
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -452,6 +457,7 @@ async fn create_multiple_api_deployments_and_update_component_2(deps: &EnvBasedT
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await
         .unwrap_err()
@@ -475,6 +481,7 @@ async fn create_multiple_api_deployments_and_update_component_2(deps: &EnvBasedT
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -862,6 +869,7 @@ async fn undeploy_component_constraint_test(deps: &EnvBasedTestDependencies) {
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await
         .unwrap_err()
@@ -890,6 +898,7 @@ async fn undeploy_component_constraint_test(deps: &EnvBasedTestDependencies) {
             ComponentType::Durable,
             None,
             None,
+            &HashMap::new(),
         )
         .await;
 

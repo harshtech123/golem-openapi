@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -153,13 +153,13 @@ pub enum FunctionReferenceType {
 // This is more efficient than assigning index to every instruction and incrementing it
 // as we care about it only if we need to jump through instructions.
 // Jumping to an ID is simply draining the stack until we find a Label instruction with the same ID.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct InstructionId {
     pub index: usize,
 }
 
 impl InstructionId {
-    pub fn from(index: usize) -> Self {
+    pub fn new(index: usize) -> Self {
         InstructionId { index }
     }
 
@@ -405,13 +405,13 @@ mod protobuf {
                 Instruction::And(_) => Ok(RibIR::And),
                 Instruction::IsEmpty(_) => Ok(RibIR::IsEmpty),
                 Instruction::Or(_) => Ok(RibIR::Or),
-                Instruction::JumpIfFalse(value) => Ok(RibIR::JumpIfFalse(InstructionId::from(
+                Instruction::JumpIfFalse(value) => Ok(RibIR::JumpIfFalse(InstructionId::new(
                     value.instruction_id as usize,
                 ))),
-                Instruction::Jump(value) => Ok(RibIR::Jump(InstructionId::from(
+                Instruction::Jump(value) => Ok(RibIR::Jump(InstructionId::new(
                     value.instruction_id as usize,
                 ))),
-                Instruction::Label(value) => Ok(RibIR::Label(InstructionId::from(
+                Instruction::Label(value) => Ok(RibIR::Label(InstructionId::new(
                     value.instruction_id as usize,
                 ))),
                 Instruction::Deconstruct(_) => Ok(RibIR::Deconstruct),

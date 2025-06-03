@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,7 +46,9 @@ use golem_service_base::storage::blob::BlobStorage;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tempfile::TempDir;
 use tracing::{Instrument, Level};
+use uuid::Uuid;
 
 pub struct EnvBasedTestDependenciesConfig {
     pub worker_executor_cluster_size: usize,
@@ -60,6 +62,7 @@ pub struct EnvBasedTestDependenciesConfig {
     pub redis_key_prefix: String,
     pub golem_test_components: PathBuf,
     pub golem_client_protocol: GolemClientProtocol,
+    pub unique_network_id: String,
 }
 
 impl EnvBasedTestDependenciesConfig {
@@ -154,6 +157,7 @@ impl Default for EnvBasedTestDependenciesConfig {
             redis_key_prefix: "".to_string(),
             golem_test_components: Path::new("../test-components").to_path_buf(),
             golem_client_protocol: GolemClientProtocol::Grpc,
+            unique_network_id: Uuid::new_v4().to_string(),
         }
     }
 }
@@ -167,11 +171,12 @@ pub struct EnvBasedTestDependencies {
     shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
     component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
     component_compilation_service: Arc<dyn ComponentCompilationService + Send + Sync + 'static>,
-    worker_service: Arc<dyn WorkerService + Send + Sync + 'static>,
+    worker_service: Arc<dyn WorkerService + 'static>,
     worker_executor_cluster: Arc<dyn WorkerExecutorCluster + Send + Sync + 'static>,
     blob_storage: Arc<dyn BlobStorage + Send + Sync + 'static>,
     initial_component_files_service: Arc<InitialComponentFilesService>,
     plugin_wasm_files_service: Arc<PluginWasmFilesService>,
+    component_temp_directory: Arc<TempDir>,
 }
 
 impl Debug for EnvBasedTestDependencies {
@@ -189,7 +194,7 @@ impl EnvBasedTestDependencies {
                 let sqlite_path = Path::new("../target/golem_test_db");
                 Arc::new(SqliteRdb::new(sqlite_path))
             }
-            DbType::Postgres => Arc::new(DockerPostgresRdb::new().await),
+            DbType::Postgres => Arc::new(DockerPostgresRdb::new(&config.unique_network_id).await),
         }
     }
 
@@ -198,7 +203,7 @@ impl EnvBasedTestDependencies {
     ) -> Arc<dyn Redis + Send + Sync + 'static> {
         let prefix = config.redis_key_prefix.clone();
         if config.golem_docker_services {
-            Arc::new(DockerRedis::new(prefix).await)
+            Arc::new(DockerRedis::new(&config.unique_network_id, prefix).await)
         } else {
             let host = config.redis_host.clone();
             let port = config.redis_port;
@@ -234,6 +239,7 @@ impl EnvBasedTestDependencies {
         if config.golem_docker_services {
             Arc::new(
                 DockerShardManager::new(
+                    &config.unique_network_id,
                     redis,
                     config.number_of_shards_override,
                     config.default_verbosity(),
@@ -266,6 +272,7 @@ impl EnvBasedTestDependencies {
         if config.golem_docker_services {
             Arc::new(
                 DockerComponentService::new(
+                    &config.unique_network_id,
                     config.golem_test_components.clone(),
                     Some((
                         DockerComponentCompilationService::NAME,
@@ -306,6 +313,7 @@ impl EnvBasedTestDependencies {
         if config.golem_docker_services {
             Arc::new(
                 DockerComponentCompilationService::new(
+                    &config.unique_network_id,
                     component_service,
                     config.default_verbosity(),
                 )
@@ -333,10 +341,11 @@ impl EnvBasedTestDependencies {
         component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
         shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
         rdb: Arc<dyn Rdb + Send + Sync + 'static>,
-    ) -> Arc<dyn WorkerService + Send + Sync + 'static> {
+    ) -> Arc<dyn WorkerService + 'static> {
         if config.golem_docker_services {
             Arc::new(
                 DockerWorkerService::new(
+                    &config.unique_network_id,
                     component_service,
                     shard_manager,
                     rdb,
@@ -370,13 +379,14 @@ impl EnvBasedTestDependencies {
         config: Arc<EnvBasedTestDependenciesConfig>,
         component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
         shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
-        worker_service: Arc<dyn WorkerService + Send + Sync + 'static>,
+        worker_service: Arc<dyn WorkerService + 'static>,
         redis: Arc<dyn Redis + Send + Sync + 'static>,
     ) -> Arc<dyn WorkerExecutorCluster + Send + Sync + 'static> {
         if config.golem_docker_services {
             Arc::new(
                 DockerWorkerExecutorCluster::new(
                     config.worker_executor_cluster_size,
+                    &config.unique_network_id,
                     redis,
                     component_service,
                     shard_manager,
@@ -491,6 +501,9 @@ impl EnvBasedTestDependencies {
             blob_storage,
             initial_component_files_service,
             plugin_wasm_files_service,
+            component_temp_directory: Arc::new(
+                TempDir::new().expect("Failed to create temporary directory"),
+            ),
         }
     }
 }
@@ -505,6 +518,10 @@ impl TestDependencies for EnvBasedTestDependencies {
         self.redis.clone()
     }
 
+    fn blob_storage(&self) -> Arc<dyn BlobStorage + Send + Sync + 'static> {
+        self.blob_storage.clone()
+    }
+
     fn redis_monitor(&self) -> Arc<dyn RedisMonitor + Send + Sync + 'static> {
         self.redis_monitor.clone()
     }
@@ -517,6 +534,10 @@ impl TestDependencies for EnvBasedTestDependencies {
         &self.config.golem_test_components
     }
 
+    fn component_temp_directory(&self) -> &Path {
+        self.component_temp_directory.path()
+    }
+
     fn component_service(&self) -> Arc<dyn ComponentService> {
         self.component_service.clone()
     }
@@ -527,16 +548,12 @@ impl TestDependencies for EnvBasedTestDependencies {
         self.component_compilation_service.clone()
     }
 
-    fn worker_service(&self) -> Arc<dyn WorkerService + Send + Sync + 'static> {
+    fn worker_service(&self) -> Arc<dyn WorkerService + 'static> {
         self.worker_service.clone()
     }
 
     fn worker_executor_cluster(&self) -> Arc<dyn WorkerExecutorCluster + Send + Sync + 'static> {
         self.worker_executor_cluster.clone()
-    }
-
-    fn blob_storage(&self) -> Arc<dyn BlobStorage + Send + Sync + 'static> {
-        self.blob_storage.clone()
     }
 
     fn initial_component_files_service(&self) -> Arc<InitialComponentFilesService> {

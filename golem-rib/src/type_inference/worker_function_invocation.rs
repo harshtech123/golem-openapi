@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -48,13 +48,13 @@ pub fn infer_worker_function_invokes(expr: &mut Expr) -> Result<(), RibTypeError
                     let type_parameter = generic_type_parameter
                         .as_ref()
                         .map(|gtp| {
-                            TypeParameter::from_str(&gtp.value).map_err(|err| {
+                            TypeParameter::from_text(&gtp.value).map_err(|err| {
                                 FunctionCallError::invalid_generic_type_parameter(&gtp.value, err)
                             })
                         })
                         .transpose()?;
 
-                    let fqn =
+                    let function =
                         instance_type
                             .get_function(method, type_parameter)
                             .map_err(|err| {
@@ -73,7 +73,7 @@ pub fn infer_worker_function_invokes(expr: &mut Expr) -> Result<(), RibTypeError
                                 )
                             })?;
 
-                    match fqn.function_name {
+                    match function.function_name {
                         FunctionName::Function(function_name) => {
                             let dynamic_parsed_function_name = function_name.to_string();
                             let dynamic_parsed_function_name = DynamicParsedFunctionName::parse(
@@ -106,7 +106,6 @@ pub fn infer_worker_function_invokes(expr: &mut Expr) -> Result<(), RibTypeError
                             .with_source_span(source_span.clone());
                             *expr = new_call;
                         }
-                        // We are yet to be able to create a call_type
                         FunctionName::ResourceConstructor(fully_qualified_resource_constructor) => {
                             let resource_instance_type = instance_type.get_resource_instance_type(
                                 fully_qualified_resource_constructor.clone(),
@@ -160,8 +159,9 @@ pub fn infer_worker_function_invokes(expr: &mut Expr) -> Result<(), RibTypeError
                                                 inferred_type: inferred_type.clone(),
                                             },
                                             format!(
-                                                "Resource method {:?} not found in resource {}",
-                                                resource_method, resource_constructor
+                                                "Resource method {} not found in resource {}",
+                                                resource_method.method_name(),
+                                                resource_constructor
                                             ),
                                         ))?;
 

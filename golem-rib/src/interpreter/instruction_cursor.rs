@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +20,16 @@ pub struct RibByteCodeCursor {
 }
 
 impl RibByteCodeCursor {
+    pub fn position(&self) -> InstructionId {
+        InstructionId {
+            index: self.position,
+        }
+    }
+
+    pub fn last(&self) -> Option<&RibIR> {
+        self.byte_code.instructions.last()
+    }
+
     pub fn from_rib_byte_code(byte_code: RibByteCode) -> RibByteCodeCursor {
         RibByteCodeCursor {
             byte_code,

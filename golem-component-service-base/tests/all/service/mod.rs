@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -210,6 +210,7 @@ async fn test_services(component_service: &Arc<dyn ComponentService<DefaultCompo
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -224,6 +225,7 @@ async fn test_services(component_service: &Arc<dyn ComponentService<DefaultCompo
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -304,6 +306,7 @@ async fn test_services(component_service: &Arc<dyn ComponentService<DefaultCompo
             None,
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .map_err(|err| err.to_string())
@@ -567,6 +570,7 @@ async fn test_initial_component_file_upload(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -621,6 +625,7 @@ async fn test_initial_component_file_data_sharing(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -642,6 +647,7 @@ async fn test_initial_component_file_data_sharing(
             }),
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -681,6 +687,7 @@ async fn test_component_constraint_incompatible_updates(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -714,6 +721,7 @@ async fn test_component_constraint_incompatible_updates(
             None,
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap_err()
@@ -762,6 +770,7 @@ async fn test_component_oplog_process_plugin_creation(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -801,6 +810,7 @@ async fn test_component_oplog_process_plugin_creation(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -857,6 +867,7 @@ async fn test_component_oplog_process_plugin_creation_invalid_plugin(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -910,6 +921,7 @@ async fn test_failing_component_transformer_plugin(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -981,6 +993,7 @@ async fn test_library_plugin_creation(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -1067,6 +1080,7 @@ async fn test_app_plugin_creation(
             vec![],
             HashMap::new(),
             &DefaultComponentOwner,
+            HashMap::new(),
         )
         .await
         .unwrap();

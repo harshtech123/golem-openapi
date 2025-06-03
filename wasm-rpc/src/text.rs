@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -666,7 +666,13 @@ mod type_annotated_value {
         fn kind(&self) -> WasmTypeKind {
             let analysed_type = AnalysedType::try_from(&self.0)
                 .expect("Failed to retrieve AnalysedType from TypeAnnotatedValue");
-            analysed_type.kind()
+            let kind = analysed_type.kind();
+            if kind == WasmTypeKind::Unsupported {
+                // Fake kind to avoid the printer to panic
+                WasmTypeKind::String
+            } else {
+                kind
+            }
         }
 
         fn make_bool(val: bool) -> Self {
@@ -1039,6 +1045,9 @@ mod type_annotated_value {
         fn unwrap_string(&self) -> Cow<str> {
             match self.0.clone() {
                 TypeAnnotatedValue::Str(value) => Cow::Owned(value.clone()),
+                TypeAnnotatedValue::Handle(handle) => {
+                    Cow::Owned(format!("{}/{}", handle.uri, handle.resource_id))
+                }
                 _ => panic!("Expected string, found {:?}", self),
             }
         }

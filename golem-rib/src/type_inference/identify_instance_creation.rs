@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -103,7 +103,7 @@ mod internal {
                 let type_parameter = generic_type_parameter
                     .as_ref()
                     .map(|gtp| {
-                        TypeParameter::from_str(&gtp.value).map_err(|err| {
+                        TypeParameter::from_text(&gtp.value).map_err(|err| {
                             FunctionCallError::invalid_generic_type_parameter(&gtp.value, err)
                         })
                     })
@@ -112,7 +112,7 @@ mod internal {
                 let instance_creation_type = get_instance_creation_details(call_type, args);
 
                 if let Some(instance_creation_details) = instance_creation_type {
-                    let worker_name = instance_creation_details.clone().worker_name().cloned();
+                    let worker_name = instance_creation_details.worker_name().cloned();
 
                     *call_type = CallType::InstanceCreation(instance_creation_details);
 
@@ -125,13 +125,13 @@ mod internal {
                         RibTypeError::from(CustomError::new(
                             &Expr::Call {
                                 call_type: call_type.clone(),
-                                generic_type_parameter: None,
+                                generic_type_parameter: generic_type_parameter.clone(),
                                 args: args.clone(),
                                 inferred_type: InferredType::unknown(),
                                 source_span: source_span.clone(),
                                 type_annotation: type_annotation.clone(),
                             },
-                            format!("Failed to create instance type: {}", err),
+                            format!("failed to create instance: {}", err),
                         ))
                     })?;
 
@@ -167,11 +167,11 @@ mod internal {
                     _ => None,
                 }
             }
-            CallType::VariantConstructor(_) => None,
-            CallType::EnumConstructor(_) => None,
             CallType::InstanceCreation(instance_creation_type) => {
                 Some(instance_creation_type.clone())
             }
+            CallType::VariantConstructor(_) => None,
+            CallType::EnumConstructor(_) => None,
         }
     }
 }

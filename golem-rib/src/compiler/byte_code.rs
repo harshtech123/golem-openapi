@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -64,15 +64,14 @@ impl Display for RibByteCodeGenerationError {
 }
 
 impl RibByteCode {
-    pub fn diff(&self, previous: &RibByteCode) -> RibByteCode {
-        let mut diff = RibByteCode::default();
-        for (i, instruction) in self.instructions.iter().enumerate() {
-            if i >= previous.instructions.len() {
-                diff.instructions.push(instruction.clone());
-            }
-        }
-        diff
+    pub fn len(&self) -> usize {
+        self.instructions.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.instructions.is_empty()
+    }
+
     // Convert expression to bytecode instructions
     pub fn from_expr(
         inferred_expr: &InferredExpr,
@@ -148,12 +147,12 @@ mod internal {
         InferredType, InstructionId, Range, RibByteCodeGenerationError, RibIR, TypeInternal,
         VariableId, WorkerNamePresence,
     };
-    use golem_wasm_ast::analysis::{AnalysedType, TypeFlags};
+    use golem_wasm_ast::analysis::{AnalysedType, NameTypePair, TypeFlags};
     use std::collections::HashSet;
 
     use crate::call_type::{CallType, InstanceCreationType};
     use crate::type_inference::{GetTypeHint, TypeHint};
-    use golem_wasm_ast::analysis::analysed_type::{bool, tuple};
+    use golem_wasm_ast::analysis::analysed_type::{bool, record, str, tuple};
     use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
     use std::ops::Deref;
 
@@ -428,15 +427,15 @@ mod internal {
             } => {
                 // If the call type is an instance creation (worker creation),
                 // this will push worker name expression.
-                for expr in args.iter().rev() {
-                    stack.push(ExprState::from_expr(expr));
-                }
-
                 match call_type {
                     CallType::Function {
                         function_name,
                         worker,
                     } => {
+                        for expr in args.iter().rev() {
+                            stack.push(ExprState::from_expr(expr));
+                        }
+
                         let function_result_type = if inferred_type.is_unit() {
                             AnalysedTypeWithUnit::Unit
                         } else {
@@ -585,27 +584,102 @@ mod internal {
                     CallType::InstanceCreation(instance_creation_type) => {
                         match instance_creation_type {
                             InstanceCreationType::Worker { worker_name } => {
-                                if worker_name.is_none() {
-                                    // This would imply returning a instance representing ephemeral
-                                    // worker it simply returns an empty tuple. This is a corner case
-                                    // that a rib script hardly achieves anything from it,
-                                    // but we need to handle it
-                                    stack.push(ExprState::Instruction(RibIR::PushLit(
-                                        ValueAndType::new(Value::Tuple(vec![]), tuple(vec![])),
-                                    )));
+                                for expr in args.iter().rev() {
+                                    stack.push(ExprState::from_expr(expr));
+                                }
+
+                                match worker_name {
+                                    // worker name is already in stack due to args
+                                    Some(worker) => {
+                                        stack.push(ExprState::from_ir(RibIR::PushLit(
+                                            ValueAndType::new(
+                                                Value::Record(vec![Value::String(
+                                                    worker.to_string(),
+                                                )]),
+                                                record(vec![NameTypePair {
+                                                    name: "worker".to_string(),
+                                                    typ: str(),
+                                                }]),
+                                            ),
+                                        )));
+                                    }
+                                    None => {
+                                        // This would imply returning a instance representing ephemeral
+                                        // worker it simply returns an empty tuple. This is a corner case
+                                        // that a rib script hardly achieves anything from it,
+                                        // but we need to handle it
+                                        stack.push(ExprState::from_ir(RibIR::PushLit(
+                                            ValueAndType::new(
+                                                Value::Record(vec![Value::String(
+                                                    "<ephemeral>".to_string(),
+                                                )]),
+                                                record(vec![NameTypePair {
+                                                    name: "worker".to_string(),
+                                                    typ: str(),
+                                                }]),
+                                            ),
+                                        )));
+                                    }
                                 }
                             }
-                            InstanceCreationType::Resource { .. } => {}
+
+                            InstanceCreationType::Resource {
+                                worker_name,
+                                resource_name,
+                                ..
+                            } => {
+                                for expr in args.iter().rev() {
+                                    stack.push(ExprState::from_expr(expr));
+                                }
+
+                                let arg_exprs = args
+                                    .iter()
+                                    .map(|x| Value::String(x.to_string()))
+                                    .collect::<Vec<_>>();
+
+                                stack.push(ExprState::from_ir(RibIR::PushLit(ValueAndType::new(
+                                    Value::Record(vec![
+                                        Value::String(resource_name.resource_name.clone()),
+                                        worker_name.as_ref().map_or(
+                                            Value::String("<ephemeral>".to_string()),
+                                            |w| Value::String(w.to_string()),
+                                        ),
+                                        Value::Tuple(arg_exprs),
+                                    ]),
+                                    record(vec![
+                                        NameTypePair {
+                                            name: "resource".to_string(),
+                                            typ: str(),
+                                        },
+                                        NameTypePair {
+                                            name: "worker".to_string(),
+                                            typ: str(),
+                                        },
+                                        NameTypePair {
+                                            name: "args".to_string(),
+                                            typ: tuple(vec![str(); args.len()]),
+                                        },
+                                    ]),
+                                ))));
+                            }
                         }
                     }
 
                     CallType::VariantConstructor(variant_name) => {
+                        for expr in args.iter().rev() {
+                            stack.push(ExprState::from_expr(expr));
+                        }
+
                         instructions.push(RibIR::PushVariant(
                             variant_name.clone(),
                             convert_to_analysed_type(expr, inferred_type)?,
                         ));
                     }
                     CallType::EnumConstructor(enum_name) => {
+                        for expr in args.iter().rev() {
+                            stack.push(ExprState::from_expr(expr));
+                        }
+
                         instructions.push(RibIR::PushEnum(
                             enum_name.clone(),
                             convert_to_analysed_type(expr, inferred_type)?,
@@ -919,7 +993,9 @@ mod compiler_tests {
     use test_r::test;
 
     use super::*;
-    use crate::{ArmPattern, FunctionTypeRegistry, InferredType, MatchArm, VariableId};
+    use crate::{
+        ArmPattern, FunctionTypeRegistry, InferredType, MatchArm, RibCompiler, VariableId,
+    };
     use golem_wasm_ast::analysis::analysed_type::{list, str, u64};
     use golem_wasm_ast::analysis::{AnalysedType, NameTypePair, TypeRecord, TypeStr};
     use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
@@ -944,11 +1020,15 @@ mod compiler_tests {
     #[test]
     fn test_instructions_for_identifier() {
         let inferred_input_type = InferredType::string();
+
         let variable_id = VariableId::local("request", 0);
-        let empty_registry = FunctionTypeRegistry::empty();
+
         let expr = Expr::identifier_with_variable_id(variable_id.clone(), None)
             .with_inferred_type(inferred_input_type);
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
@@ -969,8 +1049,9 @@ mod compiler_tests {
 
         let expr = Expr::let_binding_with_variable_id(variable_id.clone(), literal, None);
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
@@ -989,15 +1070,19 @@ mod compiler_tests {
     #[test]
     fn test_instructions_equal_to() {
         let number_f32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::f32());
+
         let number_u32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::u32());
 
         let expr = Expr::equal_to(number_f32, number_u32);
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let value_and_type1 = 1.0f32.into_value_and_type();
+
         let value_and_type2 = 1u32.into_value_and_type();
 
         let instruction_set = vec![
@@ -1016,15 +1101,19 @@ mod compiler_tests {
     #[test]
     fn test_instructions_greater_than() {
         let number_f32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::f32());
+
         let number_u32 = Expr::number_inferred(BigDecimal::from(2), None, InferredType::u32());
 
         let expr = Expr::greater_than(number_f32, number_u32);
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let value_and_type1 = 1.0f32.into_value_and_type();
+
         let value_and_type2 = 2u32.into_value_and_type();
 
         let instruction_set = vec![
@@ -1043,15 +1132,19 @@ mod compiler_tests {
     #[test]
     fn test_instructions_less_than() {
         let number_f32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::f32());
+
         let number_u32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::u32());
 
         let expr = Expr::less_than(number_f32, number_u32);
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let value_and_type1 = 1.0f32.into_value_and_type();
+
         let value_and_type2 = 1u32.into_value_and_type();
 
         let instruction_set = vec![
@@ -1070,15 +1163,19 @@ mod compiler_tests {
     #[test]
     fn test_instructions_greater_than_or_equal_to() {
         let number_f32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::f32());
+
         let number_u32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::u32());
 
         let expr = Expr::greater_than_or_equal_to(number_f32, number_u32);
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let value_and_type1 = 1.0f32.into_value_and_type();
+
         let value_and_type2 = 1u32.into_value_and_type();
 
         let instruction_set = vec![
@@ -1097,15 +1194,19 @@ mod compiler_tests {
     #[test]
     fn test_instructions_less_than_or_equal_to() {
         let number_f32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::f32());
+
         let number_u32 = Expr::number_inferred(BigDecimal::from(1), None, InferredType::u32());
 
         let expr = Expr::less_than_or_equal_to(number_f32, number_u32);
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let value_and_type1 = 1.0f32.into_value_and_type();
+
         let value_and_type2 = 1u32.into_value_and_type();
 
         let instruction_set = vec![
@@ -1132,12 +1233,14 @@ mod compiler_tests {
             (String::from("bar_key"), InferredType::string()),
         ]));
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let bar_value = "bar_value".into_value_and_type();
+
         let foo_value = "foo_value".into_value_and_type();
 
         let instruction_set = vec![
@@ -1170,8 +1273,9 @@ mod compiler_tests {
     fn test_instructions_for_multiple() {
         let expr = Expr::expr_block(vec![Expr::literal("foo"), Expr::literal("bar")]);
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
@@ -1190,14 +1294,17 @@ mod compiler_tests {
     #[test]
     fn test_instructions_if_conditional() {
         let if_expr = Expr::literal("pred").with_inferred_type(InferredType::bool());
+
         let then_expr = Expr::literal("then");
+
         let else_expr = Expr::literal("else");
 
         let expr =
             Expr::cond(if_expr, then_expr, else_expr).with_inferred_type(InferredType::string());
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
@@ -1221,7 +1328,9 @@ mod compiler_tests {
     #[test]
     fn test_instructions_for_nested_if_else() {
         let if_expr = Expr::literal("if-pred1").with_inferred_type(InferredType::bool());
+
         let then_expr = Expr::literal("then1").with_inferred_type(InferredType::string());
+
         let else_expr = Expr::cond(
             Expr::literal("else-pred2").with_inferred_type(InferredType::bool()),
             Expr::literal("else-then2"),
@@ -1232,8 +1341,9 @@ mod compiler_tests {
         let expr =
             Expr::cond(if_expr, then_expr, else_expr).with_inferred_type(InferredType::string());
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
@@ -1275,12 +1385,14 @@ mod compiler_tests {
         let expr =
             Expr::select_field(record, "bar_key", None).with_inferred_type(InferredType::string());
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let bar_value = "bar_value".into_value_and_type();
+
         let foo_value = "foo_value".into_value_and_type();
 
         let instruction_set = vec![
@@ -1318,8 +1430,9 @@ mod compiler_tests {
         let expr = Expr::select_index(sequence, Expr::number(BigDecimal::from(1)))
             .with_inferred_type(InferredType::string());
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let compiler = RibCompiler::default();
+
+        let inferred_expr = compiler.infer_types(expr).unwrap();
 
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
@@ -1405,7 +1518,7 @@ mod compiler_tests {
         use test_r::test;
 
         use crate::compiler::byte_code::compiler_tests::internal;
-        use crate::{compiler, Expr};
+        use crate::{Expr, RibCompiler, RibCompilerConfig};
         use golem_wasm_ast::analysis::{AnalysedType, TypeStr};
 
         #[test]
@@ -1416,7 +1529,9 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &vec![]).unwrap_err().to_string();
+            let compiler = RibCompiler::default();
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
 
             assert_eq!(compiler_error, "error in the following rib found at line 2, column 16\n`foo(request)`\ncause: invalid function call `foo`\nunknown function\n");
         }
@@ -1432,10 +1547,14 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
+
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 4, column 16\n`golem:it/api.{cart0(user_id).add-item}(\"apple\")`\ncause: invalid function call `[constructor]cart0`\nunknown function\n"
+                "error in the following rib found at line 4, column 16\n`add-item(\"apple\")`\ncause: invalid function call `[constructor]cart0`\nunknown function\n"
             );
         }
 
@@ -1450,10 +1569,15 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 4, column 16\n`golem:it/api.{cart(user_id).foo}(\"apple\")`\ncause: invalid function call `[method]cart.foo`\nunknown function\n"
+                "error in the following rib found at line 4, column 16\n`foo(\"apple\")`\ncause: invalid function call `[method]cart.foo`\nunknown function\n"
             );
         }
 
@@ -1472,7 +1596,12 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
                 "error in the following rib found at line 3, column 29\n`foo(user_id, user_id)`\ncause: invalid argument size for function `foo`. expected 1 arguments, found 2\n"
@@ -1489,10 +1618,15 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 3, column 16\n`golem:it/api.{cart(user_id, user_id).add-item}(\"apple\")`\ncause: invalid argument size for function `[constructor]cart`. expected 1 arguments, found 2\n"
+                "error in the following rib found at line 3, column 16\n`add-item(\"apple\")`\ncause: invalid argument size for function `cart`. expected 1 arguments, found 2\n"
             );
         }
 
@@ -1506,10 +1640,15 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 3, column 16\n`golem:it/api.{cart(user_id).add-item}(\"apple\", \"samsung\")`\ncause: invalid argument size for function `[method]cart.add-item`. expected 1 arguments, found 2\n"
+                "error in the following rib found at line 3, column 16\n`add-item(\"apple\", \"samsung\")`\ncause: invalid argument size for function `add-item`. expected 1 arguments, found 2\n"
             );
         }
 
@@ -1524,7 +1663,12 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
                 "error in the following rib found at line 0, column 0\n`register-user(1, \"foo\")`\ncause: invalid argument size for function `register-user`. expected 1 arguments, found 2\n"
@@ -1545,7 +1689,12 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
                 "error in the following rib found at line 2, column 33\n`1: u64`\nfound within:\n`foo(1: u64)`\ncause: type mismatch. expected string, found u64\ninvalid argument to the function `foo`\n"
@@ -1562,10 +1711,15 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 3, column 54\n`\"apple\"`\nfound within:\n`golem:it/api.{cart(user_id).add-item}(\"apple\")`\ncause: type mismatch. expected record { name: string }, found string\ninvalid argument to the function `[method]cart.add-item`\n"
+                "error in the following rib found at line 3, column 54\n`\"apple\"`\nfound within:\n`add-item(\"apple\")`\ncause: type mismatch. expected record { name: string }, found string\ninvalid argument to the function `add-item`\n"
             );
         }
 
@@ -1578,10 +1732,15 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 1, column 1\n`{foo: \"bar\"}`\nfound within:\n`golem:it/api.{cart({foo: \"bar\"}).add-item}(\"apple\")`\ncause: type mismatch. expected string, found record { foo: string }\ninvalid argument to the function `[constructor]cart`\n"
+                "error in the following rib found at line 1, column 1\n`{foo: \"bar\"}`\nfound within:\n`add-item(\"apple\")`\ncause: type mismatch. expected string, found record { foo: string }\ninvalid argument to the function `cart`\n"
             );
         }
 
@@ -1596,7 +1755,12 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler_error = compiler::compile(expr, &metadata).unwrap_err().to_string();
+
+            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+
+            let compiler = RibCompiler::new(compiler_config);
+
+            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
                 "error in the following rib found at line 2, column 56\n`\"foo\"`\nfound within:\n`register-user(\"foo\")`\ncause: type mismatch. expected u64, found string\ninvalid argument to the function `register-user`\n"
@@ -1609,7 +1773,7 @@ mod compiler_tests {
         use test_r::test;
 
         use crate::compiler::byte_code::compiler_tests::internal;
-        use crate::{compiler, Expr};
+        use crate::{Expr, RibCompiler, RibCompilerConfig};
         use golem_wasm_ast::analysis::{
             AnalysedType, NameOptionTypePair, NameTypePair, TypeEnum, TypeList, TypeOption,
             TypeRecord, TypeResult, TypeStr, TypeTuple, TypeU32, TypeU64, TypeVariant,
@@ -1637,7 +1801,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1666,7 +1831,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1715,7 +1881,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1752,7 +1919,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1788,7 +1956,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1825,7 +1994,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1873,7 +2043,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1917,7 +2088,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 
@@ -1952,7 +2124,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiled = compiler::compile(expr, &analysed_exports).unwrap();
+            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
 

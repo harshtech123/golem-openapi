@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{GetTypeHint, InferredType, TypeInternal};
+use crate::{GetTypeHint, InferredType, InstanceType, TypeInternal};
 use bincode::{Decode, Encode};
-use golem_wasm_ast::analysis::analysed_type::{bool, field, option, record, tuple};
+use golem_wasm_ast::analysis::analysed_type::{bool, field, option, record, str, tuple};
 use golem_wasm_ast::analysis::{
     AnalysedResourceId, AnalysedResourceMode, AnalysedType, NameOptionTypePair, NameTypePair,
     TypeBool, TypeChr, TypeEnum, TypeF32, TypeF64, TypeFlags, TypeHandle, TypeList, TypeOption,
@@ -64,9 +64,31 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
 
     fn try_from(inferred_type: &InferredType) -> Result<Self, Self::Error> {
         match inferred_type.internal_type() {
-            TypeInternal::Instance { .. } => {
-                Err("Cannot convert Instance type to AnalysedType".to_string())
-            }
+            TypeInternal::Instance { instance_type } => match instance_type.as_ref() {
+                InstanceType::Resource { resource_args, .. } => {
+                    Ok(AnalysedTypeWithUnit::analysed_type(record(vec![
+                        NameTypePair {
+                            name: "resource".to_string(),
+                            typ: str(),
+                        },
+                        NameTypePair {
+                            name: "worker".to_string(),
+                            typ: str(),
+                        },
+                        NameTypePair {
+                            name: "args".to_string(),
+                            typ: tuple(vec![str(); resource_args.len()]),
+                        },
+                    ])))
+                }
+
+                _ => Ok(AnalysedTypeWithUnit::analysed_type(record(vec![
+                    NameTypePair {
+                        name: "worker".to_string(),
+                        typ: str(),
+                    },
+                ]))),
+            },
             TypeInternal::Range { from, to } => {
                 let from: AnalysedType = AnalysedType::try_from(from)?;
                 let to: Option<AnalysedType> =

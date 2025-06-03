@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,6 +46,7 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
             source_path: deps.component_directory().join("shopping-cart.wasm"),
         }),
         prompt: None,
+        command_registry: None,
     })
     .await
     .expect("Failed to bootstrap REPL");
@@ -76,21 +77,18 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
      "#;
 
     let result = rib_repl
-        .execute_rib(rib1)
+        .execute(rib1)
         .await
         .expect("Failed to process command");
 
     assert_eq!(result, Some(RibResult::Unit));
 
-    let result = rib_repl
-        .execute_rib(rib2)
-        .await
-        .map_err(|err| err.to_string());
+    let result = rib_repl.execute(rib2).await.map_err(|err| err.to_string());
 
     assert!(result.unwrap_err().contains("function 'add' not found"));
 
     let result = rib_repl
-        .execute_rib(rib3)
+        .execute(rib3)
         .await
         .map_err(|err| err.to_string())
         .expect("Failed to process rib");
@@ -109,7 +107,7 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
     );
 
     let result = rib_repl
-        .execute_rib(rib4)
+        .execute(rib4)
         .await
         .map_err(|err| err.to_string())
         .expect("Failed to process rib");
@@ -117,7 +115,7 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
     assert_eq!(result, Some(RibResult::Unit));
 
     let result = rib_repl
-        .execute_rib(rib5)
+        .execute(rib5)
         .await
         .map_err(|err| err.to_string())
         .expect("Failed to process rib");
@@ -156,6 +154,7 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
                 .join("shopping-cart-resource.wasm"),
         }),
         prompt: None,
+        command_registry: None,
     })
     .await
     .expect("Failed to bootstrap REPL");
@@ -186,21 +185,21 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
      "#;
 
     let result = rib_repl
-        .execute_rib(rib1)
+        .execute(rib1)
         .await
         .expect("Failed to process command");
 
     assert_eq!(result, Some(RibResult::Unit));
 
     let result = rib_repl
-        .execute_rib(rib2)
+        .execute(rib2)
         .await
         .expect("Failed to process command");
 
     assert_eq!(result, Some(RibResult::Unit));
 
     let result = rib_repl
-        .execute_rib(rib3)
+        .execute(rib3)
         .await
         .map_err(|err| err.to_string())
         .expect("Failed to process rib");
@@ -219,7 +218,7 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
     );
 
     let result = rib_repl
-        .execute_rib(rib4)
+        .execute(rib4)
         .await
         .map_err(|err| err.to_string())
         .expect("Failed to process rib");
@@ -227,7 +226,7 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
     assert_eq!(result, Some(RibResult::Unit));
 
     let result = rib_repl
-        .execute_rib(rib5)
+        .execute(rib5)
         .await
         .map_err(|err| err.to_string())
         .expect("Failed to process rib");

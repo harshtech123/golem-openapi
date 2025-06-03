@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,35 +17,31 @@ use golem_wasm_ast::analysis::{TypeEnum, TypeVariant};
 use rib::*;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::sync::Arc;
 
 pub fn compile_rib_script(
     rib_script: &str,
-    repl_state: &mut ReplState,
-) -> Result<CompilerOutput, RibCompilationError> {
+    repl_state: &Arc<ReplState>,
+) -> Result<ReplCompilerOutput, RibCompilationError> {
     let expr = Expr::from_text(rib_script)
         .map_err(|e| RibCompilationError::InvalidSyntax(e.to_string()))?;
 
-    let function_registry =
-        FunctionTypeRegistry::from_export_metadata(&repl_state.dependency().metadata);
+    let compiler = repl_state.rib_compiler();
 
-    let inferred_expr = InferredExpr::from_expr(expr, &function_registry, &vec![])
-        .map_err(RibCompilationError::RibTypeError)?;
+    let inferred_expr = compiler.infer_types(expr)?;
 
     let instance_variables = fetch_instance_variables(&inferred_expr);
 
     let identifiers = get_identifiers(&inferred_expr);
 
-    let variants = function_registry.get_variants();
-    let enums = function_registry.get_enums();
+    let variants = compiler.get_variants();
 
-    let new_byte_code = RibByteCode::from_expr(&inferred_expr)
-        .map_err(|e| RibCompilationError::RibStaticAnalysisError(e.to_string()))?;
+    let enums = compiler.get_enums();
 
-    let byte_code = new_byte_code.diff(repl_state.byte_code());
+    let byte_code = RibByteCode::from_expr(&inferred_expr)
+        .map_err(RibCompilationError::ByteCodeGenerationFail)?;
 
-    repl_state.update_byte_code(new_byte_code);
-
-    Ok(CompilerOutput {
+    Ok(ReplCompilerOutput {
         rib_byte_code: byte_code,
         instance_variables,
         identifiers,
@@ -55,7 +51,7 @@ pub fn compile_rib_script(
 }
 
 #[derive(Clone)]
-pub struct CompilerOutput {
+pub struct ReplCompilerOutput {
     pub rib_byte_code: RibByteCode,
     pub instance_variables: InstanceVariables,
     pub identifiers: Vec<VariableId>,
