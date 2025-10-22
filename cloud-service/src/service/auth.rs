@@ -1,22 +1,36 @@
-use async_trait::async_trait;
-use cloud_common::model::{
-    ProjectAction, ProjectActions, ProjectAuthorisedActions, ProjectPermisison, Role, TokenSecret,
-};
-use golem_service_base::repo::RepoError;
-use std::collections::HashSet;
-use std::sync::Arc;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::auth::AccountAuthorisation;
+use crate::model::GlobalAction;
 use crate::model::ProjectPolicy;
-use crate::model::{AccountAction, GlobalAction};
 use crate::repo::account::AccountRepo;
 use crate::repo::account_grant::AccountGrantRepo;
 use crate::repo::project::ProjectRepo;
 use crate::repo::project_grant::ProjectGrantRepo;
 use crate::repo::project_policy::ProjectPolicyRepo;
 use crate::service::token::{TokenService, TokenServiceError};
+use async_trait::async_trait;
+use golem_common::model::auth::AccountAction;
+use golem_common::model::auth::{
+    ProjectAction, ProjectActions, ProjectAuthorisedActions, ProjectPermission, Role, TokenSecret,
+};
 use golem_common::model::{AccountId, ProjectId};
 use golem_common::SafeDisplay;
+use golem_service_base::repo::RepoError;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthServiceError {
@@ -66,7 +80,7 @@ impl From<TokenServiceError> for AuthServiceError {
     fn from(error: TokenServiceError) -> Self {
         match error {
             TokenServiceError::UnknownToken(id) => {
-                AuthServiceError::invalid_token(format!("Invalid token id: {}", id))
+                AuthServiceError::invalid_token(format!("Invalid token id: {id}"))
             }
             _ => AuthServiceError::InternalTokenServiceError(error),
         }
@@ -84,7 +98,8 @@ pub enum ViewableProjects {
     /// Special case for admins, they can see all projects even if no grant is present.
     All,
     OwnedAndAdditional {
-        additional_project_ids: Vec<ProjectId>,
+        owner_account_id: AccountId,
+        additional_project_ids: HashSet<ProjectId>,
     },
 }
 
@@ -93,7 +108,7 @@ pub enum ViewableAccounts {
     /// Special case for admins, they can see all accounts even if no grant is present.
     All,
     Limited {
-        account_ids: Vec<AccountId>,
+        account_ids: HashSet<AccountId>,
     },
 }
 
@@ -154,22 +169,22 @@ pub trait AuthService: Send + Sync {
 /// This is the foundation of all other services. Avoid depending on other services here and instead query the repositories directly
 /// to avoid cyclical dependencies / logic.
 pub struct AuthServiceDefault {
-    token_service: Arc<dyn TokenService + Send + Sync>,
-    account_repo: Arc<dyn AccountRepo + Send + Sync>,
-    account_grant_repo: Arc<dyn AccountGrantRepo + Send + Sync>,
-    project_repo: Arc<dyn ProjectRepo + Sync + Send>,
-    project_policy_repo: Arc<dyn ProjectPolicyRepo + Sync + Send>,
-    project_grant_repo: Arc<dyn ProjectGrantRepo + Sync + Send>,
+    token_service: Arc<dyn TokenService>,
+    account_repo: Arc<dyn AccountRepo>,
+    account_grant_repo: Arc<dyn AccountGrantRepo>,
+    project_repo: Arc<dyn ProjectRepo>,
+    project_policy_repo: Arc<dyn ProjectPolicyRepo>,
+    project_grant_repo: Arc<dyn ProjectGrantRepo>,
 }
 
 impl AuthServiceDefault {
     pub fn new(
-        token_service: Arc<dyn TokenService + Send + Sync>,
-        account_repo: Arc<dyn AccountRepo + Send + Sync>,
-        account_grant_repo: Arc<dyn AccountGrantRepo + Send + Sync>,
-        project_repo: Arc<dyn ProjectRepo + Sync + Send>,
-        project_policy_repo: Arc<dyn ProjectPolicyRepo + Sync + Send>,
-        project_grant_repo: Arc<dyn ProjectGrantRepo + Sync + Send>,
+        token_service: Arc<dyn TokenService>,
+        account_repo: Arc<dyn AccountRepo>,
+        account_grant_repo: Arc<dyn AccountGrantRepo>,
+        project_repo: Arc<dyn ProjectRepo>,
+        project_policy_repo: Arc<dyn ProjectPolicyRepo>,
+        project_grant_repo: Arc<dyn ProjectGrantRepo>,
     ) -> Self {
         AuthServiceDefault {
             token_service,
@@ -178,6 +193,34 @@ impl AuthServiceDefault {
             project_repo,
             project_policy_repo,
             project_grant_repo,
+        }
+    }
+
+    async fn limit_to_accounts_with_shared_projects(
+        &self,
+        auth: &AccountAuthorisation,
+        target_account: &AccountId,
+    ) -> Result<(), AuthServiceError> {
+        // These resources are visible in all shared projects.
+        // So an account has access to the resource if either owns the resource or has at least
+        // one project shared with it from the account owning the resource.
+
+        if auth.has_account(target_account) {
+            Ok(())
+        } else {
+            let viewable_accounts = self.viewable_accounts(auth).await?;
+            match viewable_accounts {
+                ViewableAccounts::All => Ok(()),
+                ViewableAccounts::Limited { account_ids } => {
+                    if account_ids.contains(target_account) {
+                        Ok(())
+                    } else {
+                        Err(AuthServiceError::AccountAccessForbidden {
+                            account_id: target_account.clone(),
+                        })
+                    }
+                }
+            }
         }
     }
 }
@@ -236,19 +279,8 @@ impl AuthService for AuthServiceDefault {
 
         match requested_action {
             AccountAction::ViewAccount => {
-                if auth.has_account(account_id) {
-                    Ok(())
-                } else {
-                    let visible_accounts = self.viewable_accounts(auth).await?;
-                    match visible_accounts {
-                        ViewableAccounts::All => Ok(()),
-                        ViewableAccounts::Limited { .. } => {
-                            Err(AuthServiceError::AccountAccessForbidden {
-                                account_id: account_id.clone(),
-                            })
-                        }
-                    }
-                }
+                self.limit_to_accounts_with_shared_projects(auth, account_id)
+                    .await
             }
             AccountAction::UpdateAccount => {
                 limit_to_account_or_roles(auth, account_id, &[Role::Admin])
@@ -271,6 +303,28 @@ impl AuthService for AuthServiceDefault {
                 limit_to_account_or_roles(auth, account_id, &[Role::Admin])
             }
             AccountAction::UpdateLimits => limit_to_roles(auth, &[Role::Admin]),
+            AccountAction::ViewTokens => {
+                limit_to_account_or_roles(auth, account_id, &[Role::Admin])
+            }
+            AccountAction::CreateToken => {
+                limit_to_account_or_roles(auth, account_id, &[Role::Admin])
+            }
+            AccountAction::DeleteToken => {
+                limit_to_account_or_roles(auth, account_id, &[Role::Admin])
+            }
+            AccountAction::ViewGlobalPlugins => {
+                self.limit_to_accounts_with_shared_projects(auth, account_id)
+                    .await
+            }
+            AccountAction::CreateGlobalPlugin => {
+                limit_to_account_or_roles(auth, account_id, &[Role::Admin])
+            }
+            AccountAction::UpdateGlobalPlugin => {
+                limit_to_account_or_roles(auth, account_id, &[Role::Admin])
+            }
+            AccountAction::DeleteGlobalPlugin => {
+                limit_to_account_or_roles(auth, account_id, &[Role::Admin])
+            }
         }
     }
 
@@ -287,18 +341,18 @@ impl AuthService for AuthServiceDefault {
                 actions
                     .actions
                     .actions
-                    .contains(&ProjectPermisison::CreatePluginInstallation)
+                    .contains(&ProjectPermission::CreatePluginInstallation)
                     && actions
                         .actions
                         .actions
-                        .contains(&ProjectPermisison::UpdatePluginInstallation)
+                        .contains(&ProjectPermission::UpdatePluginInstallation)
                     && actions
                         .actions
                         .actions
-                        .contains(&ProjectPermisison::DeletePluginInstallation)
+                        .contains(&ProjectPermission::DeletePluginInstallation)
             }
             other => {
-                let converted = ProjectPermisison::try_from(other.clone()).map_err(|_| {
+                let converted = ProjectPermission::try_from(other.clone()).map_err(|_| {
                     AuthServiceError::ProjectActionForbidden {
                         project_id: project_id.clone(),
                         requested_action: other.clone(),
@@ -341,6 +395,7 @@ impl AuthService for AuthServiceDefault {
             .collect();
 
         Ok(ViewableProjects::OwnedAndAdditional {
+            owner_account_id: auth.token.account_id.clone(),
             additional_project_ids,
         })
     }
@@ -368,8 +423,8 @@ impl AuthService for AuthServiceDefault {
         let mut account_ids = owner_accounts
             .into_iter()
             .map(|value| AccountId { value })
-            .collect::<Vec<_>>();
-        account_ids.push(auth.token.account_id.clone());
+            .collect::<HashSet<_>>();
+        account_ids.insert(auth.token.account_id.clone());
 
         Ok(ViewableAccounts::Limited { account_ids })
     }
@@ -379,7 +434,10 @@ impl AuthService for AuthServiceDefault {
         auth: &AccountAuthorisation,
         project_id: &ProjectId,
     ) -> Result<ProjectAuthorisedActions, AuthServiceError> {
-        tracing::info!("Get project authorisations for project: {}", project_id);
+        tracing::info!(
+            project_id = %project_id,
+            "Get project authorisations for project",
+        );
         let project = self.project_repo.get(&project_id.0).await?;
 
         let project = if let Some(project) = project {

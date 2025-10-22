@@ -12,38 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
-use crate::model::{InterruptKind, ListDirectoryResult, ReadFileResult, TrapType};
+use crate::model::{ReadFileResult, TrapType};
 use crate::services::events::Event;
 use crate::services::oplog::{CommitLevel, OplogOps};
 use crate::services::{HasEvents, HasOplog, HasWorker};
-use crate::worker::function_result_interpreter::interpret_function_results;
-use crate::worker::invocation::{
-    find_first_available_function, invoke_observed_and_traced, InvokeResult,
+use crate::worker::invocation::{invoke_observed_and_traced, InvokeResult};
+use crate::worker::{
+    interpret_function_result, QueuedWorkerInvocation, RetryDecision, RunningWorker, Worker,
+    WorkerCommand,
 };
-use crate::worker::{QueuedWorkerInvocation, RetryDecision, RunningWorker, Worker, WorkerCommand};
 use crate::workerctx::{PublicWorkerIo, WorkerCtx};
 use anyhow::anyhow;
 use async_mutex::Mutex;
 use drop_stream::DropStream;
 use futures::channel::oneshot;
 use futures::channel::oneshot::Sender;
-use golem_common::model::invocation_context::{AttributeValue, InvocationContextStack};
+use golem_common::model::agent::AgentId;
 use golem_common::model::oplog::WorkerError;
 use golem_common::model::{
-    exports, ComponentFilePath, ComponentType, ComponentVersion, IdempotencyKey, OwnedWorkerId,
+    invocation_context::{AttributeValue, InvocationContextStack},
+    GetFileSystemNodeResult, OplogIndex,
+};
+use golem_common::model::{
+    ComponentFilePath, ComponentType, ComponentVersion, IdempotencyKey, OwnedWorkerId,
     TimestampedWorkerInvocation, WorkerId, WorkerInvocation,
 };
 use golem_common::retries::get_delay;
-use golem_wasm_ast::analysis::AnalysedFunctionResult;
-use golem_wasm_rpc::Value;
+use golem_service_base::error::worker_executor::{InterruptKind, WorkerExecutorError};
+use golem_wasm::analysis::AnalysedFunctionResult;
+use golem_wasm::Value;
 use std::collections::VecDeque;
 use std::ops::DerefMut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::RwLock;
-use tracing::{debug, error, span, warn, Instrument, Level};
+use tracing::{debug, span, warn, Instrument, Level};
 use wasmtime::component::Instance;
 use wasmtime::{AsContext, Store};
 
@@ -54,7 +58,7 @@ pub struct InvocationLoop<Ctx: WorkerCtx> {
     pub owned_worker_id: OwnedWorkerId,
     pub parent: Arc<Worker<Ctx>>, // parent must not be dropped until the invocation_loop is running
     pub waiting_for_command: Arc<AtomicBool>,
-    pub oom_retry_count: u64,
+    pub oom_retry_count: u32,
 }
 
 impl<Ctx: WorkerCtx> InvocationLoop<Ctx> {
@@ -174,15 +178,17 @@ impl<Ctx: WorkerCtx> InvocationLoop<Ctx> {
     ) -> Option<RetryDecision> {
         let mut store = store.lock().await;
 
-        store
-            .data()
-            .set_suspended()
-            .await
-            .expect("Initial set_suspended should never fail");
+        store.data().set_suspended();
+
         let span = span!(
             Level::INFO,
             "invocation",
             worker_id = %self.owned_worker_id.worker_id,
+            agent_type = self.parent
+                .agent_id
+                .as_ref()
+                .map(|id| id.agent_type.clone())
+                .unwrap_or_else(|| "-".to_string()),
         );
         let prepare_result =
             Ctx::prepare_instance(&self.owned_worker_id.worker_id, instance, &mut *store)
@@ -196,9 +202,7 @@ impl<Ctx: WorkerCtx> InvocationLoop<Ctx> {
             }
             Err(err) => {
                 warn!("Failed to start the worker: {err}");
-                if let Err(err2) = store.data().set_suspended().await {
-                    warn!("Additional error during startup of the worker: {err2}");
-                }
+                store.data().set_suspended();
 
                 self.parent.stop_internal(true, Some(err)).await;
                 None // early return, we can't retry this
@@ -209,9 +213,7 @@ impl<Ctx: WorkerCtx> InvocationLoop<Ctx> {
     /// Suspends the worker after the invocation loop exited
     async fn suspend_worker(&self, store: &Mutex<Store<Ctx>>) {
         // Marking the worker as suspended
-        if let Err(err) = store.lock().await.data().set_suspended().await {
-            error!("Failed to set the worker to suspended state at the end of the invocation loop: {err}");
-        }
+        store.lock().await.data().set_suspended();
 
         // Making sure all pending commits are flushed
         // Make sure all pending commits are done
@@ -220,8 +222,8 @@ impl<Ctx: WorkerCtx> InvocationLoop<Ctx> {
             .await
             .data()
             .get_public_state()
-            .oplog()
-            .commit(CommitLevel::Immediate)
+            .worker()
+            .commit_oplog_and_update_state(CommitLevel::Always)
             .await;
     }
 }
@@ -262,14 +264,13 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
             self.waiting_for_command.store(false, Ordering::Release);
             let outcome = match cmd {
                 WorkerCommand::Invocation => {
-                    let message = self
-                        .active
-                        .write()
-                        .await
-                        .pop_front()
-                        .expect("Message should be present");
+                    let message = self.active.write().await.pop_front();
 
-                    self.invocation(message).await
+                    if let Some(message) = message {
+                        self.invocation(message).await
+                    } else {
+                        CommandOutcome::Continue
+                    }
                 }
                 WorkerCommand::ResumeReplay => self.resume_replay().await,
                 WorkerCommand::Interrupt(kind) => self.interrupt(kind).await,
@@ -302,16 +303,14 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
     async fn resume_replay(&self) -> CommandOutcome {
         let mut store = self.store.lock().await;
 
-        let resume_replay_result = Ctx::resume_replay(&mut *store, self.instance).await;
+        let resume_replay_result = Ctx::resume_replay(&mut *store, self.instance, true).await;
 
         match resume_replay_result {
             Ok(RetryDecision::None) => CommandOutcome::Continue,
             Ok(decision) => CommandOutcome::BreakInnerLoop(decision),
             Err(err) => {
                 warn!("Failed to resume replay: {err}");
-                if let Err(err2) = store.data().set_suspended().await {
-                    warn!("Additional error during resume of replay of worker: {err2}");
-                }
+                store.data().set_suspended();
 
                 self.parent.stop_internal(true, Some(err)).await;
                 CommandOutcome::BreakOuterLoop
@@ -374,12 +373,16 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                     CommandOutcome::Continue
                 }
             }
-            QueuedWorkerInvocation::ListDirectory { path, sender } => {
-                self.list_directory(path, sender).await;
+            QueuedWorkerInvocation::GetFileSystemNode { path, sender } => {
+                self.get_file_system_node(path, sender).await;
                 CommandOutcome::Continue
             }
             QueuedWorkerInvocation::ReadFile { path, sender } => {
                 self.read_file(path, sender).await;
+                CommandOutcome::Continue
+            }
+            QueuedWorkerInvocation::AwaitReadyToProcessCommands { sender } => {
+                let _ = sender.send(Ok(()));
                 CommandOutcome::Continue
             }
         }
@@ -432,6 +435,11 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
             Level::INFO,
             "invocation",
             worker_id = %self.owned_worker_id.worker_id,
+            agent_type = self.parent
+                .agent_id
+                .as_ref()
+                .map(|id| id.agent_type.clone())
+                .unwrap_or_else(|| "-".to_string()),
             %idempotency_key,
             function = full_function_name
         );
@@ -490,17 +498,20 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
         idempotency_key: IdempotencyKey,
         full_function_name: &str,
         function_input: &[Value],
-    ) -> Result<InvokeResult, GolemError> {
+    ) -> Result<InvokeResult, WorkerExecutorError> {
         self.store
             .data_mut()
             .set_current_idempotency_key(idempotency_key.clone())
             .await;
+
+        let component_metadata = self.store.data().component_metadata().metadata.clone();
 
         Self::extend_invocation_context(
             &mut invocation_context,
             &idempotency_key,
             full_function_name,
             &self.owned_worker_id.worker_id(),
+            &self.parent.agent_id,
         );
 
         let (local_span_ids, inherited_span_ids) = invocation_context.span_ids();
@@ -518,15 +529,13 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                 .await;
         }
 
-        // Make sure to update the pending invocation queue in the status record before
-        // the invocation writes the invocation start oplog entry
-        self.store.data().update_pending_invocations().await;
-
         let result = invoke_observed_and_traced(
             full_function_name.to_string(),
             function_input.to_owned(),
             self.store,
             self.instance,
+            &component_metadata,
+            true,
         )
         .await;
 
@@ -553,17 +562,18 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
         &mut self,
         full_function_name: String,
         function_input: &Vec<Value>,
-        output: Vec<Value>,
+        output: Option<Value>,
         consumed_fuel: i64,
     ) -> CommandOutcome {
         let component_metadata = self.store.as_context().data().component_metadata();
 
-        let function_results =
-            exports::function_by_name(&component_metadata.exports, &full_function_name);
+        let function_results = component_metadata
+            .metadata
+            .find_function(&full_function_name);
 
         match function_results {
-            Ok(Some(export_function)) => {
-                let function_results = export_function.results.into_iter().collect();
+            Ok(Some(invokable_function)) => {
+                let function_results = invokable_function.analysed_export.result.clone();
 
                 match self
                     .exported_function_invocation_finished_with_type(
@@ -579,9 +589,10 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                     Err(error) => {
                         self.store
                             .data_mut()
-                            .on_invocation_failure(&TrapType::Error(WorkerError::Unknown(
-                                error.to_string(),
-                            )))
+                            .on_invocation_failure(&TrapType::Error {
+                                error: WorkerError::Unknown(error.to_string()),
+                                retry_from: OplogIndex::INITIAL,
+                            })
                             .await;
                         CommandOutcome::BreakInnerLoop(RetryDecision::None)
                     }
@@ -591,17 +602,23 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
             Ok(None) => {
                 self.store
                     .data_mut()
-                    .on_invocation_failure(&TrapType::Error(WorkerError::InvalidRequest(
-                        "Function not found".to_string(),
-                    )))
+                    .on_invocation_failure(&TrapType::Error {
+                        error: WorkerError::InvalidRequest("Function not found".to_string()),
+                        retry_from: OplogIndex::INITIAL,
+                    })
                     .await;
                 CommandOutcome::BreakInnerLoop(RetryDecision::None)
             }
 
-            Err(result) => {
+            Err(err) => {
                 self.store
                     .data_mut()
-                    .on_invocation_failure(&TrapType::Error(WorkerError::Unknown(result)))
+                    .on_invocation_failure(&TrapType::Error {
+                        error: WorkerError::InvalidRequest(format!(
+                            "Failed analysing function: {err}"
+                        )),
+                        retry_from: OplogIndex::INITIAL,
+                    })
                     .await;
                 CommandOutcome::BreakInnerLoop(RetryDecision::None)
             }
@@ -614,12 +631,12 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
         &mut self,
         full_function_name: String,
         function_input: &Vec<Value>,
-        output: Vec<Value>,
+        output: Option<Value>,
         consumed_fuel: i64,
-        function_results: Vec<AnalysedFunctionResult>,
-    ) -> Result<CommandOutcome, GolemError> {
-        let result = interpret_function_results(output, function_results).map_err(|e| {
-            GolemError::ValueMismatch {
+        function_result: Option<AnalysedFunctionResult>,
+    ) -> Result<CommandOutcome, WorkerExecutorError> {
+        let result = interpret_function_result(output, function_result).map_err(|e| {
+            WorkerExecutorError::ValueMismatch {
                 details: e.join(", "),
             }
         });
@@ -644,7 +661,7 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                 }
             }
             Err(error) => {
-                let trap_type = TrapType::from_error::<Ctx>(&anyhow!(error));
+                let trap_type = TrapType::from_error::<Ctx>(&anyhow!(error), OplogIndex::INITIAL);
 
                 self.store
                     .data_mut()
@@ -658,11 +675,14 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
     /// The logic handling a worker invocation that did not succeed.
     async fn exported_function_invocation_failed(
         &mut self,
-        result: Result<InvokeResult, GolemError>,
+        result: Result<InvokeResult, WorkerExecutorError>,
     ) -> CommandOutcome {
         let trap_type = match result {
             Ok(invoke_result) => invoke_result.as_trap_type::<Ctx>(),
-            Err(error) => Some(TrapType::from_error::<Ctx>(&anyhow!(error))),
+            Err(error) => Some(TrapType::from_error::<Ctx>(
+                &anyhow!(error),
+                OplogIndex::INITIAL,
+            )),
         };
         let decision = match trap_type {
             Some(trap_type) => {
@@ -683,7 +703,12 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
             Level::INFO,
             "manual_update",
             worker_id = %self.owned_worker_id.worker_id,
-            target_version = %target_version
+            target_version = %target_version,
+            agent_type = self.parent
+                .agent_id
+                .as_ref()
+                .map(|id| id.agent_type.clone())
+                .unwrap_or_else(|| "-".to_string()),
         );
 
         self.manual_update_inner(target_version)
@@ -700,105 +725,116 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                 .await;
             idempotency_key
         };
+        let component_metadata = self.store.data().component_metadata().metadata.clone();
 
-        if let Some(save_snapshot) = find_first_available_function(
-            self.store,
-            self.instance,
-            vec![
-                "golem:api/save-snapshot@1.1.0.{save}".to_string(),
-                "golem:api/save-snapshot@0.2.0.{save}".to_string(),
-            ],
-        ) {
-            self.store.data_mut().begin_call_snapshotting_function();
+        match component_metadata.save_snapshot() {
+            Ok(Some(save_snapshot)) => {
+                self.store.data_mut().begin_call_snapshotting_function();
 
-            let result =
-                invoke_observed_and_traced(save_snapshot, vec![], self.store, self.instance).await;
-            self.store.data_mut().end_call_snapshotting_function();
+                let result = invoke_observed_and_traced(
+                    save_snapshot.name.to_string(),
+                    vec![],
+                    self.store,
+                    self.instance,
+                    &component_metadata,
+                    true,
+                )
+                    .await;
+                self.store.data_mut().end_call_snapshotting_function();
 
-            match result {
-                Ok(InvokeResult::Succeeded { output, .. }) => {
-                    if let Some(bytes) = Self::decode_snapshot_result(output) {
-                        match self
+                match result {
+                    Ok(InvokeResult::Succeeded { output, .. }) => {
+                        if let Some(bytes) = Self::decode_snapshot_result(output) {
+                            match self
+                                .store
+                                .data()
+                                .get_public_state()
+                                .oplog()
+                                .create_snapshot_based_update_description(target_version, &bytes)
+                                .await
+                            {
+                                Ok(update_description) => {
+                                    // Enqueue the update
+                                    self.parent.enqueue_update(update_description).await;
+
+                                    // Reactivate the worker
+                                    CommandOutcome::BreakInnerLoop(RetryDecision::Immediate)
+                                    // Stop processing the queue to avoid race conditions
+                                }
+                                Err(error) => {
+                                    self.fail_update(
+                                        target_version,
+                                        format!(
+                                            "failed to store the snapshot for manual update: {error}"
+                                        ),
+                                    )
+                                        .await
+                                }
+                            }
+                        } else {
+                            self.fail_update(
+                                target_version,
+                                "failed to get a snapshot for manual update: invalid snapshot result"
+                                    .to_string(),
+                            )
+                                .await
+                        }
+                    }
+                    Ok(InvokeResult::Failed { error, .. }) => {
+                        let stderr = self
                             .store
                             .data()
                             .get_public_state()
-                            .oplog()
-                            .create_snapshot_based_update_description(target_version, &bytes)
-                            .await
-                        {
-                            Ok(update_description) => {
-                                // Enqueue the update
-                                self.parent.enqueue_update(update_description).await;
-
-                                // Make sure to update the pending updates queue
-                                self.store.data().update_pending_updates().await;
-
-                                // Reactivate the worker
-                                CommandOutcome::BreakInnerLoop(RetryDecision::Immediate)
-                                // Stop processing the queue to avoid race conditions
-                            }
-                            Err(error) => {
-                                self.fail_update(
-                                    target_version,
-                                    format!(
-                                        "failed to store the snapshot for manual update: {error}"
-                                    ),
-                                )
-                                .await
-                            }
-                        }
-                    } else {
+                            .event_service()
+                            .get_last_invocation_errors();
+                        let error = error.to_string(&stderr);
                         self.fail_update(
                             target_version,
-                            "failed to get a snapshot for manual update: invalid snapshot result"
+                            format!("failed to get a snapshot for manual update: {error}"),
+                        )
+                            .await
+                    }
+                    Ok(InvokeResult::Exited { .. }) => {
+                        self.fail_update(
+                            target_version,
+                            "failed to get a snapshot for manual update: it called exit"
                                 .to_string(),
                         )
-                        .await
+                            .await
+                    }
+                    Ok(InvokeResult::Interrupted { interrupt_kind, .. }) => {
+                        self.fail_update(
+                            target_version,
+                            format!(
+                                "failed to get a snapshot for manual update: {interrupt_kind:?}"
+                            ),
+                        )
+                            .await
+                    }
+                    Err(error) => {
+                        self.fail_update(
+                            target_version,
+                            format!("failed to get a snapshot for manual update: {error:?}"),
+                        )
+                            .await
                     }
                 }
-                Ok(InvokeResult::Failed { error, .. }) => {
-                    let stderr = self
-                        .store
-                        .data()
-                        .get_public_state()
-                        .event_service()
-                        .get_last_invocation_errors();
-                    let error = error.to_string(&stderr);
-                    self.fail_update(
-                        target_version,
-                        format!("failed to get a snapshot for manual update: {error}"),
-                    )
-                    .await
-                }
-                Ok(InvokeResult::Exited { .. }) => {
-                    self.fail_update(
-                        target_version,
-                        "failed to get a snapshot for manual update: it called exit".to_string(),
-                    )
-                    .await
-                }
-                Ok(InvokeResult::Interrupted { interrupt_kind, .. }) => {
-                    self.fail_update(
-                        target_version,
-                        format!("failed to get a snapshot for manual update: {interrupt_kind:?}"),
-                    )
-                    .await
-                }
-                Err(error) => {
-                    self.fail_update(
-                        target_version,
-                        format!("failed to get a snapshot for manual update: {error:?}"),
-                    )
-                    .await
-                }
             }
-        } else {
-            self.fail_update(
-                target_version,
-                "failed to get a snapshot for manual update: save-snapshot is not exported"
-                    .to_string(),
-            )
-            .await
+            Ok(None) => {
+                self.fail_update(
+                    target_version,
+                    "failed to get a snapshot for manual update: save-snapshot is not exported"
+                        .to_string(),
+                )
+                    .await
+            }
+            Err(error) => {
+                self.fail_update(
+                    target_version,
+                    format!("failed to get a snapshot for manual update: error while finding the exported save-snapshot function: {error}"),
+                )
+                    .await
+            }
         }
     }
 
@@ -806,12 +842,12 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
     ///
     /// These are threaded through the invocation loop to make sure they are not accessing the file system concurrently with invocations
     /// that may modify them.
-    async fn list_directory(
+    async fn get_file_system_node(
         &self,
         path: ComponentFilePath,
-        sender: Sender<Result<ListDirectoryResult, GolemError>>,
+        sender: Sender<Result<GetFileSystemNodeResult, WorkerExecutorError>>,
     ) {
-        let result = self.store.data().list_directory(&path).await;
+        let result = self.store.data().get_file_system_node(&path).await;
         let _ = sender.send(result);
     }
 
@@ -822,7 +858,7 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
     async fn read_file(
         &self,
         path: ComponentFilePath,
-        sender: Sender<Result<ReadFileResult, GolemError>>,
+        sender: Sender<Result<ReadFileResult, WorkerExecutorError>>,
     ) {
         let result = self.store.data().read_file(&path).await;
         match result {
@@ -854,21 +890,17 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
     }
 
     /// Attempts to interpret the save snapshot result as a byte vector
-    fn decode_snapshot_result(values: Vec<Value>) -> Option<Vec<u8>> {
-        if values.len() == 1 {
-            if let Value::List(bytes) = &values[0] {
-                let mut result = Vec::new();
-                for value in bytes {
-                    if let Value::U8(byte) = value {
-                        result.push(*byte);
-                    } else {
-                        return None;
-                    }
+    fn decode_snapshot_result(value: Option<Value>) -> Option<Vec<u8>> {
+        if let Some(Value::List(bytes)) = value {
+            let mut result = Vec::new();
+            for value in bytes {
+                if let Value::U8(byte) = value {
+                    result.push(byte);
+                } else {
+                    return None;
                 }
-                Some(result)
-            } else {
-                None
             }
+            Some(result)
         } else {
             None
         }
@@ -880,6 +912,7 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
         idempotency_key: &IdempotencyKey,
         full_function_name: &str,
         worker_id: &WorkerId,
+        agent_id: &Option<AgentId>,
     ) {
         let invocation_span = invocation_context.spans.first().start_span(None);
         invocation_span.set_attribute(
@@ -898,11 +931,22 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
             "worker_id".to_string(),
             AttributeValue::String(worker_id.to_string()),
         );
+        if let Some(agent_id) = agent_id {
+            invocation_span.set_attribute(
+                "agent_type".to_string(),
+                AttributeValue::String(agent_id.agent_type.clone()),
+            );
+            invocation_span.set_attribute(
+                "agent_parameters".to_string(),
+                AttributeValue::String(agent_id.parameters.to_string()),
+            )
+        }
         invocation_context.push(invocation_span);
     }
 }
 
 /// Outcome of processing a single command within the inner invocation loop
+#[derive(Debug)]
 enum CommandOutcome {
     /// Break from both the inner and outer loops, there is no way to retry anything
     BreakOuterLoop,

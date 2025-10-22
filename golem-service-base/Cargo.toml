@@ -14,16 +14,18 @@ autotests = false
 [lib]
 harness = false
 
+[features]
+default = []
+worker-executor = [ "dep:wasmtime-wasi" ]
+
 [dependencies]
-golem-api-grpc = { path = "../golem-api-grpc", version = "=0.0.0" }
-golem-common = { path = "../golem-common", version = "=0.0.0" }
-golem-wasm-ast = { path = "../wasm-ast", version = "=0.0.0" }
-golem-wasm-rpc = { path = "../wasm-rpc", version = "=0.0.0", default-features = false, features = [
-    "host",
-] }
-golem-wasm-rpc-derive = { path = "../wasm-rpc-derive", version = "=0.0.0" }
+golem-api-grpc = { workspace = true }
+golem-common = { workspace = true }
+golem-wasm = { workspace = true }
+golem-wasm-derive = { workspace = true }
 
 anyhow = { workspace = true }
+applying = { workspace = true }
 async-fs = { workspace = true }
 async-hash = { workspace = true }
 async-trait = { workspace = true }
@@ -31,26 +33,29 @@ axum = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 bincode = { workspace = true }
-bitflags = "2.6.0"
+bitflags = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 conditional-trait-gen = { workspace = true }
 dashmap = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
+headers = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 humantime-serde = { workspace = true }
+include_dir = { workspace = true }
 lazy_static = { workspace = true }
-pin-project = "1.1.10"
+pin-project = { workspace = true }
 poem = { workspace = true }
 poem-openapi = { workspace = true }
 poem-openapi-derive = { workspace = true }
 prometheus = { workspace = true }
 prost-types = { workspace = true }
 reqwest = { workspace = true }
+scc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = [
@@ -68,10 +73,12 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
+wasmtime-wasi = { workspace = true, optional = true }
 
 [dev-dependencies]
-assert2 = { workspace = true }
+pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 test-r = { workspace = true }
 testcontainers = { workspace = true }

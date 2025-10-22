@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod api;
 pub mod api_tags;
-pub mod auth;
+pub mod clients;
 pub mod config;
 pub mod db;
+pub mod dto;
+pub mod error;
+pub mod grpc;
 pub mod headers;
 pub mod metrics;
 pub mod migration;
@@ -27,6 +31,7 @@ pub mod repo;
 pub mod service;
 pub mod storage;
 pub mod stream;
+pub mod testing;
 
 #[cfg(test)]
 test_r::enable!();

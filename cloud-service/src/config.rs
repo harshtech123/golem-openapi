@@ -1,14 +1,29 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::model::{Plan, PlanData};
-use cloud_common::config::RemoteCloudServiceConfig;
-use cloud_common::model::PlanId;
-use cloud_common::model::Role;
 use golem_common::config::ConfigLoader;
 use golem_common::config::DbConfig;
+use golem_common::model::auth::Role;
+use golem_common::model::{Empty, PlanId};
 use golem_common::tracing::TracingConfig;
+use golem_common::SafeDisplay;
+use golem_service_base::clients::RemoteServiceConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::path::PathBuf;
 use uuid::uuid;
 use uuid::Uuid;
 
@@ -21,11 +36,39 @@ pub struct CloudServiceConfig {
     pub grpc_port: u16,
     pub db: DbConfig,
     pub plans: PlansConfig,
-    pub ed_dsa: EdDsaConfig,
     pub accounts: AccountsConfig,
-    pub oauth2: OAuth2Config,
-    pub component_service: RemoteCloudServiceConfig,
+    pub login: LoginConfig,
+    pub component_service: RemoteServiceConfig,
     pub cors_origin_regex: String,
+}
+
+impl SafeDisplay for CloudServiceConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "tracing:");
+        let _ = writeln!(&mut result, "{}", self.tracing.to_safe_string_indented());
+        let _ = writeln!(&mut result, "environment: {}", self.environment);
+        let _ = writeln!(&mut result, "workspace: {}", self.workspace);
+        let _ = writeln!(&mut result, "HTTP port: {}", self.http_port);
+        let _ = writeln!(&mut result, "gRPC port: {}", self.grpc_port);
+        let _ = writeln!(&mut result, "DB:");
+        let _ = writeln!(&mut result, "{}", self.db.to_safe_string_indented());
+        let _ = writeln!(&mut result, "plans:");
+        let _ = writeln!(&mut result, "{}", self.plans.to_safe_string_indented());
+        let _ = writeln!(&mut result, "accounts:");
+        let _ = writeln!(&mut result, "{}", self.accounts.to_safe_string_indented());
+        let _ = writeln!(&mut result, "login:");
+        let _ = writeln!(&mut result, "{}", self.login.to_safe_string_indented());
+        let _ = writeln!(&mut result, "component service:");
+        let _ = writeln!(
+            &mut result,
+            "{}",
+            self.component_service.to_safe_string_indented()
+        );
+        let _ = writeln!(&mut result, "CORS origin regex: {}", self.cors_origin_regex);
+
+        result
+    }
 }
 
 impl Default for CloudServiceConfig {
@@ -38,10 +81,9 @@ impl Default for CloudServiceConfig {
             grpc_port: 8081,
             db: DbConfig::default(),
             plans: PlansConfig::default(),
-            ed_dsa: EdDsaConfig::default(),
             accounts: AccountsConfig::default(),
-            oauth2: OAuth2Config::default(),
-            component_service: RemoteCloudServiceConfig::default(),
+            login: LoginConfig::default(),
+            component_service: RemoteServiceConfig::default(),
             cors_origin_regex: "https://*.golem.cloud".to_string(),
         }
     }
@@ -51,6 +93,15 @@ impl Default for CloudServiceConfig {
 pub struct EdDsaConfig {
     pub private_key: String,
     pub public_key: String,
+}
+
+impl SafeDisplay for EdDsaConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "public key: {}", self.public_key);
+        let _ = writeln!(&mut result, "private key: ****");
+        result
+    }
 }
 
 impl Default for EdDsaConfig {
@@ -68,6 +119,15 @@ pub struct PlansConfig {
     pub default: PlanConfig,
 }
 
+impl SafeDisplay for PlansConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "default:");
+        let _ = writeln!(&mut result, "{}", self.default.to_safe_string_indented());
+        result
+    }
+}
+
 impl Default for PlansConfig {
     fn default() -> Self {
         PlansConfig {
@@ -79,6 +139,7 @@ impl Default for PlansConfig {
                 storage_limit: 500000000,
                 monthly_gas_limit: 1000000000000,
                 monthly_upload_limit: 1000000000,
+                max_memory_per_worker: 1024 * 1024 * 1024, // 1 GB
             },
         }
     }
@@ -93,6 +154,25 @@ pub struct PlanConfig {
     pub storage_limit: i32,
     pub monthly_gas_limit: i64,
     pub monthly_upload_limit: i32,
+    pub max_memory_per_worker: i64,
+}
+
+impl SafeDisplay for PlanConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "Plan ID: {}", self.plan_id);
+        let _ = writeln!(&mut result, "Project limit: {}", self.project_limit);
+        let _ = writeln!(&mut result, "Component limit: {}", self.component_limit);
+        let _ = writeln!(&mut result, "Worker limit: {}", self.worker_limit);
+        let _ = writeln!(&mut result, "Storage limit: {}", self.storage_limit);
+        let _ = writeln!(&mut result, "Monthly gas limit: {}", self.monthly_gas_limit);
+        let _ = writeln!(
+            &mut result,
+            "Monthly upload limit: {}",
+            self.monthly_upload_limit
+        );
+        result
+    }
 }
 
 impl From<PlanConfig> for Plan {
@@ -106,24 +186,81 @@ impl From<PlanConfig> for Plan {
                 storage_limit: config.storage_limit,
                 monthly_gas_limit: config.monthly_gas_limit,
                 monthly_upload_limit: config.monthly_upload_limit,
+                max_memory_per_worker: config.max_memory_per_worker,
             },
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OAuth2Config {
-    pub github_client_id: String,
-    pub github_client_secret: String,
-    pub github_redirect_uri: url::Url,
+#[serde(tag = "type", content = "config")]
+pub enum LoginConfig {
+    OAuth2(OAuth2Config),
+    Disabled(Empty),
 }
 
-impl Default for OAuth2Config {
+impl SafeDisplay for LoginConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        match self {
+            LoginConfig::OAuth2(inner) => {
+                let _ = writeln!(&mut result, "OAuth2:");
+                let _ = writeln!(&mut result, "{}", inner.to_safe_string_indented());
+            }
+            LoginConfig::Disabled(_) => {
+                let _ = writeln!(&mut result, "disabled");
+            }
+        }
+        result
+    }
+}
+
+impl Default for LoginConfig {
+    fn default() -> LoginConfig {
+        LoginConfig::OAuth2(OAuth2Config::default())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OAuth2Config {
+    pub github: GitHubOAuth2Config,
+    pub ed_dsa: EdDsaConfig,
+}
+
+impl SafeDisplay for OAuth2Config {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "GitHub:");
+        let _ = writeln!(&mut result, "{}", self.github.to_safe_string_indented());
+        let _ = writeln!(&mut result, "EdDSA:");
+        let _ = writeln!(&mut result, "{}", self.ed_dsa.to_safe_string_indented());
+        result
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GitHubOAuth2Config {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: url::Url,
+}
+
+impl SafeDisplay for GitHubOAuth2Config {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "client id: {}", self.client_id);
+        let _ = writeln!(&mut result, "client secret: ****");
+        let _ = writeln!(&mut result, "redirect uri: {}", self.redirect_uri);
+        result
+    }
+}
+
+impl Default for GitHubOAuth2Config {
     fn default() -> Self {
-        OAuth2Config {
-            github_client_id: "GITHUB_CLIENT_ID".to_string(),
-            github_client_secret: "GITHUB_CLIENT_SECRET".to_string(),
-            github_redirect_uri: url::Url::parse(
+        Self {
+            client_id: "GITHUB_CLIENT_ID".to_string(),
+            client_secret: "GITHUB_CLIENT_SECRET".to_string(),
+            redirect_uri: url::Url::parse(
                 "http://localhost:8080/v1/login/oauth2/web/callback/github",
             )
             .unwrap(),
@@ -135,6 +272,17 @@ impl Default for OAuth2Config {
 #[serde(transparent)]
 pub struct AccountsConfig {
     pub accounts: HashMap<String, AccountConfig>,
+}
+
+impl SafeDisplay for AccountsConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        for (id, account) in &self.accounts {
+            let _ = writeln!(&mut result, "{id}:");
+            let _ = writeln!(&mut result, "{}", account.to_safe_string_indented());
+        }
+        result
+    }
 }
 
 impl Default for AccountsConfig {
@@ -171,6 +319,18 @@ pub struct AccountConfig {
     pub email: String,
     pub token: Uuid,
     pub role: Role,
+}
+
+impl SafeDisplay for AccountConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "id: {}", self.id);
+        let _ = writeln!(&mut result, "name: {}", self.name);
+        let _ = writeln!(&mut result, "email: {}", self.email);
+        let _ = writeln!(&mut result, "token: ****");
+        let _ = writeln!(&mut result, "role: {:?}", self.role);
+        result
+    }
 }
 
 pub fn make_config_loader() -> ConfigLoader<CloudServiceConfig> {

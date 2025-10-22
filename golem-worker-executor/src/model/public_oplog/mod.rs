@@ -23,54 +23,52 @@ use crate::durable_host::serialized::{
     SerializableIpAddresses, SerializableStreamError,
 };
 use crate::durable_host::wasm_rpc::serialized::{
+    EnrichedSerializableInvokeRequest, EnrichedSerializableScheduleInvocationRequest,
     SerializableInvokeRequest, SerializableInvokeResult, SerializableScheduleId,
     SerializableScheduleInvocationRequest,
 };
-use crate::error::GolemError;
+use crate::preview2::golem_api_1_x::host::ForkResult;
 use crate::services::component::ComponentService;
 use crate::services::oplog::OplogService;
 use crate::services::plugins::Plugins;
+use crate::services::projects::ProjectService;
 use crate::services::rdbms::mysql::types as mysql_types;
 use crate::services::rdbms::mysql::MysqlType;
 use crate::services::rdbms::postgres::types as postgres_types;
 use crate::services::rdbms::postgres::PostgresType;
 use crate::services::rdbms::RdbmsIntoValueAndType;
 use crate::services::rpc::RpcError;
-use crate::GolemTypes;
 use async_trait::async_trait;
 use bincode::Decode;
 use golem_api_grpc::proto::golem::worker::UpdateMode;
-use golem_common::model::exports::{find_resource_site, function_by_name};
-use golem_common::model::invocation_context::TraceId;
+use golem_common::model::agent::{AgentId, DataValue, RegisteredAgentType};
 use golem_common::model::lucene::Query;
 use golem_common::model::oplog::{OplogEntry, OplogIndex, SpanData, UpdateDescription};
 use golem_common::model::public_oplog::{
-    ActivatePluginParameters, CancelInvocationParameters, ChangePersistenceLevelParameters,
-    ChangeRetryPolicyParameters, CreateParameters, DeactivatePluginParameters,
-    DescribeResourceParameters, EndRegionParameters, ErrorParameters,
+    ActivatePluginParameters, BeginRemoteTransactionParameters, CancelInvocationParameters,
+    ChangePersistenceLevelParameters, ChangeRetryPolicyParameters, CreateParameters,
+    DeactivatePluginParameters, EndRegionParameters, ErrorParameters,
     ExportedFunctionCompletedParameters, ExportedFunctionInvokedParameters,
     ExportedFunctionParameters, FailedUpdateParameters, FinishSpanParameters, GrowMemoryParameters,
     ImportedFunctionInvokedParameters, JumpParameters, LogParameters, ManualUpdateParameters,
     PendingUpdateParameters, PendingWorkerInvocationParameters, PluginInstallationDescription,
     PublicAttribute, PublicExternalSpanData, PublicLocalSpanData, PublicOplogEntry, PublicSpanData,
-    PublicUpdateDescription, PublicWorkerInvocation, ResourceParameters, RevertParameters,
-    SetSpanAttributeParameters, SnapshotBasedUpdateParameters, StartSpanParameters,
-    SuccessfulUpdateParameters, TimestampParameter,
+    PublicUpdateDescription, PublicWorkerInvocation, RemoteTransactionParameters,
+    ResourceParameters, RevertParameters, SetSpanAttributeParameters,
+    SnapshotBasedUpdateParameters, StartSpanParameters, SuccessfulUpdateParameters,
+    TimestampParameter,
 };
 use golem_common::model::{
     ComponentId, ComponentVersion, Empty, OwnedWorkerId, PromiseId, WorkerId, WorkerInvocation,
 };
 use golem_common::serialization::try_deserialize as core_try_deserialize;
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 use golem_service_base::model::RevertWorkerTarget;
-use golem_wasm_ast::analysis::analysed_type::{
+use golem_wasm::analysis::analysed_type::{
     case, field, list, option, record, result, result_err, str, u64, unit_case, variant,
 };
-use golem_wasm_ast::analysis::{AnalysedFunctionParameter, AnalysedType};
-use golem_wasm_rpc::protobuf::type_annotated_value::TypeAnnotatedValue;
-use golem_wasm_rpc::{
-    parse_type_annotated_value, IntoValue, IntoValueAndType, Value, ValueAndType, WitValue,
-};
-use rib::{ParsedFunctionName, ParsedFunctionReference};
+use golem_wasm::analysis::{AnalysedFunctionParameter, AnalysedType};
+use golem_wasm::{IntoValue, IntoValueAndType, Value, ValueAndType, WitValue};
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -84,10 +82,11 @@ pub struct PublicOplogChunk {
     pub last_index: OplogIndex,
 }
 
-pub async fn get_public_oplog_chunk<T: GolemTypes>(
-    component_service: Arc<dyn ComponentService<T>>,
+pub async fn get_public_oplog_chunk(
+    components: Arc<dyn ComponentService>,
     oplog_service: Arc<dyn OplogService>,
-    plugins: Arc<dyn Plugins<T>>,
+    plugins: Arc<dyn Plugins>,
+    projects: Arc<dyn ProjectService>,
     owned_worker_id: &OwnedWorkerId,
     initial_component_version: ComponentVersion,
     initial_oplog_index: OplogIndex,
@@ -102,17 +101,23 @@ pub async fn get_public_oplog_chunk<T: GolemTypes>(
     let mut entries = Vec::new();
     let mut current_component_version = initial_component_version;
     let mut next_oplog_index = initial_oplog_index;
+    let mut first_index_in_chunk = None;
 
     for (index, raw_entry) in raw_entries {
+        if first_index_in_chunk.is_none() {
+            first_index_in_chunk = Some(index);
+        }
         if let Some(version) = raw_entry.specifies_component_version() {
             current_component_version = version;
         }
 
         let entry = PublicOplogEntry::from_oplog_entry(
+            index,
             raw_entry,
             oplog_service.clone(),
-            component_service.clone(),
+            components.clone(),
             plugins.clone(),
+            projects.clone(),
             owned_worker_id,
             current_component_version,
         )
@@ -125,7 +130,7 @@ pub async fn get_public_oplog_chunk<T: GolemTypes>(
         entries,
         next_oplog_index,
         current_component_version,
-        first_index_in_chunk: initial_oplog_index,
+        first_index_in_chunk: first_index_in_chunk.unwrap_or(initial_oplog_index),
         last_index,
     })
 }
@@ -137,10 +142,11 @@ pub struct PublicOplogSearchResult {
     pub last_index: OplogIndex,
 }
 
-pub async fn search_public_oplog<T: GolemTypes>(
-    component_service: Arc<dyn ComponentService<T>>,
+pub async fn search_public_oplog(
+    component_service: Arc<dyn ComponentService>,
     oplog_service: Arc<dyn OplogService>,
-    plugin_service: Arc<dyn Plugins<T>>,
+    plugin_service: Arc<dyn Plugins>,
+    project_service: Arc<dyn ProjectService>,
     owned_worker_id: &OwnedWorkerId,
     initial_component_version: ComponentVersion,
     initial_oplog_index: OplogIndex,
@@ -159,6 +165,7 @@ pub async fn search_public_oplog<T: GolemTypes>(
             component_service.clone(),
             oplog_service.clone(),
             plugin_service.clone(),
+            project_service.clone(),
             owned_worker_id,
             current_component_version,
             current_index,
@@ -196,7 +203,7 @@ pub async fn find_component_version_at(
     oplog_service: Arc<dyn OplogService>,
     owned_worker_id: &OwnedWorkerId,
     start: OplogIndex,
-) -> Result<ComponentVersion, GolemError> {
+) -> Result<ComponentVersion, WorkerExecutorError> {
     let mut initial_component_version = 0;
     let last_oplog_index = oplog_service.get_last_index(owned_worker_id).await;
     let mut current = OplogIndex::INITIAL;
@@ -220,67 +227,55 @@ pub async fn find_component_version_at(
 }
 
 #[async_trait]
-pub trait PublicOplogEntryOps<T: GolemTypes>: Sized {
+pub trait PublicOplogEntryOps: Sized {
     async fn from_oplog_entry(
+        oplog_index: OplogIndex,
         value: OplogEntry,
         oplog_service: Arc<dyn OplogService>,
-        components: Arc<dyn ComponentService<T>>,
-        plugins: Arc<dyn Plugins<T>>,
+        components: Arc<dyn ComponentService>,
+        plugins: Arc<dyn Plugins>,
+        projects: Arc<dyn ProjectService>,
         owned_worker_id: &OwnedWorkerId,
         component_version: ComponentVersion,
     ) -> Result<Self, String>;
 }
 
 #[async_trait]
-impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
+impl PublicOplogEntryOps for PublicOplogEntry {
     async fn from_oplog_entry(
+        oplog_index: OplogIndex,
         value: OplogEntry,
         oplog_service: Arc<dyn OplogService>,
-        components: Arc<dyn ComponentService<T>>,
-        plugins: Arc<dyn Plugins<T>>,
+        components: Arc<dyn ComponentService>,
+        plugins: Arc<dyn Plugins>,
+        projects: Arc<dyn ProjectService>,
         owned_worker_id: &OwnedWorkerId,
         component_version: ComponentVersion,
     ) -> Result<Self, String> {
         match value {
-            OplogEntry::CreateV1 {
-                timestamp,
-                worker_id,
-                component_version,
-                args,
-                env,
-                account_id,
-                parent,
-                component_size,
-                initial_total_linear_memory_size,
-            } => Ok(PublicOplogEntry::Create(CreateParameters {
-                timestamp,
-                worker_id,
-                component_version,
-                args,
-                env: env.into_iter().collect(),
-                account_id,
-                parent,
-                component_size,
-                initial_total_linear_memory_size,
-                initial_active_plugins: BTreeSet::new(),
-            })),
             OplogEntry::Create {
                 timestamp,
                 worker_id,
                 component_version,
                 args,
                 env,
-                account_id,
+                project_id,
+                created_by,
                 parent,
                 component_size,
                 initial_total_linear_memory_size,
                 initial_active_plugins,
+                wasi_config_vars,
             } => {
+                let project_owner = projects
+                    .get_project_owner(&project_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 let mut initial_plugins = BTreeSet::new();
                 for installation_id in initial_active_plugins {
                     let (installation, definition) = plugins
                         .get(
-                            &account_id,
+                            &project_owner,
                             &worker_id.component_id,
                             component_version,
                             &installation_id,
@@ -299,39 +294,21 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                     component_version,
                     args,
                     env: env.into_iter().collect(),
-                    account_id,
+                    project_id,
+                    created_by,
                     parent,
                     component_size,
                     initial_total_linear_memory_size,
                     initial_active_plugins: initial_plugins,
+                    wasi_config_vars: wasi_config_vars.into(),
                 }))
-            }
-            OplogEntry::ImportedFunctionInvokedV1 {
-                timestamp,
-                function_name,
-                response,
-                wrapped_function_type,
-            } => {
-                let payload_bytes = oplog_service
-                    .download_payload(owned_worker_id, &response)
-                    .await?;
-                let value = encode_host_function_response_as_value(&function_name, &payload_bytes)?;
-                Ok(PublicOplogEntry::ImportedFunctionInvoked(
-                    ImportedFunctionInvokedParameters {
-                        timestamp,
-                        function_name,
-                        request: no_payload()?,
-                        response: value,
-                        wrapped_function_type: wrapped_function_type.into(),
-                    },
-                ))
             }
             OplogEntry::ImportedFunctionInvoked {
                 timestamp,
                 function_name,
                 request,
                 response,
-                wrapped_function_type,
+                durable_function_type,
             } => {
                 let request_bytes = oplog_service
                     .download_payload(owned_worker_id, &request)
@@ -339,70 +316,25 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                 let response_bytes = oplog_service
                     .download_payload(owned_worker_id, &response)
                     .await?;
-                let request =
-                    encode_host_function_request_as_value(&function_name, &request_bytes)?;
-                let response =
-                    encode_host_function_response_as_value(&function_name, &response_bytes)?;
+                let request = encode_host_function_request_as_value(
+                    oplog_index,
+                    components,
+                    &function_name,
+                    &request_bytes,
+                )
+                .await?;
+                let response = encode_host_function_response_as_value(
+                    oplog_index,
+                    &function_name,
+                    &response_bytes,
+                )?;
                 Ok(PublicOplogEntry::ImportedFunctionInvoked(
                     ImportedFunctionInvokedParameters {
                         timestamp,
                         function_name,
                         request,
                         response,
-                        wrapped_function_type: wrapped_function_type.into(),
-                    },
-                ))
-            }
-            OplogEntry::ExportedFunctionInvokedV1 {
-                timestamp,
-                function_name,
-                request,
-                idempotency_key,
-            } => {
-                let payload_bytes = oplog_service
-                    .download_payload(owned_worker_id, &request)
-                    .await?;
-                let proto_params: Vec<golem_wasm_rpc::protobuf::Val> =
-                    core_try_deserialize(&payload_bytes)?.unwrap_or_default();
-                let params = proto_params
-                    .into_iter()
-                    .map(Value::try_from)
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let metadata = components
-                    .get_metadata(
-                        &owned_worker_id.account_id,
-                        &owned_worker_id.worker_id.component_id,
-                        Some(component_version),
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?;
-                let function = function_by_name(&metadata.exports, &function_name)?.ok_or(
-                        format!("Exported function {function_name} not found in component {} version {component_version}", owned_worker_id.component_id())
-                    )?;
-
-                let parsed = ParsedFunctionName::parse(&function_name)?;
-                let param_types: Box<dyn Iterator<Item = &AnalysedFunctionParameter>> =
-                    if parsed.function().is_indexed_resource() {
-                        Box::new(function.parameters.iter().skip(1))
-                    } else {
-                        Box::new(function.parameters.iter())
-                    };
-
-                let request = param_types
-                    .zip(params)
-                    .map(|(param, value)| ValueAndType::new(value, param.typ.clone()))
-                    .collect();
-
-                Ok(PublicOplogEntry::ExportedFunctionInvoked(
-                    ExportedFunctionInvokedParameters {
-                        timestamp,
-                        function_name,
-                        request,
-                        idempotency_key,
-                        trace_id: TraceId::generate(),
-                        trace_states: vec![],
-                        invocation_context: vec![],
+                        durable_function_type: durable_function_type.into(),
                     },
                 ))
             }
@@ -418,7 +350,7 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                 let payload_bytes = oplog_service
                     .download_payload(owned_worker_id, &request)
                     .await?;
-                let proto_params: Vec<golem_wasm_rpc::protobuf::Val> =
+                let proto_params: Vec<golem_wasm::protobuf::Val> =
                     core_try_deserialize(&payload_bytes)?.unwrap_or_default();
                 let params = proto_params
                     .into_iter()
@@ -427,23 +359,17 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
 
                 let metadata = components
                     .get_metadata(
-                        &owned_worker_id.account_id,
                         &owned_worker_id.worker_id.component_id,
                         Some(component_version),
                     )
                     .await
                     .map_err(|err| err.to_string())?;
-                let function = function_by_name(&metadata.exports, &function_name)?.ok_or(
+                let function = metadata.metadata.find_function(&function_name)?.ok_or(
                     format!("Exported function {function_name} not found in component {} version {component_version}", owned_worker_id.component_id())
                 )?;
 
-                let parsed = ParsedFunctionName::parse(&function_name)?;
                 let param_types: Box<dyn Iterator<Item = &AnalysedFunctionParameter>> =
-                    if parsed.function().is_indexed_resource() {
-                        Box::new(function.parameters.iter().skip(1))
-                    } else {
-                        Box::new(function.parameters.iter())
-                    };
+                    Box::new(function.analysed_export.parameters.iter());
 
                 let request = param_types
                     .zip(params)
@@ -470,19 +396,15 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                 let payload_bytes = oplog_service
                     .download_payload(owned_worker_id, &response)
                     .await?;
-                let proto_type_annotated_value: TypeAnnotatedValue =
-                    core_try_deserialize(&payload_bytes)?.unwrap_or(TypeAnnotatedValue::Record(
-                        golem_wasm_rpc::protobuf::TypedRecord {
-                            typ: Vec::new(),
-                            value: Vec::new(),
-                        },
-                    ));
-                let typ: AnalysedType = AnalysedType::try_from(&proto_type_annotated_value)?;
-                let value = Value::try_from(proto_type_annotated_value)?;
+                let value_and_type: Option<ValueAndType> = try_deserialize(
+                    oplog_index,
+                    "ExportedFunctionCompleted payload",
+                    &payload_bytes,
+                )?;
                 Ok(PublicOplogEntry::ExportedFunctionCompleted(
                     ExportedFunctionCompletedParameters {
                         timestamp,
-                        response: ValueAndType::new(value, typ),
+                        response: value_and_type,
                         consumed_fuel,
                     },
                 ))
@@ -490,12 +412,15 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
             OplogEntry::Suspend { timestamp } => {
                 Ok(PublicOplogEntry::Suspend(TimestampParameter { timestamp }))
             }
-            OplogEntry::Error { timestamp, error } => {
-                Ok(PublicOplogEntry::Error(ErrorParameters {
-                    timestamp,
-                    error: error.to_string(""),
-                }))
-            }
+            OplogEntry::Error {
+                timestamp,
+                error,
+                retry_from,
+            } => Ok(PublicOplogEntry::Error(ErrorParameters {
+                timestamp,
+                error: error.to_string(""),
+                retry_from,
+            })),
             OplogEntry::NoOp { timestamp } => {
                 Ok(PublicOplogEntry::NoOp(TimestampParameter { timestamp }))
             }
@@ -556,14 +481,13 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                     } => {
                         let metadata = components
                             .get_metadata(
-                                &owned_worker_id.account_id,
                                 &owned_worker_id.worker_id.component_id,
                                 Some(component_version),
                             )
                             .await
                             .map_err(|err| err.to_string())?;
 
-                        let function = function_by_name(&metadata.exports, &full_function_name)?;
+                        let function = metadata.metadata.find_function(&full_function_name)?;
 
                         // It is not guaranteed that we can resolve the enqueued invocation's parameter types because
                         // we only know the current component version. If the client enqueued an update earlier and assumes
@@ -572,9 +496,10 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                         // If we cannot resolve the type, we leave the `function_input` field empty in the public oplog.
                         let mut params = None;
                         if let Some(function) = function {
-                            if function.parameters.len() == function_input.len() {
+                            if function.analysed_export.parameters.len() == function_input.len() {
                                 params = Some(
                                     function
+                                        .analysed_export
                                         .parameters
                                         .iter()
                                         .zip(function_input)
@@ -634,29 +559,21 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                     description: public_description,
                 }))
             }
-            OplogEntry::SuccessfulUpdateV1 {
-                timestamp,
-                target_version,
-                new_component_size,
-            } => Ok(PublicOplogEntry::SuccessfulUpdate(
-                SuccessfulUpdateParameters {
-                    timestamp,
-                    target_version,
-                    new_component_size,
-                    new_active_plugins: BTreeSet::new(),
-                },
-            )),
             OplogEntry::SuccessfulUpdate {
                 timestamp,
                 target_version,
                 new_component_size,
                 new_active_plugins,
             } => {
+                let project_owner = projects
+                    .get_project_owner(&owned_worker_id.project_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 let mut new_plugins = BTreeSet::new();
                 for installation_id in new_active_plugins {
                     let (installation, definition) = plugins
                         .get(
-                            &owned_worker_id.account_id,
+                            &project_owner,
                             &owned_worker_id.worker_id.component_id,
                             target_version,
                             &installation_id,
@@ -694,69 +611,27 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                     delta,
                 }))
             }
-            OplogEntry::CreateResource { timestamp, id } => {
-                Ok(PublicOplogEntry::CreateResource(ResourceParameters {
-                    timestamp,
-                    id,
-                }))
-            }
-            OplogEntry::DropResource { timestamp, id } => {
-                Ok(PublicOplogEntry::DropResource(ResourceParameters {
-                    timestamp,
-                    id,
-                }))
-            }
-            OplogEntry::DescribeResource {
+            OplogEntry::CreateResource {
                 timestamp,
                 id,
-                indexed_resource,
-            } => {
-                let metadata = components
-                    .get_metadata(
-                        &owned_worker_id.account_id,
-                        &owned_worker_id.worker_id.component_id,
-                        Some(component_version),
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?;
+                resource_type_id,
+            } => Ok(PublicOplogEntry::CreateResource(ResourceParameters {
+                timestamp,
+                id,
+                name: resource_type_id.name,
+                owner: resource_type_id.owner,
+            })),
+            OplogEntry::DropResource {
+                timestamp,
+                id,
+                resource_type_id,
+            } => Ok(PublicOplogEntry::DropResource(ResourceParameters {
+                timestamp,
+                id,
+                name: resource_type_id.name,
+                owner: resource_type_id.owner,
+            })),
 
-                let resource_name = indexed_resource.resource_name.clone();
-                let resource_constructor_name = ParsedFunctionName::new(
-                    find_resource_site(&metadata.exports, &resource_name).ok_or(format!(
-                        "Resource site for resource {} not found in component {} version {}",
-                        resource_name,
-                        owned_worker_id.component_id(),
-                        component_version
-                    ))?,
-                    ParsedFunctionReference::RawResourceConstructor {
-                        resource: resource_name.clone(),
-                    },
-                );
-                let constructor_def = function_by_name(&metadata.exports, &resource_constructor_name.to_string())?.ok_or(
-                        format!("Resource constructor {resource_constructor_name} not found in component {} version {component_version}", owned_worker_id.component_id())
-                    )?;
-
-                let mut resource_params = Vec::new();
-                for (value_str, param) in indexed_resource
-                    .resource_params
-                    .iter()
-                    .zip(constructor_def.parameters)
-                {
-                    let type_annotated_value: TypeAnnotatedValue =
-                        parse_type_annotated_value(&param.typ, value_str)?;
-                    let value = type_annotated_value.try_into()?;
-                    let value_and_type = ValueAndType::new(value, param.typ.clone());
-                    resource_params.push(value_and_type);
-                }
-                Ok(PublicOplogEntry::DescribeResource(
-                    DescribeResourceParameters {
-                        timestamp,
-                        id,
-                        resource_name,
-                        resource_params,
-                    },
-                ))
-            }
             OplogEntry::Log {
                 timestamp,
                 level,
@@ -772,9 +647,13 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                 Ok(PublicOplogEntry::Restart(TimestampParameter { timestamp }))
             }
             OplogEntry::ActivatePlugin { timestamp, plugin } => {
+                let project_owner = projects
+                    .get_project_owner(&owned_worker_id.project_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 let (installation, definition) = plugins
                     .get(
-                        &owned_worker_id.account_id,
+                        &project_owner,
                         &owned_worker_id.worker_id.component_id,
                         component_version,
                         &plugin,
@@ -791,9 +670,13 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                 }))
             }
             OplogEntry::DeactivatePlugin { timestamp, plugin } => {
+                let project_owner = projects
+                    .get_project_owner(&owned_worker_id.project_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 let (installation, definition) = plugins
                     .get(
-                        &owned_worker_id.account_id,
+                        &project_owner,
                         &owned_worker_id.worker_id.component_id,
                         component_version,
                         &plugin,
@@ -871,46 +754,155 @@ impl<T: GolemTypes> PublicOplogEntryOps<T> for PublicOplogEntry {
                     persistence_level: level,
                 }),
             ),
+            OplogEntry::BeginRemoteTransaction {
+                timestamp,
+                transaction_id,
+                ..
+            } => Ok(PublicOplogEntry::BeginRemoteTransaction(
+                BeginRemoteTransactionParameters {
+                    timestamp,
+                    transaction_id,
+                },
+            )),
+            OplogEntry::PreCommitRemoteTransaction {
+                timestamp,
+                begin_index,
+            } => Ok(PublicOplogEntry::PreCommitRemoteTransaction(
+                RemoteTransactionParameters {
+                    timestamp,
+                    begin_index,
+                },
+            )),
+            OplogEntry::PreRollbackRemoteTransaction {
+                timestamp,
+                begin_index,
+            } => Ok(PublicOplogEntry::PreRollbackRemoteTransaction(
+                RemoteTransactionParameters {
+                    timestamp,
+                    begin_index,
+                },
+            )),
+            OplogEntry::CommittedRemoteTransaction {
+                timestamp,
+                begin_index,
+            } => Ok(PublicOplogEntry::CommittedRemoteTransaction(
+                RemoteTransactionParameters {
+                    timestamp,
+                    begin_index,
+                },
+            )),
+            OplogEntry::RolledBackRemoteTransaction {
+                timestamp,
+                begin_index,
+            } => Ok(PublicOplogEntry::RolledBackRemoteTransaction(
+                RemoteTransactionParameters {
+                    timestamp,
+                    begin_index,
+                },
+            )),
         }
     }
 }
 
-fn try_deserialize<T: Decode>(data: &[u8]) -> Result<T, String> {
-    core_try_deserialize(data)?.ok_or("Unexpected oplog payload, cannot deserialize".to_string())
+fn try_deserialize<T: Decode<()>>(
+    oplog_idx: OplogIndex,
+    what: &str,
+    data: &[u8],
+) -> Result<T, String> {
+    core_try_deserialize(data)
+        .map_err(|err| format!("Oplog entry #{oplog_idx} - {what}: {err}"))?
+        .ok_or("Unexpected oplog payload, cannot deserialize".to_string())
 }
 
 fn no_payload() -> Result<ValueAndType, String> {
     Ok(ValueAndType::new(Value::Option(None), option(str())))
 }
 
-fn encode_host_function_request_as_value(
+async fn try_resolve_agent_id(
+    component_service: Arc<dyn ComponentService>,
+    worker_id: &WorkerId,
+) -> Option<AgentId> {
+    if let Ok(component) = component_service
+        .get_metadata(&worker_id.component_id, None)
+        .await
+    {
+        AgentId::parse(&worker_id.worker_name, &component.metadata).ok()
+    } else {
+        None
+    }
+}
+
+async fn enrich_serializable_invoke_request(
+    components: Arc<dyn ComponentService>,
+    payload: SerializableInvokeRequest,
+) -> EnrichedSerializableInvokeRequest {
+    let agent_id = try_resolve_agent_id(components, &payload.remote_worker_id).await;
+    EnrichedSerializableInvokeRequest {
+        remote_worker_id: payload.remote_worker_id,
+        remote_agent_type: agent_id
+            .as_ref()
+            .map(|agent_id| agent_id.agent_type.clone()),
+        remote_agent_parameters: agent_id.map(|agent_id| agent_id.parameters),
+        idempotency_key: payload.idempotency_key,
+        function_name: payload.function_name,
+        function_params: payload.function_params,
+    }
+}
+
+async fn enrich_serializable_schedule_invocation_request(
+    components: Arc<dyn ComponentService>,
+    payload: SerializableScheduleInvocationRequest,
+) -> EnrichedSerializableScheduleInvocationRequest {
+    let agent_id = try_resolve_agent_id(components, &payload.remote_worker_id).await;
+    EnrichedSerializableScheduleInvocationRequest {
+        remote_worker_id: payload.remote_worker_id,
+        remote_agent_type: agent_id
+            .as_ref()
+            .map(|agent_id| agent_id.agent_type.clone()),
+        remote_agent_parameters: agent_id.map(|agent_id| agent_id.parameters),
+        idempotency_key: payload.idempotency_key,
+        function_name: payload.function_name,
+        function_params: payload.function_params,
+        datetime: payload.datetime,
+    }
+}
+
+async fn encode_host_function_request_as_value(
+    oplog_index: OplogIndex,
+    components: Arc<dyn ComponentService>,
     function_name: &str,
     bytes: &[u8],
 ) -> Result<ValueAndType, String> {
+    let what = format!("{function_name} input");
     match function_name {
         "golem::rpc::future-invoke-result::get" => {
-            let payload: SerializableInvokeRequest = try_deserialize(bytes)?;
+            let payload: SerializableInvokeRequest = try_deserialize(oplog_index, &what, bytes)?;
+            let payload = enrich_serializable_invoke_request(components, payload).await;
             Ok(payload.into_value_and_type())
         }
         "http::types::future_incoming_response::get" => {
-            let payload: SerializableHttpRequest = try_deserialize(bytes)?;
+            let payload: SerializableHttpRequest = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
-        "golem io::poll::poll" => no_payload(),
+        "golem io::poll::poll" => {
+            let count: usize = try_deserialize(oplog_index, &what, bytes)?;
+            Ok(ValueAndType::new(Value::U64(count as u64), u64()))
+        }
+        "golem io::poll::ready" => no_payload(),
         "golem blobstore::container::object_info" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container_and_object(payload.0, payload.1))
         }
         "golem blobstore::container::delete_objects" => {
-            let payload: (String, Vec<String>) = try_deserialize(bytes)?;
+            let payload: (String, Vec<String>) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container_and_objects(payload.0, payload.1))
         }
         "golem blobstore::container::list_objects" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container(payload))
         }
         "golem blobstore::container::get_data" => {
-            let payload: (String, String, u64, u64) = try_deserialize(bytes)?;
+            let payload: (String, String, u64, u64) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     Value::String(payload.0),
@@ -927,7 +919,7 @@ fn encode_host_function_request_as_value(
             ))
         }
         "golem blobstore::container::write_data" => {
-            let payload: (String, String, u64) = try_deserialize(bytes)?;
+            let payload: (String, String, u64) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     Value::String(payload.0),
@@ -942,19 +934,20 @@ fn encode_host_function_request_as_value(
             ))
         }
         "golem blobstore::container::delete_object" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container_and_object(payload.0, payload.1))
         }
         "golem blobstore::container::has_object" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container_and_object(payload.0, payload.1))
         }
         "golem blobstore::container::clear" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container(payload))
         }
         "golem blobstore::blobstore::copy_object" => {
-            let payload: (String, String, String, String) = try_deserialize(bytes)?;
+            let payload: (String, String, String, String) =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     Value::String(payload.0),
@@ -971,23 +964,24 @@ fn encode_host_function_request_as_value(
             ))
         }
         "golem blobstore::blobstore::delete_container" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container(payload))
         }
         "golem blobstore::blobstore::create_container" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container(payload))
         }
         "golem blobstore::blobstore::get_container" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container(payload))
         }
         "golem blobstore::blobstore::container_exists" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(container(payload))
         }
         "golem blobstore::blobstore::move_object" => {
-            let payload: (String, String, String, String) = try_deserialize(bytes)?;
+            let payload: (String, String, String, String) =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     Value::String(payload.0),
@@ -1008,84 +1002,131 @@ fn encode_host_function_request_as_value(
         "golem_environment::initial_cwd" => no_payload(),
         "monotonic_clock::resolution" => no_payload(),
         "monotonic_clock::now" => no_payload(),
-        "monotonic_clock::subscribe_duration" => no_payload(),
+        "monotonic_clock::subscribe_duration" => {
+            let duration_ns: u64 = try_deserialize(oplog_index, &what, bytes)?;
+            Ok(ValueAndType::new(Value::U64(duration_ns), u64()))
+        }
         "wall_clock::now" => no_payload(),
         "wall_clock::resolution" => no_payload(),
         "golem::api::create_promise" => no_payload(),
-        "golem::api::delete_promise" => {
-            let payload: PromiseId = try_deserialize(bytes)?;
-            Ok(payload.into_value_and_type())
-        }
         "golem::api::complete_promise" => {
-            let payload: PromiseId = try_deserialize(bytes)?;
+            let payload: PromiseId = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
+        "golem::api::get-promise-result::get" => no_payload(),
         "golem::api::update-worker" => {
-            let payload: (WorkerId, ComponentVersion, UpdateMode) = try_deserialize(bytes)?;
+            let payload: (WorkerId, ComponentVersion, UpdateMode) =
+                try_deserialize(oplog_index, &what, bytes)?;
+            let agent_id = try_resolve_agent_id(components, &payload.0).await;
+
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     payload.0.into_value(),
+                    agent_id
+                        .as_ref()
+                        .map(|agent_id| agent_id.agent_type.clone())
+                        .into_value(),
+                    agent_id.map(|agent_id| agent_id.parameters).into_value(),
                     payload.1.into_value(),
                     Value::String(format!("{:?}", payload.2)),
                 ]),
                 record(vec![
                     field("worker_id", WorkerId::get_type()),
+                    field("agent_type", Option::<String>::get_type()),
+                    field("agent_parameters", Option::<DataValue>::get_type()),
                     field("component_version", u64()),
                     field("update_mode", str()),
                 ]),
             ))
         }
         "golem::api::fork-worker" => {
-            let payload: (WorkerId, WorkerId, OplogIndex) = try_deserialize(bytes)?;
+            let payload: (WorkerId, WorkerId, OplogIndex) =
+                try_deserialize(oplog_index, &what, bytes)?;
+            let source_agent_id = try_resolve_agent_id(components.clone(), &payload.0).await;
+            let target_agent_id = try_resolve_agent_id(components, &payload.1).await;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     payload.0.into_value(),
+                    source_agent_id
+                        .as_ref()
+                        .map(|agent_id| agent_id.agent_type.clone())
+                        .into_value(),
+                    source_agent_id
+                        .map(|agent_id| agent_id.parameters)
+                        .into_value(),
                     payload.1.into_value(),
+                    target_agent_id
+                        .as_ref()
+                        .map(|agent_id| agent_id.agent_type.clone())
+                        .into_value(),
+                    target_agent_id
+                        .map(|agent_id| agent_id.parameters)
+                        .into_value(),
                     payload.2.into_value(),
                 ]),
                 record(vec![
                     field("source_worker_id", WorkerId::get_type()),
+                    field("source_agent_type", Option::<String>::get_type()),
+                    field("source_agent_parameters", Option::<DataValue>::get_type()),
                     field("target_worker_id", WorkerId::get_type()),
+                    field("target_agent_type", Option::<String>::get_type()),
+                    field("target_agent_parameters", Option::<DataValue>::get_type()),
                     field("oplog_idx_cut_off", u64()),
                 ]),
             ))
         }
+        "golem::api::fork" => {
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
+            Ok(payload.into_value_and_type())
+        }
         "golem::api::revert-worker" => {
-            let payload: (WorkerId, RevertWorkerTarget) = try_deserialize(bytes)?;
+            let payload: (WorkerId, RevertWorkerTarget) =
+                try_deserialize(oplog_index, &what, bytes)?;
+            let agent_id = try_resolve_agent_id(components, &payload.0).await;
             Ok(ValueAndType::new(
-                Value::Record(vec![payload.0.into_value(), payload.1.into_value()]),
+                Value::Record(vec![
+                    payload.0.into_value(),
+                    agent_id
+                        .as_ref()
+                        .map(|agent_id| agent_id.agent_type.clone())
+                        .into_value(),
+                    agent_id.map(|agent_id| agent_id.parameters).into_value(),
+                    payload.1.into_value(),
+                ]),
                 record(vec![
                     field("worker_id", WorkerId::get_type()),
+                    field("agent_type", Option::<String>::get_type()),
+                    field("agent_parameters", Option::<DataValue>::get_type()),
                     field("target", RevertWorkerTarget::get_type()),
                 ]),
             ))
         }
         "http::types::incoming_body_stream::skip" => {
-            let payload: SerializableHttpRequest = try_deserialize(bytes)?;
+            let payload: SerializableHttpRequest = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::read" => {
-            let payload: SerializableHttpRequest = try_deserialize(bytes)?;
+            let payload: SerializableHttpRequest = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::blocking_read" => {
-            let payload: SerializableHttpRequest = try_deserialize(bytes)?;
+            let payload: SerializableHttpRequest = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::blocking_skip" => {
-            let payload: SerializableHttpRequest = try_deserialize(bytes)?;
+            let payload: SerializableHttpRequest = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual::delete" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(bucket_and_key(payload.0, payload.1))
         }
         "golem keyvalue::eventual::get" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(bucket_and_key(payload.0, payload.1))
         }
         "golem keyvalue::eventual::set" => {
-            let payload: (String, String, u64) = try_deserialize(bytes)?;
+            let payload: (String, String, u64) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     Value::String(payload.0),
@@ -1100,11 +1141,11 @@ fn encode_host_function_request_as_value(
             ))
         }
         "golem keyvalue::eventual::exists" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(bucket_and_key(payload.0, payload.1))
         }
         "golem keyvalue::eventual_batch::set_many" => {
-            let payload: (String, Vec<(String, u64)>) = try_deserialize(bytes)?;
+            let payload: (String, Vec<(String, u64)>) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(ValueAndType::new(
                 Value::Record(vec![
                     Value::String(payload.0),
@@ -1128,15 +1169,15 @@ fn encode_host_function_request_as_value(
             ))
         }
         "golem keyvalue::eventual_batch::get_many" => {
-            let payload: (String, Vec<String>) = try_deserialize(bytes)?;
+            let payload: (String, Vec<String>) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(bucket_and_keys(payload.0, payload.1))
         }
         "golem keyvalue::eventual_batch::get_keys" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(bucket(payload))
         }
         "golem keyvalue::eventual_batch::delete_many" => {
-            let payload: (String, Vec<String>) = try_deserialize(bytes)?;
+            let payload: (String, Vec<String>) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(bucket_and_keys(payload.0, payload.1))
         }
         "golem random::insecure::get_insecure_random_bytes" => no_payload(),
@@ -1145,54 +1186,54 @@ fn encode_host_function_request_as_value(
         "golem random::get_random_bytes" => no_payload(),
         "golem random::get_random_u64" => no_payload(),
         "sockets::ip_name_lookup::resolve_addresses" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke" => {
-            let payload: SerializableInvokeRequest = try_deserialize(bytes)?;
+            let payload: SerializableInvokeRequest = try_deserialize(oplog_index, &what, bytes)?;
+            let payload = enrich_serializable_invoke_request(components, payload).await;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke-and-await"
         | "golem::rpc::wasm-rpc::invoke-and-await result" => {
-            let payload: SerializableInvokeRequest = try_deserialize(bytes)?;
+            let payload: SerializableInvokeRequest = try_deserialize(oplog_index, &what, bytes)?;
+            let payload = enrich_serializable_invoke_request(components, payload).await;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::generate_unique_local_worker_id" => no_payload(),
-        "cli::preopens::get_directories" => no_payload(),
         "filesystem::types::descriptor::stat" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "filesystem::types::descriptor::stat_at" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem api::generate_idempotency_key" => no_payload(),
         "golem http::types::future_trailers::get" => {
-            let payload: SerializableHttpRequest = try_deserialize(bytes)?;
+            let payload: SerializableHttpRequest = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke idempotency key" => no_payload(),
         "golem::rpc::wasm-rpc::invoke-and-await idempotency key" => no_payload(),
         "golem::rpc::wasm-rpc::async-invoke-and-await idempotency key" => no_payload(),
         "golem::rpc::wasm-rpc::schedule_invocation" => {
-            let payload: SerializableScheduleInvocationRequest = try_deserialize(bytes)?;
+            let payload: SerializableScheduleInvocationRequest =
+                try_deserialize(oplog_index, &what, bytes)?;
+            let payload =
+                enrich_serializable_schedule_invocation_request(components, payload).await;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::cancellation-token::cancel" => {
-            let payload: SerializableScheduleId = try_deserialize(bytes)?;
-            Ok(payload.into_value_and_type())
-        }
-        "golem::api::poll_promise" => {
-            let payload: PromiseId = try_deserialize(bytes)?;
+            let payload: SerializableScheduleId = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::resolve_component_id" => {
-            let payload: String = try_deserialize(bytes)?;
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::resolve_worker_id_strict" => {
-            let payload: (String, String) = try_deserialize(bytes)?;
+            let payload: (String, String) = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "rdbms::mysql::db-connection::query"
@@ -1201,12 +1242,11 @@ fn encode_host_function_request_as_value(
         | "rdbms::mysql::db-transaction::query"
         | "rdbms::mysql::db-transaction::execute"
         | "rdbms::mysql::db-transaction::query-stream" => {
-            let payload: Option<RdbmsRequest<MysqlType>> = try_deserialize(bytes)?;
+            let payload: Option<RdbmsRequest<MysqlType>> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
-        "rdbms::mysql::db-transaction::rollback"
-        | "rdbms::mysql::db-transaction::commit"
-        | "rdbms::mysql::db-result-stream::get-columns"
+        "rdbms::mysql::db-result-stream::get-columns"
         | "rdbms::mysql::db-result-stream::get-next" => no_payload(),
         "rdbms::postgres::db-connection::query"
         | "rdbms::postgres::db-connection::execute"
@@ -1214,16 +1254,20 @@ fn encode_host_function_request_as_value(
         | "rdbms::postgres::db-transaction::query"
         | "rdbms::postgres::db-transaction::execute"
         | "rdbms::postgres::db-transaction::query-stream" => {
-            let payload: Option<RdbmsRequest<PostgresType>> = try_deserialize(bytes)?;
+            let payload: Option<RdbmsRequest<PostgresType>> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
-        "rdbms::postgres::db-transaction::rollback"
-        | "rdbms::postgres::db-transaction::commit"
-        | "rdbms::postgres::db-result-stream::get-columns"
+        "rdbms::postgres::db-result-stream::get-columns"
         | "rdbms::postgres::db-result-stream::get-next" => no_payload(),
+        "golem_agent::get_all_agent_types" => no_payload(),
+        "golem_agent::get_agent_type" => {
+            let payload: String = try_deserialize(oplog_index, &what, bytes)?;
+            Ok(payload.into_value_and_type())
+        }
         _ => {
             // For everything else we assume that payload is a serialized ValueAndType
-            let payload: ValueAndType = try_deserialize(bytes)?;
+            let payload: ValueAndType = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload)
         }
     }
@@ -1231,12 +1275,14 @@ fn encode_host_function_request_as_value(
 
 #[allow(clippy::type_complexity)]
 fn encode_host_function_response_as_value(
+    oplog_index: OplogIndex,
     function_name: &str,
     bytes: &[u8],
 ) -> Result<ValueAndType, String> {
+    let what = format!("{function_name} output");
     match function_name {
         "golem::rpc::future-invoke-result::get" => {
-            let payload: SerializableInvokeResult = try_deserialize(bytes)?;
+            let payload: SerializableInvokeResult = try_deserialize(oplog_index, &what, bytes)?;
             match payload {
                 SerializableInvokeResult::Failed(error) => Ok(ValueAndType::new(
                     Value::Variant {
@@ -1260,9 +1306,8 @@ fn encode_host_function_response_as_value(
                         unit_case("Completed"),
                     ]),
                 )),
-                SerializableInvokeResult::Completed(Ok(value)) => {
-                    let typ: AnalysedType = (&value).try_into()?;
-                    let value: Value = value.try_into()?;
+                SerializableInvokeResult::Completed(Ok(Some(value))) => {
+                    let ValueAndType { value, typ } = value;
                     Ok(ValueAndType::new(
                         Value::Variant {
                             case_idx: 2,
@@ -1275,6 +1320,17 @@ fn encode_host_function_response_as_value(
                         ]),
                     ))
                 }
+                SerializableInvokeResult::Completed(Ok(None)) => Ok(ValueAndType::new(
+                    Value::Variant {
+                        case_idx: 2,
+                        case_value: Some(Box::new(Value::Result(Ok(None)))),
+                    },
+                    variant(vec![
+                        case("Failed", SerializableError::get_type()),
+                        unit_case("Pending"),
+                        case("Completed", result_err(RpcError::get_type())),
+                    ]),
+                )),
                 SerializableInvokeResult::Completed(Err(rpc_error)) => Ok(ValueAndType::new(
                     Value::Variant {
                         case_idx: 2,
@@ -1291,221 +1347,281 @@ fn encode_host_function_response_as_value(
             }
         }
         "http::types::future_incoming_response::get" => {
-            let payload: SerializableResponse = try_deserialize(bytes)?;
+            let payload: SerializableResponse = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem io::poll::poll" => {
-            let payload: Result<Vec<u32>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<u32>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
+            Ok(payload.into_value_and_type())
+        }
+        "golem io::poll::ready" => {
+            let payload: Result<bool, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::object_info" => {
             let payload: Result<crate::services::blob_store::ObjectMetadata, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::delete_objects" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::list_objects" => {
-            let payload: Result<Vec<String>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<String>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::get_data" => {
-            let payload: Result<Vec<u8>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<u8>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::write_data" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::delete_object" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::has_object" => {
-            let payload: Result<bool, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<bool, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::container::clear" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::blobstore::copy_object" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::blobstore::delete_container" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::blobstore::create_container" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::blobstore::get_container" => {
-            let payload: Result<Option<u64>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Option<u64>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::blobstore::container_exists" => {
-            let payload: Result<bool, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<bool, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem blobstore::blobstore::move_object" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem_environment::get_arguments" => {
-            let payload: Result<Vec<String>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<String>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem_environment::get_environment" => {
-            let payload: Result<Vec<(String, String)>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<(String, String)>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem_environment::initial_cwd" => {
-            let payload: Result<Option<String>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Option<String>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "monotonic_clock::resolution" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "monotonic_clock::now" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "monotonic_clock::subscribe_duration" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "wall_clock::now" => {
-            let payload: Result<SerializableDateTime, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<SerializableDateTime, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "wall_clock::resolution" => {
-            let payload: Result<SerializableDateTime, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<SerializableDateTime, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::create_promise" => {
-            let payload: Result<PromiseId, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<PromiseId, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
-        "golem::api::delete_promise" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+        "golem::api::get-promise-result::get" => {
+            let payload: Result<Option<Vec<u8>>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::complete_promise" => {
-            let payload: Result<bool, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<bool, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::update-worker" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::fork-worker" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
+            Ok(payload.into_value_and_type())
+        }
+        "golem::api::fork" => {
+            let payload: Result<ForkResult, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::revert-worker" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::skip" => {
-            let payload: Result<u64, SerializableStreamError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableStreamError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::read" => {
-            let payload: Result<Vec<u8>, SerializableStreamError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<u8>, SerializableStreamError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::blocking_read" => {
-            let payload: Result<Vec<u8>, SerializableStreamError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<u8>, SerializableStreamError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "http::types::incoming_body_stream::blocking_skip" => {
-            let payload: Result<u64, SerializableStreamError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableStreamError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual::delete" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual::get" => {
-            let payload: Result<Option<Vec<u8>>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Option<Vec<u8>>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual::set" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual::exists" => {
-            let payload: Result<bool, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<bool, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual_batch::set_many" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual_batch::get_many" => {
-            let payload: Result<Vec<Option<Vec<u8>>>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<Option<Vec<u8>>>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual_batch::get_keys" => {
-            let payload: Result<Vec<String>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<String>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem keyvalue::eventual_batch::delete_many" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem random::insecure::get_insecure_random_bytes" => {
-            let payload: Result<Vec<u8>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<u8>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem random::insecure::get_insecure_random_u64" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem random::insecure_seed::insecure_seed" => {
-            let payload: Result<(u64, u64), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(u64, u64), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem random::get_random_bytes" => {
-            let payload: Result<Vec<u8>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Vec<u8>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem random::get_random_u64" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "sockets::ip_name_lookup::resolve_addresses" => {
             let payload: Result<SerializableIpAddresses, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke-and-await"
         | "golem::rpc::wasm-rpc::invoke-and-await result" => {
-            let payload: Result<Result<TypeAnnotatedValue, SerializableError>, String> =
-                try_deserialize(bytes);
+            let payload: Result<Result<Option<ValueAndType>, SerializableError>, String> =
+                try_deserialize(oplog_index, &what, bytes);
 
             match payload {
                 Err(_) => {
-                    let _payload: Result<WitValue, SerializableError> = try_deserialize(bytes)?;
+                    let _payload: Result<WitValue, SerializableError> =
+                        try_deserialize(oplog_index, &what, bytes)?;
                     no_payload()
                 }
-                Ok(Ok(payload)) => {
-                    let typ: AnalysedType = (&payload).try_into()?;
-                    let value: Value = payload.try_into()?;
+                Ok(Ok(Some(payload))) => {
+                    let ValueAndType { value, typ } = payload;
                     Ok(ValueAndType::new(
                         Value::Result(Ok(Some(Box::new(value)))),
                         result(typ, SerializableError::get_type()),
                     ))
                 }
+                Ok(Ok(None)) => Ok(ValueAndType::new(
+                    Value::Result(Ok(None)),
+                    result_err(SerializableError::get_type()),
+                )),
                 Ok(Err(error)) => Ok(ValueAndType::new(
                     Value::Result(Err(Some(Box::new(error.into_value())))),
                     result_err(SerializableError::get_type()),
@@ -1513,134 +1629,152 @@ fn encode_host_function_response_as_value(
             }
         }
         "golem::rpc::wasm-rpc::generate_unique_local_worker_id" => {
-            let payload: Result<WorkerId, SerializableError> = try_deserialize(bytes)?;
-            Ok(payload.into_value_and_type())
-        }
-        "cli::preopens::get_directories" => {
-            let payload: Result<Vec<String>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<WorkerId, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "filesystem::types::descriptor::stat" => {
-            let payload: Result<SerializableFileTimes, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<SerializableFileTimes, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "filesystem::types::descriptor::stat_at" => {
-            let payload: Result<SerializableFileTimes, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<SerializableFileTimes, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem api::generate_idempotency_key" => {
-            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(bytes)?
-                .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
+            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(
+                oplog_index,
+                &what,
+                bytes,
+            )?
+            .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
             Ok(payload.into_value_and_type())
         }
         "golem http::types::future_trailers::get" => {
             let payload: Result<
                 Option<Result<Result<Option<HashMap<String, Vec<u8>>>, SerializableErrorCode>, ()>>,
                 SerializableError,
-            > = try_deserialize(bytes)?;
+            > = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke idempotency key" => {
-            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(bytes)?
-                .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
+            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(
+                oplog_index,
+                &what,
+                bytes,
+            )?
+            .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::invoke-and-await idempotency key" => {
-            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(bytes)?
-                .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
+            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(
+                oplog_index,
+                &what,
+                bytes,
+            )?
+            .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::async-invoke-and-await idempotency key" => {
-            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(bytes)?
-                .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
+            let payload = try_deserialize::<Result<(u64, u64), SerializableError>>(
+                oplog_index,
+                &what,
+                bytes,
+            )?
+            .map(|pair| Uuid::from_u64_pair(pair.0, pair.1));
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::wasm-rpc::schedule_invocation" => {
             let payload: Result<SerializableScheduleId, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::rpc::cancellation-token::cancel" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
-            Ok(payload.into_value_and_type())
-        }
-        "golem::api::poll_promise" => {
-            let payload: Result<Option<Vec<u8>>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<(), SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::resolve_component_id" => {
-            let payload: Result<Option<ComponentId>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Option<ComponentId>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "golem::api::resolve_worker_id_strict" => {
-            let payload: Result<Option<WorkerId>, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<Option<WorkerId>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "rdbms::mysql::db-connection::execute" | "rdbms::mysql::db-transaction::execute" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "rdbms::mysql::db-connection::query" | "rdbms::mysql::db-transaction::query" => {
             let payload: Result<crate::services::rdbms::DbResult<MysqlType>, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
         "rdbms::mysql::db-connection::query-stream"
         | "rdbms::mysql::db-transaction::query-stream" => {
             let payload: Result<RdbmsRequest<MysqlType>, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
-        }
-        "rdbms::mysql::db-transaction::rollback" | "rdbms::mysql::db-transaction::commit" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
-            Ok(payload.into_value_and_type())
         }
         "rdbms::mysql::db-result-stream::get-columns" => {
             let payload: Result<Vec<mysql_types::DbColumn>, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
         "rdbms::mysql::db-result-stream::get-next" => {
             let payload: Result<
                 Option<Vec<crate::services::rdbms::DbRow<mysql_types::DbValue>>>,
                 SerializableError,
-            > = try_deserialize(bytes)?;
+            > = try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
         "rdbms::postgres::db-connection::execute" | "rdbms::postgres::db-transaction::execute" => {
-            let payload: Result<u64, SerializableError> = try_deserialize(bytes)?;
+            let payload: Result<u64, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload.into_value_and_type())
         }
         "rdbms::postgres::db-connection::query" | "rdbms::postgres::db-transaction::query" => {
             let payload: Result<crate::services::rdbms::DbResult<PostgresType>, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
         "rdbms::postgres::db-connection::query-stream"
         | "rdbms::postgres::db-transaction::query-stream" => {
             let payload: Result<RdbmsRequest<PostgresType>, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
-        }
-        "rdbms::postgres::db-transaction::rollback" | "rdbms::postgres::db-transaction::commit" => {
-            let payload: Result<(), SerializableError> = try_deserialize(bytes)?;
-            Ok(payload.into_value_and_type())
         }
         "rdbms::postgres::db-result-stream::get-columns" => {
             let payload: Result<Vec<postgres_types::DbColumn>, SerializableError> =
-                try_deserialize(bytes)?;
+                try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
         }
         "rdbms::postgres::db-result-stream::get-next" => {
             let payload: Result<
                 Option<Vec<crate::services::rdbms::DbRow<postgres_types::DbValue>>>,
                 SerializableError,
-            > = try_deserialize(bytes)?;
+            > = try_deserialize(oplog_index, &what, bytes)?;
             Ok(RdbmsIntoValueAndType::into_value_and_type(payload))
+        }
+        "golem_agent::get_agent_type" => {
+            let payload: Result<Option<RegisteredAgentType>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
+            Ok(payload.into_value_and_type())
+        }
+        "golem_agent::get_all_agent_types" => {
+            let payload: Result<Vec<RegisteredAgentType>, SerializableError> =
+                try_deserialize(oplog_index, &what, bytes)?;
+            Ok(payload.into_value_and_type())
         }
         _ => {
             // For everything else we assume that payload is a serialized ValueAndType
-            let payload: ValueAndType = try_deserialize(bytes)?;
+            let payload: ValueAndType = try_deserialize(oplog_index, &what, bytes)?;
             Ok(payload)
         }
     }
@@ -1726,9 +1860,25 @@ fn encode_span_data(spans: &[SpanData]) -> Vec<Vec<PublicSpanData>> {
                 inherited,
             } => {
                 let linked_context = if let Some(linked_context) = linked_context {
-                    let id = result.len() as u64;
-                    let encoded_linked_context = encode_span_data(linked_context);
+                    let mut encoded_linked_context = encode_span_data(linked_context);
+
+                    // Before merging encoded_linked_context into result, we need to adjust the indices in it
+                    for spans in encoded_linked_context.iter_mut() {
+                        for span in spans.iter_mut() {
+                            match span {
+                                PublicSpanData::LocalSpan(local_span) => {
+                                    if let Some(idx) = local_span.linked_context.as_mut() {
+                                        *idx += (result.len() as u64) + 1;
+                                    }
+                                }
+                                PublicSpanData::ExternalSpan(_) => {}
+                            }
+                        }
+                    }
+
                     result.extend(encoded_linked_context);
+
+                    let id = result.len() as u64 + 1;
                     Some(id)
                 } else {
                     None

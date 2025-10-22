@@ -68,7 +68,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             .collect();
 
         let span = self
-            .start_span(&outgoing_http_request_span_attributes(&uri, &method))
+            .start_span(&outgoing_http_request_span_attributes(&uri, &method), false)
             .await
             .map_err(|err| HttpError::trap(anyhow!(err)))?;
 
@@ -123,18 +123,18 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 };
 
                 let handle = future_incoming_response.rep();
-                self.state.open_function_table.insert(handle, begin_index);
                 self.state.open_http_requests.insert(
                     handle,
                     HttpRequestState {
                         close_owner: HttpRequestCloseOwner::FutureIncomingResponseDrop,
-                        root_handle: handle,
+                        begin_index,
                         request,
                         span_id: span.span_id().clone(),
                     },
                 );
             }
-            Err(_) => {
+            Err(err) => {
+                tracing::error!("!!! ERROR FROM handle(): {err:?}");
                 self.end_durable_function(
                     &DurableFunctionType::WriteRemoteBatched(None),
                     begin_index,

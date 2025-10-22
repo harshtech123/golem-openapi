@@ -12,13 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use test_r::{inherit_test_dep, test};
-
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
-
 use crate::common::{start, TestContext};
 use crate::{LastUniqueId, Tracing, WorkerExecutorTestDependencies};
 use assert2::{assert, check};
@@ -26,22 +19,30 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{BoxError, Router};
 use bytes::Bytes;
-use futures_util::stream;
+use futures::stream;
+use golem_common::model::oplog::WorkerError;
 use golem_common::model::{
-    AccountId, ComponentFilePermissions, ComponentFileSystemNode, ComponentFileSystemNodeDetails,
+    ComponentFilePermissions, ComponentFileSystemNode, ComponentFileSystemNodeDetails,
     IdempotencyKey, WorkerStatus,
 };
 use golem_common::virtual_exports::http_incoming_handler::IncomingHttpRequest;
+use golem_test_framework::config::TestDependencies;
 use golem_test_framework::dsl::{
-    drain_connection, stderr_events, stdout_events, worker_error_message, TestDslUnsafe,
+    drain_connection, stderr_events, stdout_events, worker_error_logs, worker_error_message,
+    worker_error_underlying_error, TestDslUnsafe,
 };
-use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
+use golem_wasm::{IntoValueAndType, Value, ValueAndType};
 use http::{HeaderMap, StatusCode};
-use serde_json::json;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+use test_r::{inherit_test_dep, test};
 use tokio::spawn;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_stream::StreamExt;
-use tracing::{info, Instrument};
+use tracing::{debug, info, Instrument};
 
 inherit_test_dep!(WorkerExecutorTestDependencies);
 inherit_test_dep!(LastUniqueId);
@@ -55,7 +56,7 @@ async fn write_stdout(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("write-stdout").store().await;
     let worker_id = executor.start_worker(&component_id, "write-stdout-1").await;
@@ -89,7 +90,7 @@ async fn write_stderr(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("write-stderr").store().await;
     let worker_id = executor.start_worker(&component_id, "write-stderr-1").await;
@@ -123,7 +124,7 @@ async fn read_stdin(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("read-stdin").store().await;
     let worker_id = executor.start_worker(&component_id, "read-stdin-1").await;
@@ -145,7 +146,7 @@ async fn clocks(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("clocks").store().await;
     let worker_id = executor.start_worker(&component_id, "clocks-1").await;
@@ -197,13 +198,19 @@ async fn file_write_read_delete(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-write-read-delete").store().await;
     let mut env = HashMap::new();
     env.insert("RUST_BACKTRACE".to_string(), "full".to_string());
     let worker_id = executor
-        .start_worker_with(&component_id, "file-write-read-delete-1", vec![], env)
+        .start_worker_with(
+            &component_id,
+            "file-write-read-delete-1",
+            vec![],
+            env,
+            vec![],
+        )
         .await;
 
     let result = executor
@@ -233,26 +240,21 @@ async fn initial_file_read_write(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_files = executor
-        .add_initial_component_files(
-            &AccountId {
-                value: "test-account".to_string(),
-            },
-            &[
-                (
-                    "initial-file-read-write/files/foo.txt",
-                    "foo.txt",
-                    ComponentFilePermissions::ReadOnly,
-                ),
-                (
-                    "initial-file-read-write/files/baz.txt",
-                    "/bar/baz.txt",
-                    ComponentFilePermissions::ReadWrite,
-                ),
-            ],
-        )
+        .add_initial_component_files(&[
+            (
+                "initial-file-read-write/files/foo.txt",
+                "foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            ),
+            (
+                "initial-file-read-write/files/baz.txt",
+                "/bar/baz.txt",
+                ComponentFilePermissions::ReadWrite,
+            ),
+        ])
         .await;
 
     let component_id = executor
@@ -264,7 +266,13 @@ async fn initial_file_read_write(
     let mut env = HashMap::new();
     env.insert("RUST_BACKTRACE".to_string(), "full".to_string());
     let worker_id = executor
-        .start_worker_with(&component_id, "initial-file-read-write-1", vec![], env)
+        .start_worker_with(
+            &component_id,
+            "initial-file-read-write-1",
+            vec![],
+            env,
+            vec![],
+        )
         .await;
 
     let result = executor
@@ -296,31 +304,26 @@ async fn initial_file_listing_through_api(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_files = executor
-        .add_initial_component_files(
-            &AccountId {
-                value: "test-account".to_string(),
-            },
-            &[
-                (
-                    "initial-file-read-write/files/foo.txt",
-                    "/foo.txt",
-                    ComponentFilePermissions::ReadOnly,
-                ),
-                (
-                    "initial-file-read-write/files/baz.txt",
-                    "/bar/baz.txt",
-                    ComponentFilePermissions::ReadWrite,
-                ),
-                (
-                    "initial-file-read-write/files/baz.txt",
-                    "/baz.txt",
-                    ComponentFilePermissions::ReadWrite,
-                ),
-            ],
-        )
+        .add_initial_component_files(&[
+            (
+                "initial-file-read-write/files/foo.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            ),
+            (
+                "initial-file-read-write/files/baz.txt",
+                "/bar/baz.txt",
+                ComponentFilePermissions::ReadWrite,
+            ),
+            (
+                "initial-file-read-write/files/baz.txt",
+                "/baz.txt",
+                ComponentFilePermissions::ReadWrite,
+            ),
+        ])
         .await;
 
     let component_id = executor
@@ -329,13 +332,12 @@ async fn initial_file_listing_through_api(
         .with_files(&component_files)
         .store()
         .await;
-    let mut env = HashMap::new();
-    env.insert("RUST_BACKTRACE".to_string(), "full".to_string());
+
     let worker_id = executor
-        .start_worker_with(&component_id, "initial-file-read-write-2", vec![], env)
+        .start_worker(&component_id, "initial-file-read-write-1")
         .await;
 
-    let result = executor.list_directory(&worker_id, "/").await;
+    let result = executor.get_file_system_node(&worker_id, "/").await;
 
     let mut result = result
         .into_iter()
@@ -346,10 +348,6 @@ async fn initial_file_listing_through_api(
         .collect::<Vec<_>>();
 
     result.sort_by_key(|e| e.name.clone());
-
-    executor.check_oplog_is_queryable(&worker_id).await;
-
-    drop(executor);
 
     check!(
         result
@@ -377,6 +375,58 @@ async fn initial_file_listing_through_api(
                 },
             ]
     );
+
+    let result = executor.get_file_system_node(&worker_id, "/bar").await;
+
+    let mut result = result
+        .into_iter()
+        .map(|e| ComponentFileSystemNode {
+            last_modified: SystemTime::UNIX_EPOCH,
+            ..e
+        })
+        .collect::<Vec<_>>();
+
+    result.sort_by_key(|e| e.name.clone());
+
+    check!(
+        result
+            == vec![ComponentFileSystemNode {
+                name: "baz.txt".to_string(),
+                last_modified: SystemTime::UNIX_EPOCH,
+                details: ComponentFileSystemNodeDetails::File {
+                    permissions: ComponentFilePermissions::ReadWrite,
+                    size: 4,
+                }
+            },]
+    );
+
+    let result = executor.get_file_system_node(&worker_id, "/baz.txt").await;
+
+    let mut result = result
+        .into_iter()
+        .map(|e| ComponentFileSystemNode {
+            last_modified: SystemTime::UNIX_EPOCH,
+            ..e
+        })
+        .collect::<Vec<_>>();
+
+    result.sort_by_key(|e| e.name.clone());
+
+    check!(
+        result
+            == vec![ComponentFileSystemNode {
+                name: "baz.txt".to_string(),
+                last_modified: SystemTime::UNIX_EPOCH,
+                details: ComponentFileSystemNodeDetails::File {
+                    permissions: ComponentFilePermissions::ReadWrite,
+                    size: 4,
+                }
+            },]
+    );
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    drop(executor);
 }
 
 #[test]
@@ -387,26 +437,21 @@ async fn initial_file_reading_through_api(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_files = executor
-        .add_initial_component_files(
-            &AccountId {
-                value: "test-account".to_string(),
-            },
-            &[
-                (
-                    "initial-file-read-write/files/foo.txt",
-                    "/foo.txt",
-                    ComponentFilePermissions::ReadOnly,
-                ),
-                (
-                    "initial-file-read-write/files/baz.txt",
-                    "/bar/baz.txt",
-                    ComponentFilePermissions::ReadWrite,
-                ),
-            ],
-        )
+        .add_initial_component_files(&[
+            (
+                "initial-file-read-write/files/foo.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            ),
+            (
+                "initial-file-read-write/files/baz.txt",
+                "/bar/baz.txt",
+                ComponentFilePermissions::ReadWrite,
+            ),
+        ])
         .await;
 
     let component_id = executor
@@ -418,7 +463,13 @@ async fn initial_file_reading_through_api(
     let mut env = HashMap::new();
     env.insert("RUST_BACKTRACE".to_string(), "full".to_string());
     let worker_id = executor
-        .start_worker_with(&component_id, "initial-file-read-write-3", vec![], env)
+        .start_worker_with(
+            &component_id,
+            "initial-file-read-write-3",
+            vec![],
+            env,
+            vec![],
+        )
         .await;
 
     // run the worker so it can update the files.
@@ -449,7 +500,7 @@ async fn directories(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("directories").store().await;
     let worker_id = executor.start_worker(&component_id, "directories-1").await;
@@ -509,7 +560,7 @@ async fn directories_replay(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("directories").store().await;
     let worker_id = executor.start_worker(&component_id, "directories-1").await;
@@ -522,7 +573,7 @@ async fn directories_replay(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     // NOTE: if the directory listing would not be stable, replay would fail with divergence error
 
@@ -578,7 +629,7 @@ async fn file_write_read(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-1").await;
@@ -598,7 +649,7 @@ async fn file_write_read(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let result = executor
         .invoke_and_await(
@@ -619,195 +670,336 @@ async fn file_write_read(
 
 #[test]
 #[tracing::instrument]
-async fn http_client(
+async fn file_update_1(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
+    let component_id = {
+        let component_files = executor
+            .add_initial_component_files(&[(
+                "ifs-update/files/foo.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            )])
+            .await;
+
+        executor
+            .component("golem_it_ifs_update")
+            .unique()
+            .with_files(&component_files)
+            .store()
+            .await
+    };
+
+    let worker_id = executor.start_worker(&component_id, "ifs-update-1").await;
+
+    executor
+        .invoke_and_await(
+            &worker_id,
+            "golem-it:ifs-update-exports/golem-it-ifs-update-api.{load-file}",
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    {
+        let content_before_update = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_before_update[0] == Value::String("foo\n".to_string()));
+    }
+
+    {
+        let component_files = executor
+            .add_initial_component_files(&[(
+                "ifs-update/files/bar.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            )])
+            .await;
+
+        let target_version = executor
+            .update_component_with_files(
+                &component_id,
+                "golem_it_ifs_update",
+                Some(&component_files),
+            )
+            .await;
+
+        executor
+            .auto_update_worker(&worker_id, target_version)
+            .await;
+    };
+
+    {
+        let content_after_update = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_update[0] == Value::String("foo\n".to_string()));
+    }
+
+    executor.simulated_crash(&worker_id).await;
+
+    {
+        let content_after_crash = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_crash[0] == Value::String("foo\n".to_string()));
+    }
+
+    executor
+        .invoke_and_await(
+            &worker_id,
+            "golem-it:ifs-update-exports/golem-it-ifs-update-api.{load-file}",
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    {
+        let content_after_reload = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_reload[0] == Value::String("bar\n".to_string()));
+    }
+
+    executor.simulated_crash(&worker_id).await;
+
+    {
+        let content_after_crash = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_crash[0] == Value::String("bar\n".to_string()));
+    }
+
+    {
+        let component_files = executor
+            .add_initial_component_files(&[(
+                "ifs-update/files/baz.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            )])
+            .await;
+
+        let target_version = executor
+            .update_component_with_files(
+                &component_id,
+                "golem_it_ifs_update",
+                Some(&component_files),
+            )
+            .await;
+
+        executor
+            .manual_update_worker(&worker_id, target_version)
+            .await;
+    };
+
+    {
+        let content_after_manual_update = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_manual_update[0] == Value::String("restored".to_string()));
+    }
+
+    executor
+        .invoke_and_await(
+            &worker_id,
+            "golem-it:ifs-update-exports/golem-it-ifs-update-api.{load-file}",
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    {
+        let content_after_reload = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_reload[0] == Value::String("baz\n".to_string()));
+    }
+
+    executor.simulated_crash(&worker_id).await;
+
+    {
+        let content_after_crash = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:ifs-update-exports/golem-it-ifs-update-api.{get-file-content}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(content_after_crash[0] == Value::String("baz\n".to_string()));
+    }
+
+    executor.delete_worker(&worker_id).await;
+}
+
+#[test]
+#[tracing::instrument]
+async fn file_update_in_the_middle_of_exported_function(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (sender, mut latch) = tokio::sync::mpsc::channel::<()>(1);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let host_http_port = listener.local_addr().unwrap().port();
 
-    let http_server = spawn(
-        async move {
+    let http_server = {
+        let sender = Arc::new(sender);
+        let first_request = Arc::new(tokio::sync::Mutex::new(true));
+        let start_server = async {
             let route = Router::new().route(
                 "/",
-                post(move |headers: HeaderMap, body: Bytes| async move {
-                    let header = headers.get("X-Test").unwrap().to_str().unwrap();
-                    let body = String::from_utf8(body.to_vec()).unwrap();
-                    format!("response is {header} {body}")
-                }),
-            );
-
-            axum::serve(listener, route).await.unwrap();
-        }
-        .in_current_span(),
-    );
-
-    let component_id = executor.component("http-client").store().await;
-    let mut env = HashMap::new();
-    env.insert("PORT".to_string(), host_http_port.to_string());
-    env.insert("RUST_BACKTRACE".to_string(), "full".to_string());
-
-    let worker_id = executor
-        .start_worker_with(&component_id, "http-client-1", vec![], env)
-        .await;
-    let rx = executor.capture_output(&worker_id).await;
-
-    let result = executor
-        .invoke_and_await(&worker_id, "golem:it/api.{run}", vec![])
-        .await;
-
-    executor.check_oplog_is_queryable(&worker_id).await;
-
-    drop(executor);
-    drop(rx);
-    http_server.abort();
-
-    check!(
-        result
-            == Ok(vec![Value::String(
-                "200 response is test-header test-body".to_string()
-            )])
-    );
-}
-
-#[test]
-#[tracing::instrument]
-async fn http_client_using_reqwest(
-    last_unique_id: &LastUniqueId,
-    deps: &WorkerExecutorTestDependencies,
-    _tracing: &Tracing,
-) {
-    let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
-    let captured_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let captured_body_clone = captured_body.clone();
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let host_http_port = listener.local_addr().unwrap().port();
-
-    let http_server = spawn(
-        async move {
-            let route = Router::new().route(
-                "/post-example",
-                post(move |headers: HeaderMap, body: Bytes| async move {
-                    let header = headers
-                        .get("X-Test")
-                        .map(|h| h.to_str().unwrap().to_string())
-                        .unwrap_or("no X-Test header".to_string());
-                    let body = String::from_utf8(body.to_vec()).unwrap();
-                    {
-                        let mut capture = captured_body_clone.lock().unwrap();
-                        *capture = Some(body.clone());
+                get(async move || {
+                    sender.send(()).await.unwrap();
+                    let mut first_request = first_request.lock().await;
+                    if *first_request {
+                        (*first_request) = false;
+                        tokio::time::sleep(Duration::from_secs(600)).await;
                     }
-                    format!(
-                        "{{ \"percentage\" : 0.25, \"message\": \"response message {}\" }}",
-                        header
-                    )
+                    "Hello, World!".to_string()
                 }),
             );
 
             axum::serve(listener, route).await.unwrap();
-        }
-        .in_current_span(),
-    );
+        };
 
-    let component_id = executor.component("http-client-2").store().await;
-    let mut env = HashMap::new();
-    env.insert("PORT".to_string(), host_http_port.to_string());
+        spawn(start_server.in_current_span())
+    };
 
-    let worker_id = executor
-        .start_worker_with(&component_id, "http-client-reqwest-1", vec![], env)
-        .await;
+    let component_id = {
+        let component_files = executor
+            .add_initial_component_files(&[(
+                "ifs-update-inside-exported-function/files/foo.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            )])
+            .await;
 
-    let result = executor
-        .invoke_and_await(&worker_id, "golem:it/api.{run}", vec![])
-        .await
-        .unwrap();
-    let captured_body = captured_body.lock().unwrap().clone().unwrap();
+        let env = vec![
+            ("PORT".to_string(), host_http_port.to_string()),
+            ("RUST_BACKTRACE".to_string(), "full".to_string()),
+        ];
 
-    executor.check_oplog_is_queryable(&worker_id).await;
+        executor
+            .component("golem_it_ifs_update_inside_exported_function")
+            .unique()
+            .with_files(&component_files)
+            .with_env(env)
+            .store()
+            .await
+    };
 
-    drop(executor);
-    http_server.abort();
+    let worker_id = executor.start_worker(&component_id, "ifs-update-1").await;
 
-    check!(result == vec![Value::String("200 ExampleResponse { percentage: 0.25, message: Some(\"response message Golem\") }".to_string())]);
-    check!(
-        captured_body
-            == "{\"name\":\"Something\",\"amount\":42,\"comments\":[\"Hello\",\"World\"]}"
-                .to_string()
-    );
-}
+    let idempotency_key = IdempotencyKey::fresh();
 
-#[test]
-#[tracing::instrument]
-async fn outgoing_http_contains_idempotency_key(
-    last_unique_id: &LastUniqueId,
-    deps: &WorkerExecutorTestDependencies,
-    _tracing: &Tracing,
-) {
-    let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let host_http_port = listener.local_addr().unwrap().port();
-
-    let http_server = spawn(
-        async move {
-            let route = Router::new().route(
-                "/post-example",
-                post(move |headers: HeaderMap| async move {
-                    let idempotency_key = headers
-                        .get("idempotency-key")
-                        .map(|h| h.to_str().unwrap().to_string());
-                    let idempotency_key_str = idempotency_key.map(|i| i.to_string());
-                    json!({
-                        "percentage": 0.0,
-                        "message": idempotency_key_str
-                    })
-                    .to_string()
-                }),
-            );
-
-            axum::serve(listener, route).await.unwrap();
-        }
-        .in_current_span(),
-    );
-
-    let component_id = executor.component("http-client-2").store().await;
-    let mut env = HashMap::new();
-    env.insert("PORT".to_string(), host_http_port.to_string());
-
-    let worker_id = executor
-        .start_worker_with(
-            &component_id,
-            "outgoing-http-contains-idempotency-key",
+    executor
+        .invoke_with_key(
+            &worker_id,
+            &idempotency_key,
+            "golem-it:ifs-update-inside-exported-function-exports/golem-it-ifs-update-inside-exported-function-api.{run}",
             vec![],
-            env,
         )
-        .await;
-
-    let key = IdempotencyKey::new("177db03d-3234-4a04-8d03-e8d042348abd".to_string());
-    let result = executor
-        .invoke_and_await_with_key(&worker_id, &key, "golem:it/api.{run}", vec![])
         .await
         .unwrap();
 
-    executor.check_oplog_is_queryable(&worker_id).await;
+    latch.recv().await.expect("channel should produce value");
 
-    drop(executor);
+    {
+        let component_files = executor
+            .add_initial_component_files(&[(
+                "ifs-update-inside-exported-function/files/bar.txt",
+                "/foo.txt",
+                ComponentFilePermissions::ReadOnly,
+            )])
+            .await;
+
+        let target_version = executor
+            .update_component_with_files(
+                &component_id,
+                "golem_it_ifs_update_inside_exported_function",
+                Some(&component_files),
+            )
+            .await;
+
+        executor
+            .auto_update_worker(&worker_id, target_version)
+            .await;
+    };
+
+    {
+        let result = executor
+            .invoke_and_await_with_key(
+                &worker_id,
+                &idempotency_key,
+                "golem-it:ifs-update-inside-exported-function-exports/golem-it-ifs-update-inside-exported-function-api.{run}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        check!(
+            result[0]
+                == Value::Tuple(vec![
+                    Value::String("foo\n".to_string()),
+                    Value::String("bar\n".to_string())
+                ])
+        );
+    }
+
     http_server.abort();
-
-    check!(
-        result
-            == vec![Value::String(
-                "200 ExampleResponse { percentage: 0.0, message: Some(\"25b5624b-3a2a-5574-bdad-418287838cba\") }"
-                    .to_string()
-            )]
-    );
 }
 
 #[test]
@@ -818,14 +1010,14 @@ async fn environment_service(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("environment-service").store().await;
     let args = vec!["test-arg".to_string()];
     let mut env = HashMap::new();
     env.insert("TEST_ENV".to_string(), "test-value".to_string());
     let worker_id = executor
-        .start_worker_with(&component_id, "environment-service-1", args, env)
+        .start_worker_with(&component_id, "environment-service-1", args, env, vec![])
         .await;
 
     let args_result = executor
@@ -856,6 +1048,10 @@ async fn environment_service(
                     Value::String("test-value".to_string())
                 ]),
                 Value::Tuple(vec![
+                    Value::String("GOLEM_AGENT_ID".to_string()),
+                    Value::String("environment-service-1".to_string())
+                ]),
+                Value::Tuple(vec![
                     Value::String("GOLEM_WORKER_NAME".to_string()),
                     Value::String("environment-service-1".to_string())
                 ]),
@@ -879,7 +1075,7 @@ async fn http_client_response_persisted_between_invocations(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let host_http_port = listener.local_addr().unwrap().port();
@@ -911,7 +1107,7 @@ async fn http_client_response_persisted_between_invocations(
     env.insert("PORT".to_string(), host_http_port.to_string());
 
     let worker_id = executor
-        .start_worker_with(&component_id, "http-client-2", vec![], env)
+        .start_worker_with(&component_id, "http-client-2", vec![], env, vec![])
         .await;
     let rx = executor.capture_output(&worker_id).await;
 
@@ -925,7 +1121,7 @@ async fn http_client_response_persisted_between_invocations(
     drop(executor);
     drop(rx);
 
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
     let _rx = executor.capture_output(&worker_id).await;
 
     let result = executor
@@ -950,7 +1146,7 @@ async fn http_client_interrupting_response_stream(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let host_http_port = listener.local_addr().unwrap().port();
@@ -998,7 +1194,116 @@ async fn http_client_interrupting_response_stream(
     env.insert("PORT".to_string(), host_http_port.to_string());
 
     let worker_id = executor
-        .start_worker_with(&component_id, "http-client-2", vec![], env)
+        .start_worker_with(&component_id, "http-client-2", vec![], env, vec![])
+        .await;
+    let rx = executor.capture_output_with_termination(&worker_id).await;
+
+    let key = IdempotencyKey::fresh();
+
+    let executor_clone = executor.clone();
+    let worker_id_clone = worker_id.clone();
+    let key_clone = key.clone();
+    let _handle = spawn(
+        async move {
+            let _ = executor_clone
+                .invoke_and_await_with_key(
+                    &worker_id_clone,
+                    &key_clone,
+                    "golem:it/api.{slow-body-stream}",
+                    vec![],
+                )
+                .await;
+        }
+        .in_current_span(),
+    );
+
+    signal_rx.recv().await.unwrap();
+
+    executor.interrupt(&worker_id).await; // Potential "body stream was interrupted" error
+
+    let _ = drain_connection(rx).await;
+
+    executor.resume(&worker_id, false).await;
+
+    executor
+        .wait_for_status(&worker_id, WorkerStatus::Running, Duration::from_secs(5))
+        .await;
+    executor.log_output(&worker_id).await;
+
+    let result = executor
+        .invoke_and_await_with_key(&worker_id, &key, "golem:it/api.{slow-body-stream}", vec![])
+        .await;
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    drop(executor);
+
+    http_server.abort();
+
+    check!(result == Ok(vec![Value::U64(100 * 1024)]));
+
+    let idempotency_keys = idempotency_keys.lock().unwrap();
+    check!(idempotency_keys.len() == 2);
+    check!(idempotency_keys[0] == idempotency_keys[1]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn http_client_interrupting_response_stream_async(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let idempotency_keys = Arc::new(Mutex::new(Vec::new()));
+    let idempotency_keys_clone = idempotency_keys.clone();
+
+    let http_server = spawn(
+        async move {
+            let route = Router::new().route(
+                "/big-byte-array",
+                get(move |headers: HeaderMap| async move {
+                    let idempotency_key = headers
+                        .get("idempotency-key")
+                        .map(|h| h.to_str().unwrap().to_string());
+                    if let Some(key) = idempotency_key {
+                        let mut keys = idempotency_keys_clone.lock().unwrap();
+                        keys.push(key);
+                    }
+                    let stream = stream::iter(0..100)
+                        .throttle(Duration::from_millis(20))
+                        .map(move |i| {
+                            if i == 50 {
+                                signal_tx.send(()).unwrap();
+                            }
+                            Ok::<Bytes, BoxError>(Bytes::from(vec![0; 1024]))
+                        });
+
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/octet-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                }),
+            );
+
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component_id = executor.component("http-client-3").store().await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+
+    let worker_id = executor
+        .start_worker_with(&component_id, "http-client-2-async", vec![], env, vec![])
         .await;
     let rx = executor.capture_output_with_termination(&worker_id).await;
 
@@ -1059,7 +1364,7 @@ async fn sleep(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("clock-service").store().await;
     let worker_id = executor
@@ -1078,7 +1383,7 @@ async fn sleep(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let start = Instant::now();
     let _ = executor
@@ -1096,13 +1401,416 @@ async fn sleep(
 
 #[test]
 #[tracing::instrument]
+async fn sleep_less_than_suspend_threshold(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker(&component_id, "clock-service-2")
+        .await;
+
+    let start = Instant::now();
+    let _ = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep}",
+            vec![1u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    let result = executor
+        .invoke_and_await(&worker_id, "golem:it/api.{healthcheck}", vec![])
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    drop(executor);
+
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    check!(duration.as_secs() >= 1);
+    check!(result == vec![Value::Bool(true)]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_longer_than_suspend_threshold(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker(&component_id, "clock-service-3")
+        .await;
+
+    let start = Instant::now();
+    let _ = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep}",
+            vec![12u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    let result = executor
+        .invoke_and_await(&worker_id, "golem:it/api.{healthcheck}", vec![])
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    drop(executor);
+
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    check!(duration.as_secs() >= 12);
+    check!(result == vec![Value::Bool(true)]);
+}
+
+async fn simulated_slow_request_server(delay: Duration) -> (u16, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    let http_server = spawn(
+        async move {
+            let route = Router::new().route(
+                "/simulated-slow-request",
+                get(move || async move {
+                    tokio::time::sleep(delay).await;
+                    "slow response".to_string()
+                }),
+            );
+
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    (host_http_port, http_server)
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_less_than_suspend_threshold_while_awaiting_response(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (port, server) = simulated_slow_request_server(Duration::from_secs(10)).await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker_with(&component_id, "clock-service-4", vec![], env, vec![])
+        .await;
+
+    let start = Instant::now();
+    let result = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep-during-request}",
+            vec![2u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    server.abort();
+    drop(executor);
+
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    check!(duration.as_secs() >= 2);
+    check!(duration.as_secs() < 10);
+    check!(result == vec![Value::String("Timeout".to_string())]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_longer_than_suspend_threshold_while_awaiting_response(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (port, server) = simulated_slow_request_server(Duration::from_secs(5)).await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker_with(&component_id, "clock-service-5", vec![], env, vec![])
+        .await;
+
+    let start = Instant::now();
+    let result = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep-during-request}",
+            vec![30u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    server.abort();
+    drop(executor);
+
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    check!(duration.as_secs() >= 5);
+    check!(duration.as_secs() < 30);
+    check!(result == vec![Value::String("slow response".to_string())]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_longer_than_suspend_threshold_while_awaiting_response_2(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (port, server) = simulated_slow_request_server(Duration::from_secs(30)).await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker_with(&component_id, "clock-service-6", vec![], env, vec![])
+        .await;
+
+    let start = Instant::now();
+    let result = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep-during-request}",
+            vec![15u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    server.abort();
+    drop(executor);
+
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    check!(duration.as_secs() >= 15);
+    check!(duration.as_secs() < 30);
+    check!(result == vec![Value::String("Timeout".to_string())]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_and_awaiting_parallel_responses(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (port, server) = simulated_slow_request_server(Duration::from_secs(2)).await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker_with(&component_id, "clock-service-7", vec![], env, vec![])
+        .await;
+
+    let start = Instant::now();
+    let result = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep-during-parallel-requests}",
+            vec![20u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    drop(executor);
+    server.abort();
+
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    info!("Restarting worker...");
+    let executor = crate::common::start(deps, &context)
+        .await
+        .unwrap()
+        .into_admin()
+        .await;
+    info!("Worker restarted");
+
+    let healthcheck_result = executor
+        .invoke_and_await(&worker_id, "golem:it/api.{healthcheck}", vec![])
+        .await
+        .unwrap();
+
+    // server.abort();
+
+    check!(duration.as_secs() >= 10);
+    check!(duration.as_secs() < 20);
+    check!(result == vec![Value::String("Ok(\"slow response\")\nOk(\"slow response\")\nOk(\"slow response\")\nOk(\"slow response\")\nOk(\"slow response\")\n".to_string())]);
+    check!(healthcheck_result == vec![Value::Bool(true)]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_below_threshold_between_http_responses(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (port, server) = simulated_slow_request_server(Duration::from_secs(1)).await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker_with(&component_id, "clock-service-8", vec![], env, vec![])
+        .await;
+
+    let _ = executor.log_output(&worker_id).await;
+
+    let start = Instant::now();
+    let result = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep-between-requests}",
+            vec![1u64.into_value_and_type(), 5u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    server.abort();
+    drop(executor);
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    info!("Restarting worker...");
+    let executor = crate::common::start(deps, &context)
+        .await
+        .unwrap()
+        .into_admin()
+        .await;
+    info!("Worker restarted");
+
+    let healthcheck_result = executor
+        .invoke_and_await(&worker_id, "golem:it/api.{healthcheck}", vec![])
+        .await
+        .unwrap();
+
+    check!(duration.as_secs() >= 10);
+    check!(result == vec![Value::String("Ok(\"slow response\")\nOk(\"slow response\")\nOk(\"slow response\")\nOk(\"slow response\")\nOk(\"slow response\")\n".to_string())]);
+    check!(healthcheck_result == vec![Value::Bool(true)]);
+}
+
+#[test]
+#[tracing::instrument]
+async fn sleep_above_threshold_between_http_responses(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let (port, server) = simulated_slow_request_server(Duration::from_secs(1)).await;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+
+    let component_id = executor.component("clock-service").store().await;
+    let worker_id = executor
+        .start_worker_with(&component_id, "clock-service-9", vec![], env, vec![])
+        .await;
+
+    let start = Instant::now();
+    let result = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{sleep-between-requests}",
+            vec![12u64.into_value_and_type(), 2u64.into_value_and_type()],
+        )
+        .await
+        .unwrap();
+
+    executor.check_oplog_is_queryable(&worker_id).await;
+
+    server.abort();
+    drop(executor);
+    let duration = start.elapsed();
+    debug!("duration: {:?}", duration);
+
+    info!("Restarting worker...");
+    let executor = crate::common::start(deps, &context)
+        .await
+        .unwrap()
+        .into_admin()
+        .await;
+    info!("Worker restarted");
+
+    let healthcheck_result = executor
+        .invoke_and_await(&worker_id, "golem:it/api.{healthcheck}", vec![])
+        .await
+        .unwrap();
+
+    check!(duration.as_secs() >= 14);
+    check!(
+        result
+            == vec![Value::String(
+                "Ok(\"slow response\")\nOk(\"slow response\")\n".to_string()
+            )]
+    );
+    check!(healthcheck_result == vec![Value::Bool(true)]);
+}
+
+#[test]
+#[tracing::instrument]
 async fn resuming_sleep(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("clock-service").store().await;
     let worker_id = executor
@@ -1134,7 +1842,7 @@ async fn resuming_sleep(
 
     info!("Restarting worker...");
 
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     info!("Worker restarted");
 
@@ -1161,7 +1869,7 @@ async fn failing_worker(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("failing-component").store().await;
     let worker_id = executor
@@ -1195,11 +1903,22 @@ async fn failing_worker(
     check!(result1.is_ok());
     check!(result2.is_err());
     check!(result3.is_err());
-    check!(worker_error_message(&result2.clone().err().unwrap())
-        .starts_with("Runtime error: error while executing at wasm backtrace:"));
-    check!(worker_error_message(&result2.err().unwrap())
-        .contains("failing_component.wasm!golem:component/api#add"));
-    check!(worker_error_message(&result3.err().unwrap()).starts_with("Previous invocation failed"));
+
+    let result2_err = result2.err().unwrap();
+    assert_eq!(worker_error_message(&result2_err), "Invocation failed");
+    assert!(
+        matches!(worker_error_underlying_error(&result2_err), Some(WorkerError::Unknown(error)) if error.starts_with("error while executing at wasm backtrace:") && error.contains("failing_component.wasm!golem:component/api#add"))
+    );
+    assert_eq!(worker_error_logs(&result2_err), Some("error log message\n\nthread '<unnamed>' panicked at src/lib.rs:31:17:\nvalue is too large\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n".to_string()));
+    let result3_err = result3.err().unwrap();
+    assert_eq!(
+        worker_error_message(&result3_err),
+        "Previous invocation failed"
+    );
+    assert!(
+        matches!(worker_error_underlying_error(&result3_err), Some(WorkerError::Unknown(error)) if error.starts_with("error while executing at wasm backtrace:") && error.contains("failing_component.wasm!golem:component/api#add"))
+    );
+    assert_eq!(worker_error_logs(&result3_err), Some("error log message\n\nthread '<unnamed>' panicked at src/lib.rs:31:17:\nvalue is too large\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n".to_string()));
 }
 
 #[test]
@@ -1210,7 +1929,7 @@ async fn file_service_write_direct(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-2").await;
@@ -1230,7 +1949,7 @@ async fn file_service_write_direct(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let result = executor
         .invoke_and_await(
@@ -1257,7 +1976,7 @@ async fn filesystem_write_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-3").await;
@@ -1285,7 +2004,7 @@ async fn filesystem_write_replay_restores_file_times(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times2 = executor
         .invoke_and_await(
@@ -1307,7 +2026,7 @@ async fn filesystem_create_dir_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-4").await;
@@ -1332,7 +2051,7 @@ async fn filesystem_create_dir_replay_restores_file_times(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times2 = executor
         .invoke_and_await(
@@ -1354,7 +2073,7 @@ async fn file_hard_link(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-5").await;
@@ -1408,7 +2127,7 @@ async fn filesystem_link_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-6").await;
@@ -1472,7 +2191,7 @@ async fn filesystem_link_replay_restores_file_times(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times_dir_2 = executor
         .invoke_and_await(
@@ -1503,7 +2222,7 @@ async fn filesystem_remove_dir_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-7").await;
@@ -1544,7 +2263,7 @@ async fn filesystem_remove_dir_replay_restores_file_times(
     executor.check_oplog_is_queryable(&worker_id).await;
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times2 = executor
         .invoke_and_await(
@@ -1566,7 +2285,7 @@ async fn filesystem_symlink_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-8").await;
@@ -1629,7 +2348,7 @@ async fn filesystem_symlink_replay_restores_file_times(
 
     drop(executor);
 
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times_dir_2 = executor
         .invoke_and_await(
@@ -1664,7 +2383,7 @@ async fn filesystem_rename_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-9").await;
@@ -1734,7 +2453,7 @@ async fn filesystem_rename_replay_restores_file_times(
         .unwrap();
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times_srcdir_2 = executor
         .invoke_and_await(
@@ -1777,7 +2496,7 @@ async fn filesystem_remove_file_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor
@@ -1803,10 +2522,26 @@ async fn filesystem_remove_file_replay_restores_file_times(
         )
         .await
         .unwrap();
+    let info1 = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{get-info}",
+            vec!["/test/testfile.txt".into_value_and_type()],
+        )
+        .await
+        .unwrap();
     let _ = executor
         .invoke_and_await(
             &worker_id,
             "golem:it/api.{remove-file}",
+            vec!["/test/testfile.txt".into_value_and_type()],
+        )
+        .await
+        .unwrap();
+    let info2 = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it/api.{get-info}",
             vec!["/test/testfile.txt".into_value_and_type()],
         )
         .await
@@ -1821,7 +2556,7 @@ async fn filesystem_remove_file_replay_restores_file_times(
         .unwrap();
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times2 = executor
         .invoke_and_await(
@@ -1835,6 +2570,9 @@ async fn filesystem_remove_file_replay_restores_file_times(
     executor.check_oplog_is_queryable(&worker_id).await;
     drop(executor);
 
+    println!("{:?}", info1);
+    println!("{:?}", info2);
+
     check!(times1 == times2);
 }
 
@@ -1846,7 +2584,7 @@ async fn filesystem_write_via_stream_replay_restores_file_times(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-3").await;
@@ -1872,7 +2610,7 @@ async fn filesystem_write_via_stream_replay_restores_file_times(
         .unwrap();
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let times2 = executor
         .invoke_and_await(
@@ -1898,7 +2636,7 @@ async fn filesystem_metadata_hash(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("file-service").store().await;
     let worker_id = executor.start_worker(&component_id, "file-service-3").await;
@@ -1924,7 +2662,7 @@ async fn filesystem_metadata_hash(
         .unwrap();
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let hash2 = executor
         .invoke_and_await(
@@ -1950,7 +2688,7 @@ async fn ip_address_resolve(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor.component("networking").store().await;
     let worker_id = executor
@@ -1963,7 +2701,7 @@ async fn ip_address_resolve(
         .unwrap();
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     // If the recovery succeeds, that means that the replayed IP address resolution produced the same result as expected
 
@@ -1990,7 +2728,7 @@ async fn wasi_incoming_request_handler(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor
         .component("wasi-http-incoming-request-handler")
@@ -2050,7 +2788,7 @@ async fn wasi_incoming_request_handler_echo(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor
         .component("wasi-http-incoming-request-handler-echo")
@@ -2195,7 +2933,7 @@ async fn wasi_incoming_request_handler_state(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let component_id = executor
         .component("wasi-http-incoming-request-handler-state")
@@ -2301,7 +3039,7 @@ async fn wasi_incoming_request_handler_state(
     );
 
     // restart executor and check whether we are restoring the state
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let result3 = executor
         .invoke_and_await(
@@ -2334,4 +3072,92 @@ async fn wasi_incoming_request_handler_state(
                 ]))))
             ])
     );
+}
+
+#[test]
+#[tracing::instrument]
+async fn wasi_config_initial_worker_config(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+) {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
+
+    let component_id = executor.component("golem_it_wasi_config").store().await;
+
+    let worker_id = executor
+        .start_worker_with(
+            &component_id,
+            "worker-1",
+            Vec::new(),
+            HashMap::new(),
+            vec![
+                ("k1".to_string(), "v1".to_string()),
+                ("k2".to_string(), "v2".to_string()),
+            ],
+        )
+        .await;
+
+    {
+        // get existing key
+
+        let result = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:wasi-config-exports/golem-it-wasi-config-api.{get}",
+                vec!["k1".into_value_and_type()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            vec![Value::Option(Some(Box::new(Value::String(
+                "v1".to_string()
+            ))))]
+        )
+    }
+
+    {
+        // get non-existent key
+
+        let result = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:wasi-config-exports/golem-it-wasi-config-api.{get}",
+                vec!["k3".into_value_and_type()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, vec![Value::Option(None)])
+    }
+
+    {
+        // get all keys
+
+        let result = executor
+            .invoke_and_await(
+                &worker_id,
+                "golem-it:wasi-config-exports/golem-it-wasi-config-api.{get-all}",
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            vec![Value::List(vec![
+                Value::Tuple(vec![
+                    Value::String("k1".to_string()),
+                    Value::String("v1".to_string())
+                ]),
+                Value::Tuple(vec![
+                    Value::String("k2".to_string()),
+                    Value::String("v2".to_string())
+                ])
+            ])]
+        )
+    }
 }

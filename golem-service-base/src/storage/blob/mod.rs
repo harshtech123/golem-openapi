@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use golem_common::model::{AccountId, ComponentId, Timestamp, WorkerId};
+use golem_common::model::{AccountId, ComponentId, ProjectId, Timestamp, WorkerId};
 use golem_common::serialization::{deserialize, serialize};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -28,7 +28,7 @@ pub mod s3;
 pub mod sqlite;
 
 #[async_trait]
-pub trait BlobStorage: Debug {
+pub trait BlobStorage: Debug + Send + Sync {
     async fn get_raw(
         &self,
         target_label: &'static str,
@@ -157,7 +157,7 @@ pub trait BlobStorage: Debug {
                 self.put_raw(target_label, op_label, namespace, to, &data)
                     .await
             }
-            None => Err(format!("Entry not found: {:?}", from)),
+            None => Err(format!("Entry not found: {from:?}")),
         }
     }
 
@@ -176,11 +176,15 @@ pub trait BlobStorage: Debug {
 }
 
 pub trait BlobStorageLabelledApi<S: BlobStorage + ?Sized + Sync> {
-    fn with(&self, svc_name: &'static str, api_name: &'static str) -> LabelledBlobStorage<S>;
+    fn with(&self, svc_name: &'static str, api_name: &'static str) -> LabelledBlobStorage<'_, S>;
 }
 
 impl<S: BlobStorage + ?Sized + Sync> BlobStorageLabelledApi<S> for S {
-    fn with(&self, svc_name: &'static str, api_name: &'static str) -> LabelledBlobStorage<Self> {
+    fn with(
+        &self,
+        svc_name: &'static str,
+        api_name: &'static str,
+    ) -> LabelledBlobStorage<'_, Self> {
         LabelledBlobStorage::new(svc_name, api_name, self)
     }
 }
@@ -321,7 +325,7 @@ impl<'a, S: BlobStorage + ?Sized + Sync> LabelledBlobStorage<'a, S> {
             .await
     }
 
-    pub async fn get<T: Decode>(
+    pub async fn get<T: Decode<()>>(
         &self,
         namespace: BlobStorageNamespace,
         path: &Path,
@@ -344,22 +348,27 @@ impl<'a, S: BlobStorage + ?Sized + Sync> LabelledBlobStorage<'a, S> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlobStorageNamespace {
-    CompilationCache,
-    InitialComponentFiles {
-        account_id: AccountId,
+    CompilationCache {
+        project_id: ProjectId,
     },
-    CustomStorage(AccountId),
+    InitialComponentFiles {
+        project_id: ProjectId,
+    },
+    CustomStorage {
+        project_id: ProjectId,
+    },
     OplogPayload {
-        account_id: AccountId,
+        project_id: ProjectId,
         worker_id: WorkerId,
     },
     CompressedOplog {
-        account_id: AccountId,
+        project_id: ProjectId,
         component_id: ComponentId,
         level: usize,
     },
-    // TODO: prefix with account_id and move existing data
-    Components,
+    Components {
+        project_id: ProjectId,
+    },
     PluginWasmFiles {
         account_id: AccountId,
     },

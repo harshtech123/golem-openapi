@@ -12,30 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::durable_host::dynamic_linking::mock::{mock_link, should_mock_dependency};
 use crate::durable_host::dynamic_linking::wasm_rpc::dynamic_wasm_rpc_link;
 use crate::durable_host::DurableWorkerCtx;
-use crate::services::component::ComponentMetadata;
 use crate::workerctx::{DynamicLinking, WorkerCtx};
 use async_trait::async_trait;
 use golem_common::model::component_metadata::DynamicLinkedInstance;
-use golem_wasm_rpc::golem_rpc_0_2_x::types::HostFutureInvokeResult;
-use golem_wasm_rpc::HostWasmRpc;
+use golem_wasm::golem_rpc_0_2_x::types::HostFutureInvokeResult;
+use golem_wasm::HostWasmRpc;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
+mod mock;
 mod wasm_rpc;
 
 #[async_trait]
-impl<Ctx: WorkerCtx + HostWasmRpc + HostFutureInvokeResult> DynamicLinking<Ctx>
-    for DurableWorkerCtx<Ctx>
+impl<
+        Ctx: WorkerCtx
+            + HostWasmRpc
+            + HostFutureInvokeResult
+            + wasmtime_wasi::p2::bindings::cli::environment::Host,
+    > DynamicLinking<Ctx> for DurableWorkerCtx<Ctx>
 {
     fn link(
         &mut self,
         engine: &Engine,
         linker: &mut Linker<Ctx>,
         component: &Component,
-        component_metadata: &ComponentMetadata<Ctx::Types>,
+        component_metadata: &golem_service_base::model::Component,
     ) -> anyhow::Result<()> {
         let mut root = linker.root();
 
@@ -48,12 +53,19 @@ impl<Ctx: WorkerCtx + HostWasmRpc + HostFutureInvokeResult> DynamicLinking<Ctx>
                 ComponentItem::Module(_) => {}
                 ComponentItem::Component(_) => {}
                 ComponentItem::ComponentInstance(ref inst) => {
-                    match component_metadata.dynamic_linking.get(&name.to_string()) {
+                    match component_metadata
+                        .metadata
+                        .dynamic_linking()
+                        .get(&name.to_string())
+                    {
                         Some(DynamicLinkedInstance::WasmRpc(rpc_metadata)) => {
                             dynamic_wasm_rpc_link(&name, rpc_metadata, engine, &mut root, inst)?;
                         }
                         None => {
-                            // Instance not marked for dynamic linking
+                            // Instance is not marked for dynamic linking
+                            if should_mock_dependency(&name) {
+                                mock_link(&name, engine, &mut root, inst)?;
+                            }
                         }
                     }
                 }

@@ -12,16 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rib_type_error::RibTypeError;
+use crate::rib_source_span::SourceSpan;
+use crate::rib_type_error::RibTypeErrorInternal;
 use crate::type_inference::type_hint::TypeHint;
 use crate::type_refinement::precise_types::{ListType, RecordType};
 use crate::type_refinement::TypeRefinement;
+use crate::FunctionName;
 use crate::{
-    ActualType, ExpectedType, GetTypeHint, InferredType, MatchArm, Path, Range, TypeMismatchError,
+    ActualType, ComponentDependencies, ExpectedType, FullyQualifiedResourceMethod, GetTypeHint,
+    InferredType, InstanceIdentifier, InterfaceName, MatchArm, PackageName, Path, Range,
+    TypeInternal, TypeMismatchError,
 };
 use crate::{CustomError, Expr, ExprVisitor};
 
-pub fn type_pull_up(expr: &mut Expr) -> Result<(), RibTypeError> {
+pub fn type_pull_up(
+    expr: &mut Expr,
+    component_dependencies: &ComponentDependencies,
+) -> Result<(), RibTypeErrorInternal> {
     let mut visitor = ExprVisitor::bottom_up(expr);
 
     while let Some(expr) = visitor.pop_front() {
@@ -40,22 +47,19 @@ pub fn type_pull_up(expr: &mut Expr) -> Result<(), RibTypeError> {
 
             Expr::InvokeMethodLazy {
                 lhs,
-                generic_type_parameter,
                 method,
-                args,
                 source_span,
+                args,
                 ..
             } => {
-                return Err(CustomError {
-                    expr: Expr::invoke_worker_function(
-                        lhs.as_ref().clone(),
-                        method.clone(),
-                        generic_type_parameter.clone(),
-                        args.clone(),
-                    ).with_source_span(source_span.clone()),
-                    help_message: vec![],
-                    message: format!("invalid method invocation `{}.{}`. make sure `{}` is defined and is a valid instance type (i.e, resource or worker)", lhs, method, lhs),
-                }.into());
+                let new_call = handle_residual_method_invokes(
+                    lhs,
+                    method,
+                    source_span,
+                    args,
+                    component_dependencies,
+                )?;
+                *expr = new_call
             }
 
             Expr::SelectField {
@@ -211,6 +215,7 @@ pub fn type_pull_up(expr: &mut Expr) -> Result<(), RibTypeError> {
             }
             Expr::Length { .. } => {}
             Expr::Throw { .. } => {}
+            Expr::GenerateWorkerName { .. } => {}
             Expr::ListComprehension {
                 yield_expr,
                 inferred_type,
@@ -272,7 +277,7 @@ fn handle_select_field(
     select_from: &Expr,
     field: &str,
     current_field_type: &mut InferredType,
-) -> Result<(), RibTypeError> {
+) -> Result<(), RibTypeErrorInternal> {
     let selection_field_type = get_inferred_type_of_selected_field(select_from, field)?;
 
     *current_field_type = current_field_type.merge(selection_field_type);
@@ -284,7 +289,7 @@ fn handle_select_index(
     select_from: &Expr,
     index: &Expr,
     current_select_index_type: &mut InferredType,
-) -> Result<(), RibTypeError> {
+) -> Result<(), RibTypeErrorInternal> {
     let selection_expr_inferred_type = select_from.inferred_type();
 
     // if select_from is not yet gone through any phase, we cannot guarantee
@@ -403,39 +408,138 @@ fn handle_range(range: &Range, inferred_type: &mut InferredType) {
 fn get_inferred_type_of_selected_field(
     select_from: &Expr,
     field: &str,
-) -> Result<InferredType, RibTypeError> {
+) -> Result<InferredType, RibTypeErrorInternal> {
     let select_from_inferred_type = select_from.inferred_type();
 
     let refined_record = RecordType::refine(&select_from_inferred_type).ok_or({
         TypeMismatchError {
-            expr_with_wrong_type: select_from.clone(),
-            parent_expr: None,
+            source_span: select_from.source_span(),
             expected_type: ExpectedType::Hint(TypeHint::Record(None)),
             actual_type: ActualType::Inferred(select_from_inferred_type.clone()),
             field_path: Path::default(),
-            additional_error_detail: vec![format!(
-                "cannot select {} from {} since it is not a record type. Found: {}",
-                field,
-                select_from,
-                select_from_inferred_type.get_type_hint()
-            )],
+            additional_error_detail: vec![
+                format!("cannot select `{}` from `{}`", field, select_from,),
+                format!("if `{}` is a function, pass arguments", field),
+            ],
         }
     })?;
 
     Ok(refined_record.inner_type_by_name(field))
 }
 
+// This is not an ideal logic yet,
+// but alternate solution requires refactoring which can be done later
+fn handle_residual_method_invokes(
+    lhs: &Expr,
+    method: &str,
+    source_span: &SourceSpan,
+    args: &[Expr],
+    component_dependencies: &ComponentDependencies,
+) -> Result<Expr, RibTypeErrorInternal> {
+    let possible_resource = lhs.inferred_type().internal_type().clone();
+
+    match possible_resource {
+        TypeInternal::Resource {
+            name,
+            owner,
+            ..
+        } => {
+
+            let fully_qualified_resource_method = if let Some(owner) = owner {
+                let owner_string : String = owner;
+                let parts: Vec<&str> = owner_string.split('/').collect();
+                let namespace_and_package = parts.first().map(|s| s.to_string());
+
+                let namespace = namespace_and_package
+                    .as_ref()
+                    .and_then(|s| s.split(':').next())
+                    .map(|s| s.to_string());
+                let package_name = namespace_and_package
+                    .as_ref()
+                    .and_then(|s| s.split(':').nth(1))
+                    .map(|s| s.to_string());
+
+                let interface_name = parts.get(1).map(|s| s.to_string());
+
+                FullyQualifiedResourceMethod {
+                    package_name: namespace.map(|namespace| PackageName {
+                        namespace,
+                        package_name: package_name.unwrap(),
+                        version: None,
+                    }),
+                    interface_name: interface_name.map(|name| InterfaceName {
+                        name,
+                        version: None,
+                    }),
+                    resource_name: name.clone().unwrap(),
+                    method_name: method.to_string(),
+                    static_function: false,
+                }
+            } else {
+                FullyQualifiedResourceMethod {
+                    package_name: None,
+                    interface_name: None,
+                    resource_name: name.clone().unwrap(),
+                    method_name: method.to_string(),
+                    static_function: false,
+                }
+            };
+
+            let function_name = FunctionName::ResourceMethod(fully_qualified_resource_method.clone());
+            let (key, function_type) =
+                component_dependencies.get_function_type(&None, &function_name).unwrap();
+
+            let inferred_type = if let Some(new_inferred_type) = function_type.return_type {
+                new_inferred_type
+            } else {
+                InferredType::unit()
+            };
+
+            let dynamic_parsed_function_name = fully_qualified_resource_method
+                .dynamic_parsed_function_name().unwrap();
+
+            let variable_id = match &lhs {
+                Expr::Identifier { variable_id, .. } => Some(variable_id),
+                _ => None,
+            };
+
+            let new_call = Expr::call_worker_function(
+                dynamic_parsed_function_name,
+                None,
+                Some(InstanceIdentifier::WitResource {
+                    variable_id: variable_id.cloned(),
+                    worker_name: None,
+                    resource_name: name.unwrap().to_string()
+                }),
+                args.to_vec(),
+                Some(key)
+            )
+                .with_inferred_type(inferred_type)
+                .with_source_span(source_span.clone());
+
+            Ok(new_call)
+        }
+
+        _ => {
+            Err(CustomError {
+                source_span: source_span.clone(),
+                help_message: vec![],
+                message: format!("invalid method invocation `{lhs}.{method}`. make sure `{lhs}` is defined and is a valid instance type (i.e, resource or worker)"),
+            }.into())
+        }
+    }
+}
+
 fn get_inferred_type_of_selection_dynamic(
     select_from: &Expr,
     index: &Expr,
-) -> Result<InferredType, RibTypeError> {
+) -> Result<InferredType, RibTypeErrorInternal> {
     let select_from_type = select_from.inferred_type();
     let select_index_type = index.inferred_type();
 
     let refined_list = ListType::refine(&select_from_type).ok_or({
         TypeMismatchError {
-            expr_with_wrong_type: select_from.clone(),
-            parent_expr: None,
+            source_span: select_from.source_span(),
             expected_type: ExpectedType::Hint(TypeHint::List(None)),
             actual_type: ActualType::Inferred(select_from_type.clone()),
             field_path: Default::default(),
@@ -460,20 +564,22 @@ fn get_inferred_type_of_selection_dynamic(
 #[cfg(test)]
 mod type_pull_up_tests {
     use bigdecimal::BigDecimal;
+
     use test_r::test;
 
     use crate::call_type::CallType;
     use crate::function_name::DynamicParsedFunctionName;
-    use crate::DynamicParsedFunctionReference::IndexedResourceMethod;
+    use crate::DynamicParsedFunctionReference::Function;
     use crate::ParsedFunctionSite::PackagedInterface;
-    use crate::{ArmPattern, Expr, FunctionTypeRegistry, InferredType, MatchArm, VariableId};
+    use crate::{ArmPattern, ComponentDependencies, Expr, InferredType, MatchArm, VariableId};
 
     #[test]
     pub fn test_pull_up_identifier() {
         let expr = "foo";
         let mut expr = Expr::from_text(expr).unwrap();
         expr.add_infer_type_mut(InferredType::string());
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         assert_eq!(expr.inferred_type(), InferredType::string());
     }
 
@@ -486,7 +592,8 @@ mod type_pull_up_tests {
             )]));
         let select_expr = Expr::select_field(record_identifier, "foo", None);
         let mut expr = Expr::select_field(select_expr, "bar", None);
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         assert_eq!(expr.inferred_type(), InferredType::u64());
     }
 
@@ -495,7 +602,8 @@ mod type_pull_up_tests {
         let identifier = Expr::identifier_global("foo", None)
             .merge_inferred_type(InferredType::list(InferredType::u64()));
         let mut expr = Expr::select_index(identifier.clone(), Expr::number(BigDecimal::from(0)));
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         let expected = Expr::select_index(identifier, Expr::number(BigDecimal::from(0)))
             .merge_inferred_type(InferredType::u64());
         assert_eq!(expr, expected);
@@ -510,7 +618,8 @@ mod type_pull_up_tests {
 
         let mut expr =
             Expr::sequence(elems.clone(), None).with_inferred_type(InferredType::unknown());
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         assert_eq!(
             expr,
@@ -525,7 +634,8 @@ mod type_pull_up_tests {
             Expr::number_inferred(BigDecimal::from(1), None, InferredType::u64()),
         ]);
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         assert_eq!(
             expr.inferred_type(),
@@ -550,7 +660,8 @@ mod type_pull_up_tests {
             ("bar".to_string(), InferredType::unknown()),
         ]));
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         assert_eq!(
             expr,
@@ -570,7 +681,8 @@ mod type_pull_up_tests {
     #[test]
     pub fn test_pull_up_for_concat() {
         let mut expr = Expr::concat(vec![Expr::literal("foo"), Expr::literal("bar")]);
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         let expected = Expr::concat(vec![Expr::literal("foo"), Expr::literal("bar")])
             .with_inferred_type(InferredType::string());
         assert_eq!(expr, expected);
@@ -579,7 +691,8 @@ mod type_pull_up_tests {
     #[test]
     pub fn test_pull_up_for_not() {
         let mut expr = Expr::not(Expr::boolean(true));
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         assert_eq!(expr.inferred_type(), InferredType::bool());
     }
 
@@ -603,7 +716,8 @@ mod type_pull_up_tests {
             select_index4.clone(),
         );
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         let expected = Expr::cond(
             Expr::greater_than(
                 Expr::select_index(
@@ -649,7 +763,8 @@ mod type_pull_up_tests {
         let select_field2 = Expr::select_field(inner, "baz", None);
         let mut expr = Expr::greater_than(select_field1.clone(), select_field2.clone());
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         let expected = Expr::greater_than(
             select_field1.merge_inferred_type(InferredType::string()),
@@ -668,7 +783,8 @@ mod type_pull_up_tests {
         let select_index2 = Expr::select_index(inner, Expr::number(BigDecimal::from(1)));
         let mut expr = Expr::greater_than_or_equal_to(select_index1.clone(), select_index2.clone());
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         let expected = Expr::greater_than_or_equal_to(
             select_index1.merge_inferred_type(InferredType::u64()),
@@ -703,7 +819,8 @@ mod type_pull_up_tests {
             select_field_from_second.clone(),
         );
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         let new_select_field_from_first = Expr::select_field(
             Expr::select_index(inner.clone(), Expr::number(BigDecimal::from(0)))
@@ -734,7 +851,8 @@ mod type_pull_up_tests {
             Expr::number(BigDecimal::from(1)),
             Expr::number(BigDecimal::from(2)),
         );
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         assert_eq!(expr.inferred_type(), InferredType::bool());
     }
 
@@ -745,7 +863,8 @@ mod type_pull_up_tests {
             Expr::number(BigDecimal::from(2)),
         );
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         assert_eq!(expr.inferred_type(), InferredType::bool());
     }
@@ -757,9 +876,11 @@ mod type_pull_up_tests {
             None,
             None,
             vec![Expr::number(BigDecimal::from(1))],
+            None,
         );
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         assert_eq!(expr.inferred_type(), InferredType::unknown());
     }
@@ -768,15 +889,17 @@ mod type_pull_up_tests {
     pub fn test_pull_up_for_dynamic_call() {
         let rib = r#"
            let input = { foo: "afs", bar: "al" };
-           golem:it/api.{cart(input.foo).checkout}()
+           golem:it/api.{cart-checkout}(input.foo)
         "#;
 
         let mut expr = Expr::from_text(rib).unwrap();
-        let function_registry = FunctionTypeRegistry::empty();
-        expr.infer_types_initial_phase(&function_registry, &vec![])
+        let component_dependencies = ComponentDependencies::default();
+
+        expr.infer_types_initial_phase(&component_dependencies, &vec![], &[])
             .unwrap();
         expr.infer_all_identifiers();
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         let expected = Expr::expr_block(vec![
             Expr::let_binding_with_variable_id(
@@ -798,31 +921,32 @@ mod type_pull_up_tests {
                 None,
             ),
             Expr::call(
-                CallType::function_without_worker(DynamicParsedFunctionName {
-                    site: PackagedInterface {
-                        namespace: "golem".to_string(),
-                        package: "it".to_string(),
-                        interface: "api".to_string(),
-                        version: None,
+                CallType::function_call(
+                    DynamicParsedFunctionName {
+                        site: PackagedInterface {
+                            namespace: "golem".to_string(),
+                            package: "it".to_string(),
+                            interface: "api".to_string(),
+                            version: None,
+                        },
+                        function: Function {
+                            function: "cart-checkout".to_string(),
+                        },
                     },
-                    function: IndexedResourceMethod {
-                        resource: "cart".to_string(),
-                        resource_params: vec![Expr::select_field(
-                            Expr::identifier_local("input", 0, None).with_inferred_type(
-                                InferredType::record(vec![
-                                    ("foo".to_string(), InferredType::string()),
-                                    ("bar".to_string(), InferredType::string()),
-                                ]),
-                            ),
-                            "foo",
-                            None,
-                        )
-                        .with_inferred_type(InferredType::string())],
-                        method: "checkout".to_string(),
-                    },
-                }),
+                    None,
+                ),
                 None,
-                vec![],
+                vec![Expr::select_field(
+                    Expr::identifier_local("input", 0, None).with_inferred_type(
+                        InferredType::record(vec![
+                            ("foo".to_string(), InferredType::string()),
+                            ("bar".to_string(), InferredType::string()),
+                        ]),
+                    ),
+                    "foo",
+                    None,
+                )
+                .with_inferred_type(InferredType::string())],
             ),
         ]);
 
@@ -834,7 +958,8 @@ mod type_pull_up_tests {
         let mut number = Expr::number(BigDecimal::from(1));
         number.with_inferred_type_mut(InferredType::f64());
         let mut expr = Expr::option(Some(number)).unwrap();
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         assert_eq!(
             expr.inferred_type(),
             InferredType::option(InferredType::f64())
@@ -846,7 +971,8 @@ mod type_pull_up_tests {
         let mut number = Expr::number(BigDecimal::from(1));
         number.with_inferred_type_mut(InferredType::f64());
         let mut expr = Expr::get_tag(Expr::option(Some(number)));
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
         assert_eq!(
             expr.inferred_type(),
             InferredType::option(InferredType::f64())
@@ -914,7 +1040,8 @@ mod type_pull_up_tests {
             ],
         );
 
-        expr.pull_types_up().unwrap();
+        expr.pull_types_up(&ComponentDependencies::default())
+            .unwrap();
 
         let expected = internal::expected_pattern_match();
 

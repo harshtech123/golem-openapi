@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::repl_state::ReplState;
-use golem_wasm_ast::analysis::{TypeEnum, TypeVariant};
+use golem_wasm::analysis::{TypeEnum, TypeVariant};
 use rib::*;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -21,12 +21,14 @@ use std::sync::Arc;
 
 pub fn compile_rib_script(
     rib_script: &str,
-    repl_state: &Arc<ReplState>,
+    repl_state: Arc<ReplState>,
 ) -> Result<ReplCompilerOutput, RibCompilationError> {
     let expr = Expr::from_text(rib_script)
         .map_err(|e| RibCompilationError::InvalidSyntax(e.to_string()))?;
 
     let compiler = repl_state.rib_compiler();
+
+    repl_state.reset_instance_count();
 
     let inferred_expr = compiler.infer_types(expr)?;
 
@@ -39,7 +41,7 @@ pub fn compile_rib_script(
     let enums = compiler.get_enums();
 
     let byte_code = RibByteCode::from_expr(&inferred_expr)
-        .map_err(RibCompilationError::ByteCodeGenerationFail)?;
+        .map_err(|err| RibCompilationError::ByteCodeGenerationFail(Box::new(err)))?;
 
     Ok(ReplCompilerOutput {
         rib_byte_code: byte_code,
@@ -98,8 +100,8 @@ pub enum InstanceKey {
 impl Display for InstanceKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstanceKey::Worker(key) => write!(f, "{}", key),
-            InstanceKey::Resource(key) => write!(f, "{}", key),
+            InstanceKey::Worker(key) => write!(f, "{key}"),
+            InstanceKey::Resource(key) => write!(f, "{key}"),
         }
     }
 }

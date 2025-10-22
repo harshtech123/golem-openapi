@@ -12,28 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
 use crate::grpc::authorised_grpc_request;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use golem_api_grpc::proto::golem::worker::v1::worker_service_client::WorkerServiceClient;
 use golem_api_grpc::proto::golem::worker::v1::{
-    fork_worker_response, invoke_and_await_typed_response, invoke_response, resume_worker_response,
-    revert_worker_response, update_worker_response, worker_error, ForkWorkerRequest,
-    InvokeAndAwaitRequest, InvokeAndAwaitTypedResponse, InvokeRequest, InvokeResponse,
-    ResumeWorkerRequest, ResumeWorkerResponse, RevertWorkerRequest, RevertWorkerResponse,
-    UpdateWorkerRequest, UpdateWorkerResponse, WorkerError,
+    complete_promise_response, fork_worker_response, invoke_and_await_typed_response,
+    invoke_response, launch_new_worker_response, resume_worker_response, revert_worker_response,
+    update_worker_response, worker_error, CompletePromiseRequest, CompletePromiseResponse,
+    ForkWorkerRequest, InvokeAndAwaitRequest, InvokeAndAwaitTypedResponse, InvokeRequest,
+    InvokeResponse, LaunchNewWorkerRequest, LaunchNewWorkerResponse, ResumeWorkerRequest,
+    ResumeWorkerResponse, RevertWorkerRequest, RevertWorkerResponse, UpdateWorkerRequest,
+    UpdateWorkerResponse, WorkerError,
 };
-use golem_api_grpc::proto::golem::worker::{InvokeParameters, UpdateMode};
+use golem_api_grpc::proto::golem::worker::{CompleteParameters, InvokeParameters, UpdateMode};
 use golem_common::client::{GrpcClient, GrpcClientConfig};
 use golem_common::model::invocation_context::InvocationContextStack;
 use golem_common::model::oplog::OplogIndex;
-use golem_common::model::{ComponentVersion, IdempotencyKey, OwnedWorkerId, RetryConfig, WorkerId};
+use golem_common::model::{
+    ComponentVersion, IdempotencyKey, OwnedWorkerId, PromiseId, RetryConfig, WorkerId,
+};
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 use golem_service_base::model::RevertWorkerTarget;
-use golem_wasm_rpc::protobuf::type_annotated_value::TypeAnnotatedValue;
-use golem_wasm_rpc::{Value, WitValue};
+use golem_wasm::{Value, ValueAndType, WitValue};
 use http::Uri;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
@@ -44,6 +47,14 @@ use uuid::Uuid;
 
 #[async_trait]
 pub trait WorkerProxy: Send + Sync {
+    async fn start(
+        &self,
+        owned_worker_id: &OwnedWorkerId,
+        caller_args: Vec<String>,
+        caller_env: HashMap<String, String>,
+        caller_wasi_config_vars: BTreeMap<String, String>,
+    ) -> Result<(), WorkerProxyError>;
+
     async fn invoke_and_await(
         &self,
         owned_worker_id: &OwnedWorkerId,
@@ -53,8 +64,9 @@ pub trait WorkerProxy: Send + Sync {
         caller_worker_id: WorkerId,
         caller_args: Vec<String>,
         caller_env: HashMap<String, String>,
+        caller_wasi_config_vars: BTreeMap<String, String>,
         caller_stack: InvocationContextStack,
-    ) -> Result<TypeAnnotatedValue, WorkerProxyError>;
+    ) -> Result<Option<ValueAndType>, WorkerProxyError>;
 
     async fn invoke(
         &self,
@@ -65,6 +77,7 @@ pub trait WorkerProxy: Send + Sync {
         caller_worker_id: WorkerId,
         caller_args: Vec<String>,
         caller_env: HashMap<String, String>,
+        caller_wasi_config_vars: BTreeMap<String, String>,
         caller_stack: InvocationContextStack,
     ) -> Result<(), WorkerProxyError>;
 
@@ -87,9 +100,15 @@ pub trait WorkerProxy: Send + Sync {
 
     async fn revert(
         &self,
-        worker_id: WorkerId,
+        worker_id: &WorkerId,
         target: RevertWorkerTarget,
     ) -> Result<(), WorkerProxyError>;
+
+    async fn complete_promise(
+        &self,
+        promise_id: PromiseId,
+        data: Vec<u8>,
+    ) -> Result<bool, WorkerProxyError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -99,17 +118,19 @@ pub enum WorkerProxyError {
     LimitExceeded(String),
     NotFound(String),
     AlreadyExists(String),
-    InternalError(GolemError),
+    InternalError(WorkerExecutorError),
 }
 
-impl From<WorkerProxyError> for GolemError {
+impl From<WorkerProxyError> for WorkerExecutorError {
     fn from(value: WorkerProxyError) -> Self {
         match value {
-            WorkerProxyError::BadRequest(errors) => GolemError::invalid_request(errors.join(", ")),
-            WorkerProxyError::Unauthorized(error) => GolemError::unknown(error),
-            WorkerProxyError::LimitExceeded(error) => GolemError::unknown(error),
-            WorkerProxyError::NotFound(error) => GolemError::unknown(error),
-            WorkerProxyError::AlreadyExists(error) => GolemError::unknown(error),
+            WorkerProxyError::BadRequest(errors) => {
+                WorkerExecutorError::invalid_request(errors.join(", "))
+            }
+            WorkerProxyError::Unauthorized(error) => WorkerExecutorError::unknown(error),
+            WorkerProxyError::LimitExceeded(error) => WorkerExecutorError::unknown(error),
+            WorkerProxyError::NotFound(error) => WorkerExecutorError::unknown(error),
+            WorkerProxyError::AlreadyExists(error) => WorkerExecutorError::unknown(error),
             WorkerProxyError::InternalError(error) => error,
         }
     }
@@ -132,16 +153,15 @@ impl Display for WorkerProxyError {
 
 impl From<tonic::transport::Error> for WorkerProxyError {
     fn from(value: tonic::transport::Error) -> Self {
-        Self::InternalError(GolemError::unknown(format!(
-            "gRPC Transport error: {}",
-            value
+        Self::InternalError(WorkerExecutorError::unknown(format!(
+            "gRPC Transport error: {value}"
         )))
     }
 }
 
 impl From<tonic::Status> for WorkerProxyError {
     fn from(value: tonic::Status) -> Self {
-        Self::InternalError(GolemError::unknown(format!("gRPC error: {}", value)))
+        Self::InternalError(WorkerExecutorError::unknown(format!("gRPC error: {value}")))
     }
 }
 
@@ -163,18 +183,20 @@ impl From<WorkerError> for WorkerProxyError {
             }
             Some(worker_error::Error::InternalError(worker_executor_error)) => {
                 WorkerProxyError::InternalError(worker_executor_error.try_into().unwrap_or(
-                    GolemError::unknown("Unknown error from the worker executor".to_string()),
+                    WorkerExecutorError::unknown(
+                        "Unknown error from the worker executor".to_string(),
+                    ),
                 ))
             }
-            None => WorkerProxyError::InternalError(GolemError::unknown(
+            None => WorkerProxyError::InternalError(WorkerExecutorError::unknown(
                 "Empty error response from the worker API".to_string(),
             )),
         }
     }
 }
 
-impl From<GolemError> for WorkerProxyError {
-    fn from(value: GolemError) -> Self {
+impl From<WorkerExecutorError> for WorkerProxyError {
+    fn from(value: WorkerExecutorError) -> Self {
         WorkerProxyError::InternalError(value)
     }
 }
@@ -212,6 +234,48 @@ impl RemoteWorkerProxy {
 
 #[async_trait]
 impl WorkerProxy for RemoteWorkerProxy {
+    async fn start(
+        &self,
+        owned_worker_id: &OwnedWorkerId,
+        caller_args: Vec<String>,
+        caller_env: HashMap<String, String>,
+        caller_wasi_config_vars: BTreeMap<String, String>,
+    ) -> Result<(), WorkerProxyError> {
+        debug!(owned_worker_id=%owned_worker_id, "Starting remote worker");
+
+        let response: LaunchNewWorkerResponse = self
+            .client
+            .call("launch_new_worker", move |client| {
+                let caller_args = caller_args.clone();
+                let caller_env = caller_env.clone();
+                let caller_wasi_config_vars = caller_wasi_config_vars.clone();
+                Box::pin(client.launch_new_worker(authorised_grpc_request(
+                    LaunchNewWorkerRequest {
+                        component_id: Some(owned_worker_id.component_id().into()),
+                        name: owned_worker_id.worker_name(),
+                        args: caller_args,
+                        env: caller_env,
+                        wasi_config_vars: Some(caller_wasi_config_vars.clone().into()),
+                        ignore_already_existing: true,
+                    },
+                    &self.access_token,
+                )))
+            })
+            .await?
+            .into_inner();
+
+        match response.result {
+            Some(launch_new_worker_response::Result::Success(_)) => Ok(()),
+            Some(launch_new_worker_response::Result::Error(error)) => match error.error {
+                Some(worker_error::Error::AlreadyExists(_)) => Ok(()),
+                _ => Err(error.into()),
+            },
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
+        }
+    }
+
     async fn invoke_and_await(
         &self,
         owned_worker_id: &OwnedWorkerId,
@@ -221,8 +285,9 @@ impl WorkerProxy for RemoteWorkerProxy {
         caller_worker_id: WorkerId,
         caller_args: Vec<String>,
         caller_env: HashMap<String, String>,
+        caller_wasi_config_vars: BTreeMap<String, String>,
         caller_stack: InvocationContextStack,
-    ) -> Result<TypeAnnotatedValue, WorkerProxyError> {
+    ) -> Result<Option<ValueAndType>, WorkerProxyError> {
         debug!(
             "Invoking remote worker function {function_name} with parameters {function_params:?}"
         );
@@ -243,7 +308,7 @@ impl WorkerProxy for RemoteWorkerProxy {
             .call("invoke_and_await_typed", move |client| {
                 Box::pin(client.invoke_and_await_typed(authorised_grpc_request(
                     InvokeAndAwaitRequest {
-                        worker_id: Some(owned_worker_id.worker_id().into_target_worker_id().into()),
+                        worker_id: Some(owned_worker_id.worker_id().into()),
                         idempotency_key: idempotency_key.clone().map(|k| k.into()),
                         function: function_name.clone(),
                         invoke_parameters: invoke_parameters.clone(),
@@ -251,6 +316,7 @@ impl WorkerProxy for RemoteWorkerProxy {
                             parent: Some(caller_worker_id.clone().into()),
                             args: caller_args.clone(),
                             env: caller_env.clone(),
+                            wasi_config_vars: Some(caller_wasi_config_vars.clone().into()),
                             tracing: Some(caller_stack.clone().into()),
                         }),
                     },
@@ -262,23 +328,22 @@ impl WorkerProxy for RemoteWorkerProxy {
 
         match response.result {
             Some(invoke_and_await_typed_response::Result::Success(result)) => {
-                let result =
-                    result
-                        .result
-                        .ok_or(WorkerProxyError::InternalError(GolemError::unknown(
-                            "Missing result value in the worker API response".to_string(),
-                        )))?;
                 let result = result
-                    .type_annotated_value
-                    .ok_or(WorkerProxyError::InternalError(GolemError::unknown(
-                        "Missing type_annotated_value in the worker API response".to_string(),
-                    )))?;
+                    .result
+                    .map(|proto_vnt| {
+                        ValueAndType::try_from(proto_vnt).map_err(|e| {
+                            WorkerProxyError::InternalError(WorkerExecutorError::unknown(format!(
+                                "Failed to parse invocation result value: {e}"
+                            )))
+                        })
+                    })
+                    .transpose()?;
                 Ok(result)
             }
             Some(invoke_and_await_typed_response::Result::Error(error)) => Err(error.into()),
-            None => Err(WorkerProxyError::InternalError(GolemError::unknown(
-                "Empty response through the worker API".to_string(),
-            ))),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
         }
     }
 
@@ -291,6 +356,7 @@ impl WorkerProxy for RemoteWorkerProxy {
         caller_worker_id: WorkerId,
         caller_args: Vec<String>,
         caller_env: HashMap<String, String>,
+        caller_wasi_config_vars: BTreeMap<String, String>,
         caller_stack: InvocationContextStack,
     ) -> Result<(), WorkerProxyError> {
         debug!("Invoking remote worker function {function_name} with parameters {function_params:?} without awaiting for the result");
@@ -311,7 +377,7 @@ impl WorkerProxy for RemoteWorkerProxy {
             .call("invoke", move |client| {
                 Box::pin(client.invoke(authorised_grpc_request(
                     InvokeRequest {
-                        worker_id: Some(owned_worker_id.worker_id().into_target_worker_id().into()),
+                        worker_id: Some(owned_worker_id.worker_id().into()),
                         idempotency_key: idempotency_key.clone().map(|k| k.into()),
                         function: function_name.clone(),
                         invoke_parameters: invoke_parameters.clone(),
@@ -319,6 +385,7 @@ impl WorkerProxy for RemoteWorkerProxy {
                             parent: Some(caller_worker_id.clone().into()),
                             args: caller_args.clone(),
                             env: caller_env.clone(),
+                            wasi_config_vars: Some(caller_wasi_config_vars.clone().into()),
                             tracing: Some(caller_stack.clone().into()),
                         }),
                     },
@@ -331,9 +398,9 @@ impl WorkerProxy for RemoteWorkerProxy {
         match response.result {
             Some(invoke_response::Result::Success(_)) => Ok(()),
             Some(invoke_response::Result::Error(error)) => Err(error.into()),
-            None => Err(WorkerProxyError::InternalError(GolemError::unknown(
-                "Empty response through the worker API".to_string(),
-            ))),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
         }
     }
 
@@ -363,9 +430,9 @@ impl WorkerProxy for RemoteWorkerProxy {
         match response.result {
             Some(update_worker_response::Result::Success(_)) => Ok(()),
             Some(update_worker_response::Result::Error(error)) => Err(error.into()),
-            None => Err(WorkerProxyError::InternalError(GolemError::unknown(
-                "Empty response through the worker API".to_string(),
-            ))),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
         }
     }
 
@@ -389,9 +456,9 @@ impl WorkerProxy for RemoteWorkerProxy {
         match response.result {
             Some(resume_worker_response::Result::Success(_)) => Ok(()),
             Some(resume_worker_response::Result::Error(error)) => Err(error.into()),
-            None => Err(WorkerProxyError::InternalError(GolemError::unknown(
-                "Empty response through the worker API".to_string(),
-            ))),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
         }
     }
 
@@ -421,15 +488,17 @@ impl WorkerProxy for RemoteWorkerProxy {
         match response.result {
             Some(fork_worker_response::Result::Success(_)) => Ok(()),
             Some(fork_worker_response::Result::Error(error)) => Err(error.into()),
-            None => Err(WorkerProxyError::InternalError(GolemError::unknown(
-                "Empty response through the worker API during fork".to_string(),
-            ))),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown(
+                    "Empty response through the worker API during fork".to_string(),
+                ),
+            )),
         }
     }
 
     async fn revert(
         &self,
-        worker_id: WorkerId,
+        worker_id: &WorkerId,
         target: RevertWorkerTarget,
     ) -> Result<(), WorkerProxyError> {
         let response: RevertWorkerResponse = self
@@ -449,9 +518,40 @@ impl WorkerProxy for RemoteWorkerProxy {
         match response.result {
             Some(revert_worker_response::Result::Success(_)) => Ok(()),
             Some(revert_worker_response::Result::Error(error)) => Err(error.into()),
-            None => Err(WorkerProxyError::InternalError(GolemError::unknown(
-                "Empty response through the worker API".to_string(),
-            ))),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
+        }
+    }
+
+    async fn complete_promise(
+        &self,
+        promise_id: PromiseId,
+        data: Vec<u8>,
+    ) -> Result<bool, WorkerProxyError> {
+        let response: CompletePromiseResponse = self
+            .client
+            .call("complete_promise", move |client| {
+                Box::pin(client.complete_promise(authorised_grpc_request(
+                    CompletePromiseRequest {
+                        worker_id: Some(promise_id.worker_id.clone().into()),
+                        complete_parameters: Some(CompleteParameters {
+                            oplog_idx: promise_id.oplog_idx.into(),
+                            data: data.clone(),
+                        }),
+                    },
+                    &self.access_token,
+                )))
+            })
+            .await?
+            .into_inner();
+
+        match response.result {
+            Some(complete_promise_response::Result::Success(success)) => Ok(success),
+            Some(complete_promise_response::Result::Error(error)) => Err(error.into()),
+            None => Err(WorkerProxyError::InternalError(
+                WorkerExecutorError::unknown("Empty response through the worker API".to_string()),
+            )),
         }
     }
 }

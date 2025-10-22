@@ -16,9 +16,9 @@ use crate::services::rdbms::{AnalysedTypeMerger, RdbmsIntoValueAndType};
 use bigdecimal::BigDecimal;
 use bincode::{Decode, Encode};
 use bit_vec::BitVec;
-use golem_wasm_ast::analysis::AnalysedType;
-use golem_wasm_rpc::{IntoValue, IntoValueAndType, ValueAndType};
-use golem_wasm_rpc_derive::IntoValue;
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::{IntoValue, IntoValueAndType, ValueAndType};
+use golem_wasm_derive::IntoValue;
 use std::fmt::Display;
 
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode, IntoValue)]
@@ -157,41 +157,41 @@ pub enum DbValue {
 impl Display for DbValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DbValue::Boolean(v) => write!(f, "{}", v),
-            DbValue::Tinyint(v) => write!(f, "{}", v),
-            DbValue::Smallint(v) => write!(f, "{}", v),
-            DbValue::Mediumint(v) => write!(f, "{}", v),
-            DbValue::Int(v) => write!(f, "{}", v),
-            DbValue::Bigint(v) => write!(f, "{}", v),
-            DbValue::TinyintUnsigned(v) => write!(f, "{}", v),
-            DbValue::SmallintUnsigned(v) => write!(f, "{}", v),
-            DbValue::MediumintUnsigned(v) => write!(f, "{}", v),
-            DbValue::IntUnsigned(v) => write!(f, "{}", v),
-            DbValue::BigintUnsigned(v) => write!(f, "{}", v),
-            DbValue::Float(v) => write!(f, "{}", v),
-            DbValue::Double(v) => write!(f, "{}", v),
-            DbValue::Decimal(v) => write!(f, "{}", v),
-            DbValue::Date(v) => write!(f, "{}", v),
-            DbValue::Datetime(v) => write!(f, "{}", v),
-            DbValue::Timestamp(v) => write!(f, "{}", v),
-            DbValue::Time(v) => write!(f, "{}", v),
-            DbValue::Year(v) => write!(f, "{}", v),
-            DbValue::Fixchar(v) => write!(f, "{}", v),
-            DbValue::Varchar(v) => write!(f, "{}", v),
-            DbValue::Tinytext(v) => write!(f, "{}", v),
-            DbValue::Text(v) => write!(f, "{}", v),
-            DbValue::Mediumtext(v) => write!(f, "{}", v),
-            DbValue::Longtext(v) => write!(f, "{}", v),
-            DbValue::Binary(v) => write!(f, "{:?}", v),
-            DbValue::Varbinary(v) => write!(f, "{:?}", v),
-            DbValue::Tinyblob(v) => write!(f, "{:?}", v),
-            DbValue::Blob(v) => write!(f, "{:?}", v),
-            DbValue::Mediumblob(v) => write!(f, "{:?}", v),
-            DbValue::Longblob(v) => write!(f, "{:?}", v),
-            DbValue::Enumeration(v) => write!(f, "{}", v),
-            DbValue::Set(v) => write!(f, "{}", v),
-            DbValue::Bit(v) => write!(f, "{:?}", v),
-            DbValue::Json(v) => write!(f, "{}", v),
+            DbValue::Boolean(v) => write!(f, "{v}"),
+            DbValue::Tinyint(v) => write!(f, "{v}"),
+            DbValue::Smallint(v) => write!(f, "{v}"),
+            DbValue::Mediumint(v) => write!(f, "{v}"),
+            DbValue::Int(v) => write!(f, "{v}"),
+            DbValue::Bigint(v) => write!(f, "{v}"),
+            DbValue::TinyintUnsigned(v) => write!(f, "{v}"),
+            DbValue::SmallintUnsigned(v) => write!(f, "{v}"),
+            DbValue::MediumintUnsigned(v) => write!(f, "{v}"),
+            DbValue::IntUnsigned(v) => write!(f, "{v}"),
+            DbValue::BigintUnsigned(v) => write!(f, "{v}"),
+            DbValue::Float(v) => write!(f, "{v}"),
+            DbValue::Double(v) => write!(f, "{v}"),
+            DbValue::Decimal(v) => write!(f, "{v}"),
+            DbValue::Date(v) => write!(f, "{v}"),
+            DbValue::Datetime(v) => write!(f, "{v}"),
+            DbValue::Timestamp(v) => write!(f, "{v}"),
+            DbValue::Time(v) => write!(f, "{v}"),
+            DbValue::Year(v) => write!(f, "{v}"),
+            DbValue::Fixchar(v) => write!(f, "{v}"),
+            DbValue::Varchar(v) => write!(f, "{v}"),
+            DbValue::Tinytext(v) => write!(f, "{v}"),
+            DbValue::Text(v) => write!(f, "{v}"),
+            DbValue::Mediumtext(v) => write!(f, "{v}"),
+            DbValue::Longtext(v) => write!(f, "{v}"),
+            DbValue::Binary(v) => write!(f, "{v:?}"),
+            DbValue::Varbinary(v) => write!(f, "{v:?}"),
+            DbValue::Tinyblob(v) => write!(f, "{v:?}"),
+            DbValue::Blob(v) => write!(f, "{v:?}"),
+            DbValue::Mediumblob(v) => write!(f, "{v:?}"),
+            DbValue::Longblob(v) => write!(f, "{v:?}"),
+            DbValue::Enumeration(v) => write!(f, "{v}"),
+            DbValue::Set(v) => write!(f, "{v}"),
+            DbValue::Bit(v) => write!(f, "{v:?}"),
+            DbValue::Json(v) => write!(f, "{v}"),
             DbValue::Null => write!(f, "NULL"),
         }
     }
@@ -260,7 +260,7 @@ pub mod tests {
     use test_r::test;
     use uuid::Uuid;
 
-    fn check_bincode<T: Encode + Decode + PartialEq>(value: T) {
+    fn check_bincode<T: Encode + Decode<()> + PartialEq>(value: T) {
         let bin_value = serialize(&value).unwrap().to_vec();
         let value2: Option<T> = try_deserialize(bin_value.as_slice()).ok().flatten();
         check!(value2.unwrap() == value);
@@ -308,7 +308,7 @@ pub mod tests {
         for (i, ct) in types.iter().enumerate() {
             let c = mysql_types::DbColumn {
                 ordinal: i as u64,
-                name: format!("column-{}", i),
+                name: format!("column-{i}"),
                 db_type: ct.clone(),
                 db_type_name: ct.to_string(),
             };

@@ -34,6 +34,11 @@ pub enum RibByteCodeGenerationError {
         expected: TypeHint,
         actual: TypeHint,
     },
+    UnresolvedWasmComponent {
+        function: String,
+    },
+    UnresolvedWorkerName,
+    UnresolvedResourceVariable,
 }
 
 impl std::error::Error for RibByteCodeGenerationError {}
@@ -41,15 +46,15 @@ impl std::error::Error for RibByteCodeGenerationError {}
 impl Display for RibByteCodeGenerationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            RibByteCodeGenerationError::CastError(msg) => write!(f, "cast error: {}", msg),
+            RibByteCodeGenerationError::CastError(msg) => write!(f, "cast error: {msg}"),
             RibByteCodeGenerationError::AnalysedTypeConversionError(msg) => {
-                write!(f, "{}", msg)
+                write!(f, "{msg}")
             }
             RibByteCodeGenerationError::PatternMatchDesugarError => {
                 write!(f, "Pattern match desugar error")
             }
             RibByteCodeGenerationError::RangeSelectionDesugarError(msg) => {
-                write!(f, "Range selection desugar error: {}", msg)
+                write!(f, "Range selection desugar error: {msg}")
             }
             RibByteCodeGenerationError::UnexpectedTypeError { expected, actual } => {
                 write!(
@@ -58,6 +63,15 @@ impl Display for RibByteCodeGenerationError {
                     expected.get_type_kind(),
                     actual.get_type_kind()
                 )
+            }
+            RibByteCodeGenerationError::UnresolvedWasmComponent { function } => {
+                write!(f, "Unresolved wasm component for function: {function}")
+            }
+            RibByteCodeGenerationError::UnresolvedWorkerName => {
+                write!(f, "inline invocation of functions on a worker instance is currently not supported")
+            }
+            _ => {
+                write!(f, "inline invocation of methods on resource constructor instance is currently not supported")
             }
         }
     }
@@ -106,10 +120,9 @@ impl RibByteCode {
     }
 }
 
-#[cfg(feature = "protobuf")]
 mod protobuf {
+    use crate::proto::golem::rib::RibByteCode as ProtoRibByteCode;
     use crate::RibByteCode;
-    use golem_api_grpc::proto::golem::rib::RibByteCode as ProtoRibByteCode;
 
     impl TryFrom<ProtoRibByteCode> for RibByteCode {
         type Error = String;
@@ -144,16 +157,16 @@ mod internal {
     use crate::compiler::desugar::{desugar_pattern_match, desugar_range_selection};
     use crate::{
         AnalysedTypeWithUnit, DynamicParsedFunctionReference, Expr, FunctionReferenceType,
-        InferredType, InstructionId, Range, RibByteCodeGenerationError, RibIR, TypeInternal,
-        VariableId, WorkerNamePresence,
+        InferredType, InstanceIdentifier, InstanceVariable, InstructionId, Range,
+        RibByteCodeGenerationError, RibIR, TypeInternal, VariableId,
     };
-    use golem_wasm_ast::analysis::{AnalysedType, NameTypePair, TypeFlags};
+    use golem_wasm::analysis::{AnalysedType, TypeFlags};
     use std::collections::HashSet;
 
     use crate::call_type::{CallType, InstanceCreationType};
     use crate::type_inference::{GetTypeHint, TypeHint};
-    use golem_wasm_ast::analysis::analysed_type::{bool, record, str, tuple};
-    use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
+    use golem_wasm::analysis::analysed_type::bool;
+    use golem_wasm::{IntoValueAndType, Value, ValueAndType};
     use std::ops::Deref;
 
     pub(crate) fn process_expr(
@@ -166,6 +179,10 @@ mod internal {
             Expr::Unwrap { expr, .. } => {
                 stack.push(ExprState::from_expr(expr.deref()));
                 instructions.push(RibIR::Deconstruct);
+            }
+
+            Expr::GenerateWorkerName { variable_id, .. } => {
+                instructions.push(RibIR::GenerateWorkerName(variable_id.clone()));
             }
 
             Expr::Length { expr, .. } => {
@@ -365,8 +382,7 @@ mod internal {
                     let list_comprehension =
                         desugar_range_selection(expr, index).map_err(|err| {
                             RibByteCodeGenerationError::RangeSelectionDesugarError(format!(
-                                "Failed to desugar range selection: {}",
-                                err
+                                "Failed to desugar range selection: {err}"
                             ))
                         })?;
                     stack.push(ExprState::from_expr(&list_comprehension));
@@ -430,7 +446,8 @@ mod internal {
                 match call_type {
                     CallType::Function {
                         function_name,
-                        worker,
+                        instance_identifier: module,
+                        component_info,
                     } => {
                         for expr in args.iter().rev() {
                             stack.push(ExprState::from_expr(expr));
@@ -445,21 +462,38 @@ mod internal {
                             )?)
                         };
 
-                        // To be pushed to interpreter stack later
-                        let worker_name = match worker {
-                            Some(_) => WorkerNamePresence::Present,
-                            None => WorkerNamePresence::Absent,
+                        let module = module
+                            .as_ref()
+                            .expect("Module should be present for function calls");
+
+                        let instance_variable = match module.as_ref() {
+                            InstanceIdentifier::WitResource { variable_id, .. } => {
+                                let variable_id = variable_id.clone().unwrap_or_else(|| {
+                                    VariableId::global("___STATIC_WIT_RESOURCE".to_string())
+                                });
+                                InstanceVariable::WitResource(variable_id)
+                            }
+                            InstanceIdentifier::WitWorker { variable_id, .. } => {
+                                let variable_id = variable_id
+                                    .clone()
+                                    .ok_or(RibByteCodeGenerationError::UnresolvedWorkerName)?;
+
+                                InstanceVariable::WitWorker(variable_id)
+                            }
                         };
 
+                        let component_info = component_info.as_ref().ok_or(
+                            RibByteCodeGenerationError::UnresolvedWasmComponent {
+                                function: function_name.to_string(),
+                            },
+                        )?;
+
                         instructions.push(RibIR::InvokeFunction(
-                            worker_name,
+                            component_info.clone(),
+                            instance_variable,
                             args.len(),
                             function_result_type,
                         ));
-
-                        if let Some(worker_expr) = worker {
-                            stack.push(ExprState::from_expr(worker_expr));
-                        }
 
                         let site = function_name.site.clone();
 
@@ -509,70 +543,6 @@ mod internal {
                                     method: method.clone(),
                                 },
                             )),
-                            DynamicParsedFunctionReference::IndexedResourceConstructor {
-                                resource,
-                                resource_params,
-                            } => {
-                                for param in resource_params {
-                                    stack.push(ExprState::from_expr(param));
-                                }
-                                instructions.push(RibIR::CreateFunctionName(
-                                    site,
-                                    FunctionReferenceType::IndexedResourceConstructor {
-                                        resource: resource.clone(),
-                                        arg_size: resource_params.len(),
-                                    },
-                                ))
-                            }
-                            DynamicParsedFunctionReference::IndexedResourceMethod {
-                                resource,
-                                resource_params,
-                                method,
-                            } => {
-                                for param in resource_params {
-                                    stack.push(ExprState::from_expr(param));
-                                }
-                                instructions.push(RibIR::CreateFunctionName(
-                                    site,
-                                    FunctionReferenceType::IndexedResourceMethod {
-                                        resource: resource.clone(),
-                                        arg_size: resource_params.len(),
-                                        method: method.clone(),
-                                    },
-                                ))
-                            }
-                            DynamicParsedFunctionReference::IndexedResourceStaticMethod {
-                                resource,
-                                resource_params,
-                                method,
-                            } => {
-                                for param in resource_params {
-                                    stack.push(ExprState::from_expr(param));
-                                }
-                                instructions.push(RibIR::CreateFunctionName(
-                                    site,
-                                    FunctionReferenceType::IndexedResourceStaticMethod {
-                                        resource: resource.clone(),
-                                        arg_size: resource_params.len(),
-                                        method: method.clone(),
-                                    },
-                                ))
-                            }
-                            DynamicParsedFunctionReference::IndexedResourceDrop {
-                                resource,
-                                resource_params,
-                            } => {
-                                for param in resource_params {
-                                    stack.push(ExprState::from_expr(param));
-                                }
-                                instructions.push(RibIR::CreateFunctionName(
-                                    site,
-                                    FunctionReferenceType::IndexedResourceDrop {
-                                        resource: resource.clone(),
-                                        arg_size: resource_params.len(),
-                                    },
-                                ))
-                            }
                         }
                     }
 
@@ -583,84 +553,76 @@ mod internal {
                     // we need to push a place holder in the stack that does nothing
                     CallType::InstanceCreation(instance_creation_type) => {
                         match instance_creation_type {
-                            InstanceCreationType::Worker { worker_name } => {
-                                for expr in args.iter().rev() {
-                                    stack.push(ExprState::from_expr(expr));
-                                }
-
-                                match worker_name {
-                                    // worker name is already in stack due to args
-                                    Some(worker) => {
-                                        stack.push(ExprState::from_ir(RibIR::PushLit(
-                                            ValueAndType::new(
-                                                Value::Record(vec![Value::String(
-                                                    worker.to_string(),
-                                                )]),
-                                                record(vec![NameTypePair {
-                                                    name: "worker".to_string(),
-                                                    typ: str(),
-                                                }]),
-                                            ),
-                                        )));
-                                    }
-                                    None => {
-                                        // This would imply returning a instance representing ephemeral
-                                        // worker it simply returns an empty tuple. This is a corner case
-                                        // that a rib script hardly achieves anything from it,
-                                        // but we need to handle it
-                                        stack.push(ExprState::from_ir(RibIR::PushLit(
-                                            ValueAndType::new(
-                                                Value::Record(vec![Value::String(
-                                                    "<ephemeral>".to_string(),
-                                                )]),
-                                                record(vec![NameTypePair {
-                                                    name: "worker".to_string(),
-                                                    typ: str(),
-                                                }]),
-                                            ),
-                                        )));
+                            InstanceCreationType::WitWorker { worker_name, .. } => {
+                                if let Some(worker_name) = worker_name {
+                                    stack.push(ExprState::from_expr(worker_name));
+                                } else {
+                                    for expr in args.iter().rev() {
+                                        stack.push(ExprState::from_expr(expr));
                                     }
                                 }
                             }
 
-                            InstanceCreationType::Resource {
-                                worker_name,
+                            InstanceCreationType::WitResource {
+                                module,
                                 resource_name,
-                                ..
+                                component_info,
                             } => {
                                 for expr in args.iter().rev() {
                                     stack.push(ExprState::from_expr(expr));
                                 }
 
-                                let arg_exprs = args
-                                    .iter()
-                                    .map(|x| Value::String(x.to_string()))
-                                    .collect::<Vec<_>>();
+                                let module = module
+                                    .as_ref()
+                                    .expect("Module should be present for resource calls");
 
-                                stack.push(ExprState::from_ir(RibIR::PushLit(ValueAndType::new(
-                                    Value::Record(vec![
-                                        Value::String(resource_name.resource_name.clone()),
-                                        worker_name.as_ref().map_or(
-                                            Value::String("<ephemeral>".to_string()),
-                                            |w| Value::String(w.to_string()),
-                                        ),
-                                        Value::Tuple(arg_exprs),
-                                    ]),
-                                    record(vec![
-                                        NameTypePair {
-                                            name: "resource".to_string(),
-                                            typ: str(),
-                                        },
-                                        NameTypePair {
-                                            name: "worker".to_string(),
-                                            typ: str(),
-                                        },
-                                        NameTypePair {
-                                            name: "args".to_string(),
-                                            typ: tuple(vec![str(); args.len()]),
-                                        },
-                                    ]),
-                                ))));
+                                let instance_variable = match module {
+                                    InstanceIdentifier::WitResource { variable_id, .. } => {
+                                        let variable_id = variable_id.as_ref().ok_or({
+                                            RibByteCodeGenerationError::UnresolvedResourceVariable
+                                        })?;
+
+                                        InstanceVariable::WitResource(variable_id.clone())
+                                    }
+                                    InstanceIdentifier::WitWorker { variable_id, .. } => {
+                                        let variable_id = variable_id.as_ref().ok_or({
+                                            RibByteCodeGenerationError::UnresolvedWorkerName
+                                        })?;
+
+                                        InstanceVariable::WitWorker(variable_id.clone())
+                                    }
+                                };
+
+                                let site = resource_name.parsed_function_site();
+
+                                let component_info = component_info.as_ref().ok_or(
+                                    RibByteCodeGenerationError::UnresolvedWasmComponent {
+                                        function: resource_name.resource_name.clone(),
+                                    },
+                                )?;
+
+                                let function_result_type = if inferred_type.is_unit() {
+                                    AnalysedTypeWithUnit::Unit
+                                } else {
+                                    AnalysedTypeWithUnit::Type(convert_to_analysed_type(
+                                        expr,
+                                        inferred_type,
+                                    )?)
+                                };
+
+                                instructions.push(RibIR::InvokeFunction(
+                                    component_info.clone(),
+                                    instance_variable,
+                                    args.len(),
+                                    function_result_type,
+                                ));
+
+                                instructions.push(RibIR::CreateFunctionName(
+                                    site,
+                                    FunctionReferenceType::RawResourceConstructor {
+                                        resource: resource_name.resource_name.clone(),
+                                    },
+                                ));
                             }
                         }
                     }
@@ -703,6 +665,8 @@ mod internal {
                         value: Value::Flags(bitmap),
                         typ: AnalysedType::Flags(TypeFlags {
                             names: all_flags.iter().map(|n| n.to_string()).collect(),
+                            owner: None,
+                            name: None,
                         }),
                     }));
                 }
@@ -993,20 +957,18 @@ mod compiler_tests {
     use test_r::test;
 
     use super::*;
-    use crate::{
-        ArmPattern, FunctionTypeRegistry, InferredType, MatchArm, RibCompiler, VariableId,
-    };
-    use golem_wasm_ast::analysis::analysed_type::{list, str, u64};
-    use golem_wasm_ast::analysis::{AnalysedType, NameTypePair, TypeRecord, TypeStr};
-    use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
+    use crate::{ArmPattern, InferredType, MatchArm, RibCompiler, VariableId};
+    use golem_wasm::analysis::analysed_type;
+    use golem_wasm::analysis::analysed_type::{field, list, record, s32, str};
+    use golem_wasm::{IntoValueAndType, Value, ValueAndType};
 
     #[test]
     fn test_instructions_for_literal() {
         let literal = Expr::literal("hello");
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(literal, &empty_registry, &vec![]).unwrap();
 
-        let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
+        let compiler = RibCompiler::default();
+
+        let compiler_output = compiler.compile(literal).unwrap();
 
         let instruction_set = vec![RibIR::PushLit("hello".into_value_and_type())];
 
@@ -1014,7 +976,7 @@ mod compiler_tests {
             instructions: instruction_set,
         };
 
-        assert_eq!(instructions, expected_instructions);
+        assert_eq!(compiler_output.byte_code, expected_instructions);
     }
 
     #[test]
@@ -1246,18 +1208,10 @@ mod compiler_tests {
         let instruction_set = vec![
             RibIR::PushLit(bar_value),
             RibIR::PushLit(foo_value),
-            RibIR::CreateAndPushRecord(AnalysedType::Record(TypeRecord {
-                fields: vec![
-                    NameTypePair {
-                        name: "foo_key".to_string(),
-                        typ: AnalysedType::Str(TypeStr),
-                    },
-                    NameTypePair {
-                        name: "bar_key".to_string(),
-                        typ: AnalysedType::Str(TypeStr),
-                    },
-                ],
-            })),
+            RibIR::CreateAndPushRecord(record(vec![
+                field("foo_key", str()),
+                field("bar_key", str()),
+            ])),
             RibIR::UpdateRecord("foo_key".to_string()),
             RibIR::UpdateRecord("bar_key".to_string()),
         ];
@@ -1398,18 +1352,10 @@ mod compiler_tests {
         let instruction_set = vec![
             RibIR::PushLit(bar_value),
             RibIR::PushLit(foo_value),
-            RibIR::CreateAndPushRecord(AnalysedType::Record(TypeRecord {
-                fields: vec![
-                    NameTypePair {
-                        name: "bar_key".to_string(),
-                        typ: AnalysedType::Str(TypeStr),
-                    },
-                    NameTypePair {
-                        name: "foo_key".to_string(),
-                        typ: AnalysedType::Str(TypeStr),
-                    },
-                ],
-            })),
+            RibIR::CreateAndPushRecord(analysed_type::record(vec![
+                field("bar_key", str()),
+                field("foo_key", str()),
+            ])),
             RibIR::UpdateRecord("foo_key".to_string()), // next pop is foo_value
             RibIR::UpdateRecord("bar_key".to_string()), // last pop is bar_value
             RibIR::SelectField("bar_key".to_string()),
@@ -1437,7 +1383,7 @@ mod compiler_tests {
         let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
 
         let instruction_set = vec![
-            RibIR::PushLit(ValueAndType::new(Value::U64(1), u64())),
+            RibIR::PushLit(ValueAndType::new(Value::S32(1), s32())),
             RibIR::PushLit("bar".into_value_and_type()),
             RibIR::PushLit("foo".into_value_and_type()),
             RibIR::PushList(list(str()), 2),
@@ -1472,10 +1418,9 @@ mod compiler_tests {
         )
         .with_inferred_type(InferredType::string());
 
-        let empty_registry = FunctionTypeRegistry::empty();
-        let inferred_expr = InferredExpr::from_expr(expr, &empty_registry, &vec![]).unwrap();
+        let rib_compiler = RibCompiler::default();
 
-        let instructions = RibByteCode::from_expr(&inferred_expr).unwrap();
+        let instructions = rib_compiler.compile(expr).unwrap().byte_code;
 
         // instructions will correspond to an if-else statement
         let instruction_set = vec![
@@ -1519,7 +1464,7 @@ mod compiler_tests {
 
         use crate::compiler::byte_code::compiler_tests::internal;
         use crate::{Expr, RibCompiler, RibCompilerConfig};
-        use golem_wasm_ast::analysis::{AnalysedType, TypeStr};
+        use golem_wasm::analysis::analysed_type::str;
 
         #[test]
         fn test_unknown_function() {
@@ -1537,57 +1482,8 @@ mod compiler_tests {
         }
 
         #[test]
-        fn test_unknown_resource_constructor() {
-            let metadata = internal::metadata_with_resource_methods();
-            let expr = r#"
-               let user_id = "user";
-               golem:it/api.{cart(user_id).add-item}("apple");
-               golem:it/api.{cart0(user_id).add-item}("apple");
-                "success"
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 4, column 16\n`add-item(\"apple\")`\ncause: invalid function call `[constructor]cart0`\nunknown function\n"
-            );
-        }
-
-        #[test]
-        fn test_unknown_resource_method() {
-            let metadata = internal::metadata_with_resource_methods();
-            let expr = r#"
-               let user_id = "user";
-               golem:it/api.{cart(user_id).add-item}("apple");
-               golem:it/api.{cart(user_id).foo}("apple");
-                "success"
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
-
-            let compiler = RibCompiler::new(compiler_config);
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 4, column 16\n`foo(\"apple\")`\ncause: invalid function call `[method]cart.foo`\nunknown function\n"
-            );
-        }
-
-        #[test]
         fn test_invalid_arg_size_function() {
-            let metadata = internal::get_component_metadata(
-                "foo",
-                vec![AnalysedType::Str(TypeStr)],
-                AnalysedType::Str(TypeStr),
-            );
+            let metadata = internal::get_component_metadata("foo", vec![str()], str());
 
             let expr = r#"
                let user_id = "user";
@@ -1597,7 +1493,7 @@ mod compiler_tests {
 
             let expr = Expr::from_text(expr).unwrap();
 
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(metadata, vec![], vec![]);
 
             let compiler = RibCompiler::new(compiler_config);
 
@@ -1609,79 +1505,8 @@ mod compiler_tests {
         }
 
         #[test]
-        fn test_invalid_arg_size_resource_constructor() {
-            let metadata = internal::metadata_with_resource_methods();
-            let expr = r#"
-               let user_id = "user";
-               golem:it/api.{cart(user_id, user_id).add-item}("apple");
-                "success"
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
-
-            let compiler = RibCompiler::new(compiler_config);
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 3, column 16\n`add-item(\"apple\")`\ncause: invalid argument size for function `cart`. expected 1 arguments, found 2\n"
-            );
-        }
-
-        #[test]
-        fn test_invalid_arg_size_resource_method() {
-            let metadata = internal::metadata_with_resource_methods();
-            let expr = r#"
-               let user_id = "user";
-               golem:it/api.{cart(user_id).add-item}("apple", "samsung");
-                "success"
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
-
-            let compiler = RibCompiler::new(compiler_config);
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 3, column 16\n`add-item(\"apple\", \"samsung\")`\ncause: invalid argument size for function `add-item`. expected 1 arguments, found 2\n"
-            );
-        }
-
-        #[test]
-        fn test_invalid_arg_size_variants() {
-            let metadata = internal::metadata_with_variants();
-
-            let expr = r#"
-               let regiser_user_action = register-user(1, "foo");
-               let result = golem:it/api.{foo}(regiser_user_action);
-               result
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
-
-            let compiler = RibCompiler::new(compiler_config);
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 0, column 0\n`register-user(1, \"foo\")`\ncause: invalid argument size for function `register-user`. expected 1 arguments, found 2\n"
-            );
-        }
-
-        #[test]
         fn test_invalid_arg_types_function() {
-            let metadata = internal::get_component_metadata(
-                "foo",
-                vec![AnalysedType::Str(TypeStr)],
-                AnalysedType::Str(TypeStr),
-            );
+            let metadata = internal::get_component_metadata("foo", vec![str()], str());
 
             let expr = r#"
                let result = foo(1u64);
@@ -1690,57 +1515,14 @@ mod compiler_tests {
 
             let expr = Expr::from_text(expr).unwrap();
 
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(metadata, vec![], vec![]);
 
             let compiler = RibCompiler::new(compiler_config);
 
             let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 2, column 33\n`1: u64`\nfound within:\n`foo(1: u64)`\ncause: type mismatch. expected string, found u64\ninvalid argument to the function `foo`\n"
-            );
-        }
-
-        #[test]
-        fn test_invalid_arg_types_resource_method() {
-            let metadata = internal::metadata_with_resource_methods();
-            let expr = r#"
-               let user_id = "user";
-               golem:it/api.{cart(user_id).add-item}("apple");
-                "success"
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
-
-            let compiler = RibCompiler::new(compiler_config);
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 3, column 54\n`\"apple\"`\nfound within:\n`add-item(\"apple\")`\ncause: type mismatch. expected record { name: string }, found string\ninvalid argument to the function `add-item`\n"
-            );
-        }
-
-        #[test]
-        fn test_invalid_arg_types_resource_constructor() {
-            let metadata = internal::metadata_with_resource_methods();
-            let expr = r#"
-               golem:it/api.{cart({foo : "bar"}).add-item}("apple");
-                "success"
-            "#;
-
-            let expr = Expr::from_text(expr).unwrap();
-
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
-
-            let compiler = RibCompiler::new(compiler_config);
-
-            let compiler_error = compiler.compile(expr).unwrap_err().to_string();
-            assert_eq!(
-                compiler_error,
-                "error in the following rib found at line 1, column 1\n`{foo: \"bar\"}`\nfound within:\n`add-item(\"apple\")`\ncause: type mismatch. expected string, found record { foo: string }\ninvalid argument to the function `cart`\n"
+                "error in the following rib found at line 2, column 33\n`1: u64`\ncause: type mismatch. expected string, found u64\ninvalid argument to the function `foo`\n"
             );
         }
 
@@ -1756,14 +1538,14 @@ mod compiler_tests {
 
             let expr = Expr::from_text(expr).unwrap();
 
-            let compiler_config = RibCompilerConfig::new(metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(metadata, vec![], vec![]);
 
             let compiler = RibCompiler::new(compiler_config);
 
             let compiler_error = compiler.compile(expr).unwrap_err().to_string();
             assert_eq!(
                 compiler_error,
-                "error in the following rib found at line 2, column 56\n`\"foo\"`\nfound within:\n`register-user(\"foo\")`\ncause: type mismatch. expected u64, found string\ninvalid argument to the function `register-user`\n"
+                "error in the following rib found at line 2, column 56\n`\"foo\"`\ncause: type mismatch. expected u64, found string\ninvalid argument to the function `register-user`\n"
             );
         }
     }
@@ -1774,16 +1556,16 @@ mod compiler_tests {
 
         use crate::compiler::byte_code::compiler_tests::internal;
         use crate::{Expr, RibCompiler, RibCompilerConfig};
-        use golem_wasm_ast::analysis::{
-            AnalysedType, NameOptionTypePair, NameTypePair, TypeEnum, TypeList, TypeOption,
-            TypeRecord, TypeResult, TypeStr, TypeTuple, TypeU32, TypeU64, TypeVariant,
+        use golem_wasm::analysis::analysed_type::{
+            case, field, list, option, r#enum, record, result, str, tuple, u32, u64, unit_case,
+            variant,
         };
 
         #[test]
         async fn test_str_global_input() {
-            let request_value_type = AnalysedType::Str(TypeStr);
+            let request_value_type = str();
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -1793,7 +1575,8 @@ mod compiler_tests {
 
             let expr = r#"
                let x = request;
-               my-worker-function(x);
+               let worker = instance();
+               worker.my-worker-function(x);
                match x {
                 "foo"  => "success",
                  _ => "fallback"
@@ -1801,7 +1584,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -1811,9 +1595,9 @@ mod compiler_tests {
 
         #[test]
         async fn test_number_global_input() {
-            let request_value_type = AnalysedType::U32(TypeU32);
+            let request_value_type = u32();
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -1823,7 +1607,8 @@ mod compiler_tests {
 
             let expr = r#"
                let x = request;
-               my-worker-function(x);
+               let worker = instance();
+               worker.my-worker-function(x);
                match x {
                 1  => "success",
                 0 => "failure"
@@ -1831,7 +1616,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -1841,24 +1627,13 @@ mod compiler_tests {
 
         #[test]
         async fn test_variant_type_info() {
-            let request_value_type = AnalysedType::Variant(TypeVariant {
-                cases: vec![
-                    NameOptionTypePair {
-                        name: "register-user".to_string(),
-                        typ: Some(AnalysedType::U64(TypeU64)),
-                    },
-                    NameOptionTypePair {
-                        name: "process-user".to_string(),
-                        typ: Some(AnalysedType::Str(TypeStr)),
-                    },
-                    NameOptionTypePair {
-                        name: "validate".to_string(),
-                        typ: None,
-                    },
-                ],
-            });
+            let request_value_type = variant(vec![
+                case("register-user", u64()),
+                case("process-user", str()),
+                unit_case("validate"),
+            ]);
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -1873,7 +1648,8 @@ mod compiler_tests {
             // This means the rib interpreter env has to have a request variable in it,
             // with a value that should be of the type Variant
             let expr = r#"
-               my-worker-function(request);
+               let worker = instance();
+               worker.my-worker-function(request);
                match request {
                  process-user(user) => user,
                  _ => "default"
@@ -1881,7 +1657,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -1891,12 +1668,9 @@ mod compiler_tests {
 
         #[test]
         async fn test_result_type_info() {
-            let request_value_type = AnalysedType::Result(TypeResult {
-                ok: Some(Box::new(AnalysedType::U64(TypeU64))),
-                err: Some(Box::new(AnalysedType::Str(TypeStr))),
-            });
+            let request_value_type = result(u64(), str());
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -1911,7 +1685,8 @@ mod compiler_tests {
             // This means the rib interpreter env has to have a request variable in it,
             // with a value that should be of the type Result
             let expr = r#"
-               my-worker-function(request);
+               let worker = instance();
+               worker.my-worker-function(request);
                match request {
                  ok(x) => "${x}",
                  err(msg) => msg
@@ -1919,7 +1694,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -1929,11 +1705,9 @@ mod compiler_tests {
 
         #[test]
         async fn test_option_type_info() {
-            let request_value_type = AnalysedType::Option(TypeOption {
-                inner: Box::new(AnalysedType::Str(TypeStr)),
-            });
+            let request_value_type = option(str());
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -1948,7 +1722,8 @@ mod compiler_tests {
             // This means the rib interpreter env has to have a request variable in it,
             // with a value that should be of the type Option
             let expr = r#"
-               my-worker-function(request);
+               let worker = instance();
+               worker.my-worker-function(request);
                match request {
                  some(x) => x,
                  none => "error"
@@ -1956,7 +1731,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -1966,11 +1742,8 @@ mod compiler_tests {
 
         #[test]
         async fn test_enum_type_info() {
-            let request_value_type = AnalysedType::Enum(TypeEnum {
-                cases: vec!["prod".to_string(), "dev".to_string(), "test".to_string()],
-            });
-
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let request_value_type = r#enum(&["prod", "dev", "test"]);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -1985,7 +1758,8 @@ mod compiler_tests {
             // This means the rib interpreter env has to have a request variable in it,
             // with a value that should be of the type Option
             let expr = r#"
-               my-worker-function(request);
+               let worker = instance();
+               worker.my-worker-function(request);
                match request {
                  prod  => "p",
                  dev => "d",
@@ -1994,7 +1768,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -2004,19 +1779,10 @@ mod compiler_tests {
 
         #[test]
         async fn test_record_global_input() {
-            let request_value_type = AnalysedType::Record(TypeRecord {
-                fields: vec![NameTypePair {
-                    name: "path".to_string(),
-                    typ: AnalysedType::Record(TypeRecord {
-                        fields: vec![NameTypePair {
-                            name: "user".to_string(),
-                            typ: AnalysedType::Str(TypeStr),
-                        }],
-                    }),
-                }],
-            });
+            let request_value_type =
+                record(vec![field("path", record(vec![field("user", str())]))]);
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -2032,7 +1798,8 @@ mod compiler_tests {
             // with a value that should be of the type Record
             let expr = r#"
                let x = request;
-               my-worker-function(x);
+               let worker = instance();
+               worker.my-worker-function(x);
 
                let name = x.path.user;
 
@@ -2043,7 +1810,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -2053,20 +1821,9 @@ mod compiler_tests {
 
         #[test]
         async fn test_tuple_global_input() {
-            let request_value_type = AnalysedType::Tuple(TypeTuple {
-                items: vec![
-                    AnalysedType::Str(TypeStr),
-                    AnalysedType::U32(TypeU32),
-                    AnalysedType::Record(TypeRecord {
-                        fields: vec![NameTypePair {
-                            name: "user".to_string(),
-                            typ: AnalysedType::Str(TypeStr),
-                        }],
-                    }),
-                ],
-            });
+            let request_value_type = tuple(vec![str(), u32(), record(vec![field("user", str())])]);
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -2080,7 +1837,8 @@ mod compiler_tests {
             // implies the type of request is a Tuple.
             let expr = r#"
                let x = request;
-               my-worker-function(x);
+               let worker = instance();
+               worker.my-worker-function(x);
                match x {
                 (_, _, record) =>  record.user,
                  _ => "fallback"
@@ -2088,7 +1846,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -2098,11 +1857,9 @@ mod compiler_tests {
 
         #[test]
         async fn test_list_global_input() {
-            let request_value_type = AnalysedType::List(TypeList {
-                inner: Box::new(AnalysedType::Str(TypeStr)),
-            });
+            let request_value_type = list(str());
 
-            let output_analysed_type = AnalysedType::Str(TypeStr);
+            let output_analysed_type = str();
 
             let analysed_exports = internal::get_component_metadata(
                 "my-worker-function",
@@ -2116,7 +1873,8 @@ mod compiler_tests {
             // implies the type of request should be a List
             let expr = r#"
                let x = request;
-               my-worker-function(x);
+               let worker = instance();
+               worker.my-worker-function(x);
                match x {
                [a, b, c]  => a,
                  _ => "fallback"
@@ -2124,7 +1882,8 @@ mod compiler_tests {
             "#;
 
             let expr = Expr::from_text(expr).unwrap();
-            let compiler = RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![]));
+            let compiler =
+                RibCompiler::new(RibCompilerConfig::new(analysed_exports, vec![], vec![]));
             let compiled = compiler.compile(expr).unwrap();
             let expected_type_info =
                 internal::rib_input_type_info(vec![("request", request_value_type)]);
@@ -2134,114 +1893,80 @@ mod compiler_tests {
     }
 
     mod internal {
-        use crate::RibInputTypeInfo;
-        use golem_wasm_ast::analysis::*;
+        use crate::{ComponentDependency, ComponentDependencyKey, RibInputTypeInfo};
+        use golem_wasm::analysis::analysed_type::{case, str, u64, unit_case, variant};
+        use golem_wasm::analysis::*;
         use std::collections::HashMap;
+        use uuid::Uuid;
 
-        pub(crate) fn metadata_with_variants() -> Vec<AnalysedExport> {
+        pub(crate) fn metadata_with_variants() -> Vec<ComponentDependency> {
             let instance = AnalysedExport::Instance(AnalysedInstance {
                 name: "golem:it/api".to_string(),
                 functions: vec![AnalysedFunction {
                     name: "foo".to_string(),
                     parameters: vec![AnalysedFunctionParameter {
                         name: "param1".to_string(),
-                        typ: AnalysedType::Variant(TypeVariant {
-                            cases: vec![
-                                NameOptionTypePair {
-                                    name: "register-user".to_string(),
-                                    typ: Some(AnalysedType::U64(TypeU64)),
-                                },
-                                NameOptionTypePair {
-                                    name: "process-user".to_string(),
-                                    typ: Some(AnalysedType::Str(TypeStr)),
-                                },
-                                NameOptionTypePair {
-                                    name: "validate".to_string(),
-                                    typ: None,
-                                },
-                            ],
-                        }),
+                        typ: variant(vec![
+                            case("register-user", u64()),
+                            case("process-user", str()),
+                            unit_case("validate"),
+                        ]),
                     }],
-                    results: vec![AnalysedFunctionResult {
-                        name: None,
+                    result: Some(AnalysedFunctionResult {
                         typ: AnalysedType::Handle(TypeHandle {
                             resource_id: AnalysedResourceId(0),
                             mode: AnalysedResourceMode::Owned,
+                            name: None,
+                            owner: None,
                         }),
-                    }],
+                    }),
                 }],
             });
 
-            vec![instance]
+            let component_info = ComponentDependencyKey {
+                component_name: "foo".to_string(),
+                component_id: Uuid::new_v4(),
+                component_version: 0,
+                root_package_name: None,
+                root_package_version: None,
+            };
+
+            vec![ComponentDependency {
+                component_dependency_key: component_info,
+                component_exports: vec![instance],
+            }]
         }
 
-        pub(crate) fn metadata_with_resource_methods() -> Vec<AnalysedExport> {
-            let instance = AnalysedExport::Instance(AnalysedInstance {
-                name: "golem:it/api".to_string(),
-                functions: vec![
-                    AnalysedFunction {
-                        name: "[constructor]cart".to_string(),
-                        parameters: vec![AnalysedFunctionParameter {
-                            name: "param1".to_string(),
-                            typ: AnalysedType::Str(TypeStr),
-                        }],
-                        results: vec![AnalysedFunctionResult {
-                            name: None,
-                            typ: AnalysedType::Handle(TypeHandle {
-                                resource_id: AnalysedResourceId(0),
-                                mode: AnalysedResourceMode::Owned,
-                            }),
-                        }],
-                    },
-                    AnalysedFunction {
-                        name: "[method]cart.add-item".to_string(),
-                        parameters: vec![
-                            AnalysedFunctionParameter {
-                                name: "self".to_string(),
-                                typ: AnalysedType::Handle(TypeHandle {
-                                    resource_id: AnalysedResourceId(0),
-                                    mode: AnalysedResourceMode::Borrowed,
-                                }),
-                            },
-                            AnalysedFunctionParameter {
-                                name: "item".to_string(),
-                                typ: AnalysedType::Record(TypeRecord {
-                                    fields: vec![NameTypePair {
-                                        name: "name".to_string(),
-                                        typ: AnalysedType::Str(TypeStr),
-                                    }],
-                                }),
-                            },
-                        ],
-                        results: vec![],
-                    },
-                ],
-            });
-
-            vec![instance]
-        }
         pub(crate) fn get_component_metadata(
             function_name: &str,
             input_types: Vec<AnalysedType>,
             output: AnalysedType,
-        ) -> Vec<AnalysedExport> {
+        ) -> Vec<ComponentDependency> {
             let analysed_function_parameters = input_types
                 .into_iter()
                 .enumerate()
                 .map(|(index, typ)| AnalysedFunctionParameter {
-                    name: format!("param{}", index),
+                    name: format!("param{index}"),
                     typ,
                 })
                 .collect();
 
-            vec![AnalysedExport::Function(AnalysedFunction {
-                name: function_name.to_string(),
-                parameters: analysed_function_parameters,
-                results: vec![AnalysedFunctionResult {
-                    name: None,
-                    typ: output,
-                }],
-            })]
+            let component_info = ComponentDependencyKey {
+                component_name: "foo".to_string(),
+                component_id: Uuid::new_v4(),
+                component_version: 0,
+                root_package_name: None,
+                root_package_version: None,
+            };
+
+            vec![ComponentDependency {
+                component_dependency_key: component_info,
+                component_exports: vec![AnalysedExport::Function(AnalysedFunction {
+                    name: function_name.to_string(),
+                    parameters: analysed_function_parameters,
+                    result: Some(AnalysedFunctionResult { typ: output }),
+                })],
+            }]
         }
 
         pub(crate) fn rib_input_type_info(types: Vec<(&str, AnalysedType)>) -> RibInputTypeInfo {

@@ -17,32 +17,36 @@ pub mod mysql;
 pub mod postgres;
 pub(crate) mod sqlx_common;
 
-use crate::error::GolemError;
 use crate::services::golem_config::RdbmsConfig;
 use crate::services::rdbms::mysql::MysqlType;
 use crate::services::rdbms::postgres::PostgresType;
 use async_trait::async_trait;
 use bincode::{BorrowDecode, Decode, Encode};
+use golem_common::model::TransactionId;
 use golem_common::model::WorkerId;
-use golem_wasm_ast::analysis::{analysed_type, AnalysedType};
-use golem_wasm_rpc::{IntoValue, Value, ValueAndType};
-use golem_wasm_rpc_derive::IntoValue;
+use golem_service_base::error::worker_executor::WorkerExecutorError;
+use golem_wasm::analysis::{analysed_type, AnalysedType};
+use golem_wasm::{IntoValue, Value, ValueAndType};
+use golem_wasm_derive::IntoValue;
 use itertools::Itertools;
 use mac_address::MacAddress;
 use std::collections::{Bound, HashMap, HashSet};
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
-pub trait RdbmsType: Debug + Display + Default + Send {
+pub trait RdbmsType:
+    Debug + Display + Default + PartialEq + Encode + Decode<()> + Clone + Send
+{
     type DbColumn: Clone
         + Send
         + Sync
         + PartialEq
         + Debug
-        + Decode
-        + for<'de> BorrowDecode<'de>
+        + Decode<()>
+        + for<'de> BorrowDecode<'de, ()>
         + Encode
         + RdbmsIntoValueAndType
         + 'static;
@@ -51,8 +55,8 @@ pub trait RdbmsType: Debug + Display + Default + Send {
         + Sync
         + PartialEq
         + Debug
-        + Decode
-        + for<'de> BorrowDecode<'de>
+        + Decode<()>
+        + for<'de> BorrowDecode<'de, ()>
         + Encode
         + RdbmsIntoValueAndType
         + 'static;
@@ -75,6 +79,8 @@ impl Display for RdbmsStatus {
 
 #[async_trait]
 pub trait DbTransaction<T: RdbmsType> {
+    fn transaction_id(&self) -> TransactionId;
+
     async fn execute(&self, statement: &str, params: Vec<T::DbValue>) -> Result<u64, Error>
     where
         <T as RdbmsType>::DbValue: 'async_trait;
@@ -90,6 +96,10 @@ pub trait DbTransaction<T: RdbmsType> {
     ) -> Result<Arc<dyn DbResultStream<T> + Send + Sync>, Error>
     where
         <T as RdbmsType>::DbValue: 'async_trait;
+
+    async fn pre_commit(&self) -> Result<(), Error>;
+
+    async fn pre_rollback(&self) -> Result<(), Error>;
 
     async fn commit(&self) -> Result<(), Error>;
 
@@ -141,6 +151,20 @@ pub trait Rdbms<T: RdbmsType> {
         key: &RdbmsPoolKey,
         worker_id: &WorkerId,
     ) -> Result<Arc<dyn DbTransaction<T> + Send + Sync>, Error>;
+
+    async fn get_transaction_status(
+        &self,
+        key: &RdbmsPoolKey,
+        worker_id: &WorkerId,
+        transaction_id: &TransactionId,
+    ) -> Result<RdbmsTransactionStatus, Error>;
+
+    async fn cleanup_transaction(
+        &self,
+        key: &RdbmsPoolKey,
+        worker_id: &WorkerId,
+        transaction_id: &TransactionId,
+    ) -> Result<(), Error>;
 
     fn status(&self) -> RdbmsStatus;
 }
@@ -337,10 +361,35 @@ pub trait DbResultStream<T: RdbmsType> {
     async fn get_next(&self) -> Result<Option<Vec<DbRow<T::DbValue>>>, Error>;
 }
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Encode)]
 pub struct DbResult<T: RdbmsType + 'static> {
     pub columns: Vec<T::DbColumn>,
     pub rows: Vec<DbRow<T::DbValue>>,
+}
+
+impl<T: RdbmsType + 'static> Decode<()> for DbResult<T> {
+    fn decode<D: bincode::de::Decoder<Context = ()>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        Ok(Self {
+            columns: bincode::Decode::decode(decoder)?,
+            rows: bincode::Decode::decode(decoder)?,
+        })
+    }
+}
+
+impl<'de, T: RdbmsType + 'static> BorrowDecode<'de, ()> for DbResult<T>
+where
+    T: bincode::de::BorrowDecode<'de, ()>,
+{
+    fn borrow_decode<__D: bincode::de::BorrowDecoder<'de, Context = ()>>(
+        decoder: &mut __D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        Ok(Self {
+            columns: bincode::BorrowDecode::<'_, ()>::borrow_decode(decoder)?,
+            rows: bincode::BorrowDecode::<'_, ()>::borrow_decode(decoder)?,
+        })
+    }
 }
 
 impl<T: RdbmsType> DbResult<T> {
@@ -420,17 +469,17 @@ impl Error {
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::ConnectionFailure(msg) => write!(f, "ConnectionFailure: {}", msg),
-            Error::QueryParameterFailure(msg) => write!(f, "QueryParameterFailure: {}", msg),
-            Error::QueryExecutionFailure(msg) => write!(f, "QueryExecutionFailure: {}", msg),
-            Error::QueryResponseFailure(msg) => write!(f, "QueryResponseFailure: {}", msg),
-            Error::Other(msg) => write!(f, "Other: {}", msg),
+            Error::ConnectionFailure(msg) => write!(f, "ConnectionFailure: {msg}"),
+            Error::QueryParameterFailure(msg) => write!(f, "QueryParameterFailure: {msg}"),
+            Error::QueryExecutionFailure(msg) => write!(f, "QueryExecutionFailure: {msg}"),
+            Error::QueryResponseFailure(msg) => write!(f, "QueryResponseFailure: {msg}"),
+            Error::Other(msg) => write!(f, "Other: {msg}"),
         }
     }
 }
 
-impl From<GolemError> for Error {
-    fn from(value: GolemError) -> Self {
+impl From<WorkerExecutorError> for Error {
+    fn from(value: WorkerExecutorError) -> Self {
         Self::other_response_failure(value)
     }
 }
@@ -621,4 +670,37 @@ fn get_bound_analysed_type(base_type: AnalysedType) -> AnalysedType {
         analysed_type::case("excluded", base_type.clone()),
         analysed_type::unit_case("unbounded"),
     ])
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RdbmsTransactionStatus {
+    InProgress,
+    Committed,
+    RolledBack,
+    NotFound,
+}
+
+impl Display for RdbmsTransactionStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RdbmsTransactionStatus::InProgress => write!(f, "InProgress"),
+            RdbmsTransactionStatus::Committed => write!(f, "Committed"),
+            RdbmsTransactionStatus::RolledBack => write!(f, "RolledBack"),
+            RdbmsTransactionStatus::NotFound => write!(f, "NotFound"),
+        }
+    }
+}
+
+impl FromStr for RdbmsTransactionStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "InProgress" => Ok(RdbmsTransactionStatus::InProgress),
+            "Committed" => Ok(RdbmsTransactionStatus::Committed),
+            "RolledBack" => Ok(RdbmsTransactionStatus::RolledBack),
+            "NotFound" => Ok(RdbmsTransactionStatus::NotFound),
+            _ => Err(format!("Unknown transaction status: {s}")),
+        }
+    }
 }

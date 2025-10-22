@@ -17,9 +17,10 @@ use wasmtime::component::Resource;
 use crate::durable_host::serialized::SerializableError;
 use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx};
 use crate::services::oplog::CommitLevel;
+use crate::services::HasWorker;
 use crate::workerctx::WorkerCtx;
 use golem_common::model::oplog::DurableFunctionType;
-use wasmtime_wasi::bindings::clocks::monotonic_clock::{Duration, Host, Instant, Pollable};
+use wasmtime_wasi::p2::bindings::clocks::monotonic_clock::{Duration, Host, Instant, Pollable};
 
 impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
     async fn now(&mut self) -> anyhow::Result<Instant> {
@@ -61,7 +62,10 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         Host::subscribe_instant(&mut self.as_wasi_view(), when).await
     }
 
-    async fn subscribe_duration(&mut self, when: Duration) -> anyhow::Result<Resource<Pollable>> {
+    async fn subscribe_duration(
+        &mut self,
+        duration: Duration,
+    ) -> anyhow::Result<Resource<Pollable>> {
         let durability = Durability::<Instant, SerializableError>::new(
             self,
             "monotonic_clock",
@@ -73,14 +77,17 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         let now = {
             if durability.is_live() {
                 let result = Host::now(&mut self.as_wasi_view()).await;
-                durability.persist(self, (), result).await
+                durability.persist(self, duration, result).await
             } else {
                 durability.replay(self).await
             }
         }?;
 
-        self.state.oplog.commit(CommitLevel::DurableOnly).await;
-        let when = now.saturating_add(when);
+        self.public_state
+            .worker()
+            .commit_oplog_and_update_state(CommitLevel::DurableOnly)
+            .await;
+        let when = now.saturating_add(duration);
         Host::subscribe_instant(&mut self.as_wasi_view(), when).await
     }
 }

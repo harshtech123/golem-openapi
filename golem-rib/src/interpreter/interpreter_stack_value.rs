@@ -17,8 +17,8 @@ use crate::interpreter::rib_runtime_error::{
     arithmetic_error, invalid_comparison, RibRuntimeError,
 };
 use crate::{internal_corrupted_state, CoercedNumericValue, RibInterpreterResult};
-use golem_wasm_ast::analysis::AnalysedType;
-use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::{IntoValueAndType, Value, ValueAndType};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
@@ -208,7 +208,7 @@ impl Display for RibInterpreterStackValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             RibInterpreterStackValue::Unit => write!(f, "unit"),
-            RibInterpreterStackValue::Val(value) => write!(f, "{}", value),
+            RibInterpreterStackValue::Val(value) => write!(f, "{value}"),
             RibInterpreterStackValue::Iterator(_) => write!(f, "iterator:(...)"),
             RibInterpreterStackValue::Sink(value, _) => write!(f, "sink:{}", value.len()),
         }
@@ -217,7 +217,25 @@ impl Display for RibInterpreterStackValue {
 
 impl fmt::Debug for RibInterpreterStackValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(
+            f,
+            "{}",
+            match self {
+                RibInterpreterStackValue::Unit => "unit".to_string(),
+                RibInterpreterStackValue::Val(value) => {
+                    match &value.value {
+                        Value::Handle { uri, resource_id } => {
+                            // wasm-wave don't support resource handles yet
+                            format!("handle:{{uri:{uri}, resource-id:{resource_id}}}")
+                        }
+
+                        _ => value.to_string(),
+                    }
+                }
+                RibInterpreterStackValue::Iterator(_) => "iterator:(...)".to_string(),
+                RibInterpreterStackValue::Sink(value, _) => format!("sink:{}", value.len()),
+            }
+        )
     }
 }
 
@@ -225,8 +243,8 @@ mod internal {
     use crate::interpreter::literal::{GetLiteralValue, LiteralValue};
     use crate::interpreter::rib_runtime_error::invalid_comparison;
     use crate::{internal_corrupted_state, RibInterpreterResult};
-    use golem_wasm_ast::analysis::{AnalysedType, TypeVariant};
-    use golem_wasm_rpc::{IntoValueAndType, Value, ValueAndType};
+    use golem_wasm::analysis::{AnalysedType, TypeVariant};
+    use golem_wasm::{IntoValueAndType, Value, ValueAndType};
 
     pub(crate) fn compare_typed_value<F>(
         left: &ValueAndType,

@@ -1,27 +1,41 @@
-use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::auth::AccountAuthorisation;
 use crate::grpcapi::get_authorisation_token;
-use crate::model;
+use crate::model::{AccountData, GlobalAction};
 use crate::service::account;
 use crate::service::auth::{AuthService, AuthServiceError};
-use cloud_api_grpc::proto::golem::cloud::account::v1::cloud_account_service_server::CloudAccountService;
-use cloud_api_grpc::proto::golem::cloud::account::v1::{
+use golem_api_grpc::proto::golem::account::v1::cloud_account_service_server::CloudAccountService;
+use golem_api_grpc::proto::golem::account::v1::{
     account_create_response, account_delete_response, account_error, account_get_plan_response,
     account_get_response, account_update_response, AccountCreateRequest, AccountCreateResponse,
     AccountDeleteRequest, AccountDeleteResponse, AccountError, AccountGetPlanRequest,
     AccountGetPlanResponse, AccountGetRequest, AccountGetResponse, AccountUpdateRequest,
     AccountUpdateResponse,
 };
-use cloud_api_grpc::proto::golem::cloud::account::Account;
-use cloud_api_grpc::proto::golem::cloud::plan::Plan;
+use golem_api_grpc::proto::golem::account::Account;
+use golem_api_grpc::proto::golem::account::Plan;
 use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody};
 use golem_common::grpc::proto_account_id_string;
 use golem_common::metrics::api::TraceErrorKind;
+use golem_common::model::auth::AccountAction;
 use golem_common::model::AccountId;
 use golem_common::recorded_grpc_api_request;
 use golem_common::SafeDisplay;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -120,11 +134,16 @@ impl AccountGrpcApi {
         metadata: MetadataMap,
     ) -> Result<(), AccountError> {
         let auth = self.auth(metadata).await?;
-        let id: AccountId = request
+        let account_id: AccountId = request
             .account_id
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
-        self.account_service.delete(&id, &auth).await?;
+
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::DeleteAccount)
+            .await?;
+
+        self.account_service.delete(&account_id).await?;
 
         Ok(())
     }
@@ -135,11 +154,16 @@ impl AccountGrpcApi {
         metadata: MetadataMap,
     ) -> Result<Account, AccountError> {
         let auth = self.auth(metadata).await?;
-        let id: AccountId = request
+        let account_id: AccountId = request
             .account_id
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
-        let result = self.account_service.get(&id, &auth).await?;
+
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::ViewAccount)
+            .await?;
+
+        let result = self.account_service.get(&account_id).await?;
         Ok(result.into())
     }
 
@@ -149,13 +173,18 @@ impl AccountGrpcApi {
         metadata: MetadataMap,
     ) -> Result<Account, AccountError> {
         let auth = self.auth(metadata).await?;
-        let data: model::AccountData = request
+        let data: AccountData = request
             .account_data
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account data"))?;
+
+        self.auth_service
+            .authorize_global_action(&auth, &GlobalAction::CreateAccount)
+            .await?;
+
         let result = self
             .account_service
-            .create(&AccountId::generate(), &data, &auth)
+            .create(&AccountId::generate(), &data)
             .await?;
         Ok(result.into())
     }
@@ -166,15 +195,21 @@ impl AccountGrpcApi {
         metadata: MetadataMap,
     ) -> Result<Account, AccountError> {
         let auth = self.auth(metadata).await?;
-        let id: AccountId = request
+        let account_id: AccountId = request
             .account_id
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
-        let data: model::AccountData = request
+
+        let data: AccountData = request
             .account_data
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account data"))?;
-        let result = self.account_service.update(&id, &data, &auth).await?;
+
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::UpdateAccount)
+            .await?;
+
+        let result = self.account_service.update(&account_id, &data).await?;
         Ok(result.into())
     }
 
@@ -184,11 +219,16 @@ impl AccountGrpcApi {
         metadata: MetadataMap,
     ) -> Result<Plan, AccountError> {
         let auth = self.auth(metadata).await?;
-        let id: AccountId = request
+        let account_id: AccountId = request
             .account_id
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
-        let result = self.account_service.get_plan(&id, &auth).await?;
+
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::ViewPlan)
+            .await?;
+
+        let result = self.account_service.get_plan(&account_id).await?;
         Ok(result.into())
     }
 }

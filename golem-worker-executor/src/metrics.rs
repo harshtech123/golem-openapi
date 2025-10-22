@@ -16,7 +16,7 @@
 // Collecting them in one place makes it easier to look them up and to share
 // common metrics between different layers of the application.
 
-use crate::VERSION;
+use golem_common::golem_version;
 use lazy_static::lazy_static;
 use prometheus::*;
 
@@ -31,7 +31,7 @@ lazy_static! {
 
 pub fn register_all() -> Registry {
     VERSION_INFO
-        .with_label_values(&[VERSION, wasmtime::VERSION])
+        .with_label_values(&[golem_version(), wasmtime::VERSION])
         .inc();
 
     default_registry().clone()
@@ -172,7 +172,7 @@ pub mod wasm {
 
     use golem_common::metrics::api::TraceErrorKind;
 
-    use crate::error::GolemError;
+    use golem_service_base::error::worker_executor::WorkerExecutorError;
 
     lazy_static! {
         static ref CREATE_WORKER_SECONDS: Histogram = register_histogram!(
@@ -247,7 +247,7 @@ pub mod wasm {
         CREATE_WORKER_SECONDS.observe(duration.as_secs_f64());
     }
 
-    pub fn record_create_worker_failure(error: &GolemError) {
+    pub fn record_create_worker_failure(error: &WorkerExecutorError) {
         CREATE_WORKER_FAILURE_TOTAL
             .with_label_values(&[error.trace_error_kind()])
             .inc();

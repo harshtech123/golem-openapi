@@ -15,12 +15,12 @@
 use crate::benchmarks::data::Data;
 use clap::Parser;
 use golem_common::model::{ComponentId, IdempotencyKey, WorkerId};
-use golem_test_framework::config::{CliParams, CliTestDependencies};
+use golem_test_framework::config::{CliParams, CliTestDependencies, TestDependencies};
 use golem_test_framework::dsl::benchmark::{
     BenchmarkApi, BenchmarkRecorder, BenchmarkResult, ResultKey, RunConfig,
 };
 use golem_test_framework::dsl::TestDsl;
-use golem_wasm_rpc::{Value, ValueAndType};
+use golem_wasm::{Value, ValueAndType};
 use reqwest::{Client, Url};
 use std::time::{Duration, SystemTime};
 use tokio::task::JoinSet;
@@ -85,7 +85,13 @@ pub async fn setup_iteration(
     // Initialize infrastructure
 
     // Upload test component
-    let component_id = deps.component(component_name).unique().store().await;
+    let component_id = deps
+        .admin()
+        .await
+        .component(component_name)
+        .unique()
+        .store()
+        .await;
     // Create 'size' workers
     let worker_ids = generate_worker_ids(size, &component_id, worker_name_prefix);
 
@@ -99,6 +105,8 @@ pub async fn setup_iteration(
 pub async fn start_workers(worker_ids: &[WorkerId], deps: &CliTestDependencies) {
     for worker_id in worker_ids {
         let _ = deps
+            .admin()
+            .await
             .start_worker(&worker_id.component_id, &worker_id.worker_name)
             .await;
     }
@@ -131,7 +139,7 @@ pub async fn setup_simple_iteration(
 
 pub async fn delete_workers(deps: &CliTestDependencies, worker_ids: &[WorkerId]) {
     for worker_id in worker_ids {
-        if let Err(err) = deps.delete_worker(worker_id).await {
+        if let Err(err) = deps.admin().await.delete_worker(worker_id).await {
             warn!("Failed to delete worker: {:?}", err);
         }
     }
@@ -145,7 +153,7 @@ pub async fn warmup_workers(
 ) {
     let mut fibers = JoinSet::new();
     for worker_id in worker_ids {
-        let deps_clone = deps.clone();
+        let deps_clone = deps.clone().into_admin().await;
         let worker_id_clone = worker_id.clone();
         let params_clone = params.clone();
         let function_clone = function.to_string();
@@ -171,7 +179,7 @@ pub async fn benchmark_invocations(
     // Invoke each worker a 'length' times in parallel and record the duration
     let mut fibers = JoinSet::new();
     for (n, worker_id) in worker_ids.iter().enumerate() {
-        let deps_clone = deps.clone();
+        let deps_clone = deps.clone().into_admin().await;
         let function_clone = function.to_string();
         let params_clone = params.clone();
         let worker_id_clone = worker_id.clone();
@@ -235,7 +243,7 @@ pub async fn run_benchmark<A: BenchmarkApi>() {
     let result = get_benchmark_results::<A>(params.clone()).await;
     if params.json {
         let str = serde_json::to_string(&result).expect("Failed to serialize BenchmarkResult");
-        println!("{}", str);
+        println!("{str}");
     } else {
         println!("{}", result.view());
     }
@@ -284,14 +292,14 @@ pub async fn invoke_and_await(
             }
             Ok(Ok(Err(e))) => {
                 // worker error
-                println!("Invocation failed, retrying: {:?}", e);
+                println!("Invocation failed, retrying: {e:?}");
                 retries += 1;
                 accumulated_time += duration;
                 tokio::time::sleep(RETRY_DELAY).await;
             }
             Ok(Err(e)) => {
                 // client error
-                println!("Invocation failed, retrying: {:?}", e);
+                println!("Invocation failed, retrying: {e:?}");
                 retries += 1;
                 accumulated_time += duration;
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -300,7 +308,7 @@ pub async fn invoke_and_await(
                 // timeout
                 // not counting timeouts into the accumulated time
                 timeouts += 1;
-                println!("Invocation timed out, retrying: {:?}", e);
+                println!("Invocation timed out, retrying: {e:?}");
             }
         }
     }

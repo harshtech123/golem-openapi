@@ -15,9 +15,9 @@
 use crate::model::invocation_context::{SpanId, TraceId};
 use crate::model::oplog::{LogLevel, OplogIndex, WorkerResourceId};
 use crate::model::public_oplog::{
-    ActivatePluginParameters, CancelInvocationParameters, ChangePersistenceLevelParameters,
-    ChangeRetryPolicyParameters, CreateParameters, DeactivatePluginParameters,
-    DescribeResourceParameters, EndRegionParameters, ErrorParameters,
+    ActivatePluginParameters, BeginRemoteTransactionParameters, CancelInvocationParameters,
+    ChangePersistenceLevelParameters, ChangeRetryPolicyParameters, CreateParameters,
+    DeactivatePluginParameters, EndRegionParameters, ErrorParameters,
     ExportedFunctionCompletedParameters, ExportedFunctionInvokedParameters,
     ExportedFunctionParameters, FailedUpdateParameters, FinishSpanParameters, GrowMemoryParameters,
     ImportedFunctionInvokedParameters, JumpParameters, LogParameters, ManualUpdateParameters,
@@ -25,9 +25,10 @@ use crate::model::public_oplog::{
     PluginInstallationDescription, PublicAttribute, PublicAttributeValue,
     PublicDurableFunctionType, PublicExternalSpanData, PublicLocalSpanData, PublicOplogEntry,
     PublicRetryConfig, PublicSpanData, PublicUpdateDescription, PublicWorkerInvocation,
-    ResourceParameters, RevertParameters, SetSpanAttributeParameters,
+    RemoteTransactionParameters, ResourceParameters, RevertParameters, SetSpanAttributeParameters,
     SnapshotBasedUpdateParameters, StartSpanParameters, StringAttributeValue,
     SuccessfulUpdateParameters, TimestampParameter, WriteRemoteBatchedParameters,
+    WriteRemoteTransactionParameters,
 };
 use crate::model::regions::OplogRegion;
 use crate::model::Empty;
@@ -36,7 +37,7 @@ use golem_api_grpc::proto::golem::worker::{
     invocation_span, oplog_entry, worker_invocation, wrapped_function_type, AttributeValue,
     ExternalParentSpan, InvocationSpan, LocalInvocationSpan,
 };
-use golem_wasm_rpc::ValueAndType;
+use golem_wasm::ValueAndType;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -137,7 +138,15 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
                 component_version: create.component_version,
                 args: create.args,
                 env: create.env.into_iter().collect(),
-                account_id: create.account_id.ok_or("Missing account_id field")?.into(),
+                project_id: create
+                    .project_id
+                    .ok_or("Missing project_id field")?
+                    .try_into()?,
+                created_by: create.created_by.ok_or("Missing created_by field")?.into(),
+                wasi_config_vars: create
+                    .wasi_config_vars
+                    .ok_or("Missing wasi_config_vars field")?
+                    .into(),
                 parent: match create.parent {
                     Some(parent) => Some(parent.try_into()?),
                     None => None,
@@ -167,7 +176,7 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
                         .response
                         .ok_or("Missing response field")?
                         .try_into()?,
-                    wrapped_function_type: imported_function_invoked
+                    durable_function_type: imported_function_invoked
                         .wrapped_function_type
                         .ok_or("Missing wrapped_function_type field")?
                         .try_into()?,
@@ -204,8 +213,8 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
                         .into(),
                     response: exported_function_completed
                         .response
-                        .ok_or("Missing response field")?
-                        .try_into()?,
+                        .map(|tav| tav.try_into())
+                        .transpose()?,
                     consumed_fuel: exported_function_completed.consumed_fuel,
                 }),
             ),
@@ -217,6 +226,7 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
             oplog_entry::Entry::Error(error) => Ok(PublicOplogEntry::Error(ErrorParameters {
                 timestamp: error.timestamp.ok_or("Missing timestamp field")?.into(),
                 error: error.error,
+                retry_from: OplogIndex::from_u64(error.retry_from),
             })),
             oplog_entry::Entry::NoOp(no_op) => Ok(PublicOplogEntry::NoOp(TimestampParameter {
                 timestamp: no_op.timestamp.ok_or("Missing timestamp field")?.into(),
@@ -355,6 +365,8 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
                         .ok_or("Missing timestamp field")?
                         .into(),
                     id: WorkerResourceId(create_resource.resource_id),
+                    name: create_resource.name,
+                    owner: create_resource.owner,
                 }))
             }
             oplog_entry::Entry::DropResource(drop_resource) => {
@@ -364,23 +376,10 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
                         .ok_or("Missing timestamp field")?
                         .into(),
                     id: WorkerResourceId(drop_resource.resource_id),
+                    name: drop_resource.name,
+                    owner: drop_resource.owner,
                 }))
             }
-            oplog_entry::Entry::DescribeResource(describe_resource) => Ok(
-                PublicOplogEntry::DescribeResource(DescribeResourceParameters {
-                    timestamp: describe_resource
-                        .timestamp
-                        .ok_or("Missing timestamp field")?
-                        .into(),
-                    id: WorkerResourceId(describe_resource.resource_id),
-                    resource_name: describe_resource.resource_name,
-                    resource_params: describe_resource
-                        .resource_params
-                        .into_iter()
-                        .map(TryInto::try_into)
-                        .collect::<Result<Vec<ValueAndType>, String>>()?,
-                }),
-            ),
             oplog_entry::Entry::Log(log) => Ok(PublicOplogEntry::Log(LogParameters {
                 level: log.level().into(),
                 timestamp: log.timestamp.ok_or("Missing timestamp field")?.into(),
@@ -478,6 +477,37 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::OplogEntry> for PublicOplogEn
                     persistence_level: change.persistence_level().into(),
                 },
             )),
+            oplog_entry::Entry::BeginRemoteTransaction(value) => Ok(
+                PublicOplogEntry::BeginRemoteTransaction(BeginRemoteTransactionParameters {
+                    timestamp: value.timestamp.ok_or("Missing timestamp field")?.into(),
+                    transaction_id: value.transaction_id.into(),
+                }),
+            ),
+            oplog_entry::Entry::PreCommitRemoteTransaction(value) => Ok(
+                PublicOplogEntry::PreCommitRemoteTransaction(RemoteTransactionParameters {
+                    timestamp: value.timestamp.ok_or("Missing timestamp field")?.into(),
+                    begin_index: OplogIndex::from_u64(value.begin_index),
+                }),
+            ),
+            oplog_entry::Entry::PreRollbackRemoteTransaction(value) => Ok(
+                PublicOplogEntry::PreRollbackRemoteTransaction(RemoteTransactionParameters {
+                    timestamp: value.timestamp.ok_or("Missing timestamp field")?.into(),
+                    begin_index: OplogIndex::from_u64(value.begin_index),
+                }),
+            ),
+            oplog_entry::Entry::CommittedRemoteTransaction(value) => Ok(
+                PublicOplogEntry::CommittedRemoteTransaction(RemoteTransactionParameters {
+                    timestamp: value.timestamp.ok_or("Missing timestamp field")?.into(),
+                    begin_index: OplogIndex::from_u64(value.begin_index),
+                }),
+            ),
+
+            oplog_entry::Entry::RolledBackRemoteTransaction(value) => Ok(
+                PublicOplogEntry::RolledBackRemoteTransaction(RemoteTransactionParameters {
+                    timestamp: value.timestamp.ok_or("Missing timestamp field")?.into(),
+                    begin_index: OplogIndex::from_u64(value.begin_index),
+                }),
+            ),
         }
     }
 }
@@ -495,7 +525,9 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                         component_version: create.component_version,
                         args: create.args,
                         env: create.env.into_iter().collect(),
-                        account_id: Some(create.account_id.into()),
+                        created_by: Some(create.created_by.into()),
+                        project_id: Some(create.project_id.into()),
+                        wasi_config_vars: Some(create.wasi_config_vars.into()),
                         parent: create.parent.map(Into::into),
                         component_size: create.component_size,
                         initial_total_linear_memory_size: create.initial_total_linear_memory_size,
@@ -513,18 +545,10 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                         golem_api_grpc::proto::golem::worker::ImportedFunctionInvokedParameters {
                             timestamp: Some(imported_function_invoked.timestamp.into()),
                             function_name: imported_function_invoked.function_name.clone(),
-                            request: Some(imported_function_invoked.request.try_into().map_err(
-                                |errors: Vec<String>| {
-                                    format!("Failed to convert request for imported function {}: {}", imported_function_invoked.function_name, errors.join(", "))
-                                },
-                            )?),
-                            response: Some(imported_function_invoked.response.try_into().map_err(
-                                |errors: Vec<String>| {
-                                    format!("Failed to convert response for imported function {}: {}", imported_function_invoked.function_name, errors.join(", "))
-                                },
-                            )?),
+                            request: Some(imported_function_invoked.request.into()),
+                            response: Some(imported_function_invoked.response.into()),
                             wrapped_function_type: Some(
-                                imported_function_invoked.wrapped_function_type.into(),
+                                imported_function_invoked.durable_function_type.into(),
                             ),
                         },
                     )),
@@ -539,16 +563,15 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                             request: exported_function_invoked
                                 .request
                                 .into_iter()
-                                .map(|value| {
-                                    value.try_into().map_err(|errors: Vec<String>| {
-                                        format!("Failed to convert request for exported function {}: {}", exported_function_invoked.function_name, errors.join(", "))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?,
+                                .map(|value| value.into())
+                                .collect(),
                             idempotency_key: Some(exported_function_invoked.idempotency_key.into()),
                             trace_id: exported_function_invoked.trace_id.to_string(),
                             trace_states: exported_function_invoked.trace_states,
-                            invocation_context: decode_public_span_data(&exported_function_invoked.invocation_context, 0),
+                            invocation_context: decode_public_span_data(
+                                &exported_function_invoked.invocation_context,
+                                0,
+                            ),
                         },
                     )),
                 }
@@ -558,13 +581,9 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                     entry: Some(oplog_entry::Entry::ExportedFunctionCompleted(
                         golem_api_grpc::proto::golem::worker::ExportedFunctionCompletedParameters {
                             timestamp: Some(exported_function_completed.timestamp.into()),
-                            response: Some(
-                                exported_function_completed.response.try_into().map_err(
-                                    |errors: Vec<String>| {
-                                        format!("Failed to convert response for completed exported function: {}", errors.join(", "))
-                                    },
-                                )?,
-                            ),
+                            response: exported_function_completed
+                                .response
+                                .map(|value| value.into()),
                             consumed_fuel: exported_function_completed.consumed_fuel,
                         },
                     )),
@@ -584,6 +603,7 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                     golem_api_grpc::proto::golem::worker::ErrorParameters {
                         timestamp: Some(error.timestamp.into()),
                         error: error.error,
+                        retry_from: error.retry_from.0,
                     },
                 )),
             },
@@ -731,6 +751,8 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                         golem_api_grpc::proto::golem::worker::CreateResourceParameters {
                             timestamp: Some(create_resource.timestamp.into()),
                             resource_id: create_resource.id.0,
+                            name: create_resource.name,
+                            owner: create_resource.owner,
                         },
                     )),
                 }
@@ -741,26 +763,8 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                         golem_api_grpc::proto::golem::worker::DropResourceParameters {
                             timestamp: Some(drop_resource.timestamp.into()),
                             resource_id: drop_resource.id.0,
-                        },
-                    )),
-                }
-            }
-            PublicOplogEntry::DescribeResource(describe_resource) => {
-                golem_api_grpc::proto::golem::worker::OplogEntry {
-                    entry: Some(oplog_entry::Entry::DescribeResource(
-                        golem_api_grpc::proto::golem::worker::DescribeResourceParameters {
-                            timestamp: Some(describe_resource.timestamp.into()),
-                            resource_id: describe_resource.id.0,
-                            resource_name: describe_resource.resource_name,
-                            resource_params: describe_resource
-                                .resource_params
-                                .into_iter()
-                                .map(|value| {
-                                    value.try_into().map_err(|errors: Vec<String>| {
-                                        format!("Failed to convert request: {}", errors.join(", "))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?,
+                            name: drop_resource.name,
+                            owner: drop_resource.owner,
                         },
                     )),
                 }
@@ -806,17 +810,15 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                     )),
                 }
             }
-            PublicOplogEntry::Revert(revert) => {
-                golem_api_grpc::proto::golem::worker::OplogEntry {
-                    entry: Some(oplog_entry::Entry::Revert(
-                        golem_api_grpc::proto::golem::worker::RevertParameters {
-                            timestamp: Some(revert.timestamp.into()),
-                            start: revert.dropped_region.start.0,
-                            end: revert.dropped_region.end.0,
-                        },
-                    )),
-                }
-            }
+            PublicOplogEntry::Revert(revert) => golem_api_grpc::proto::golem::worker::OplogEntry {
+                entry: Some(oplog_entry::Entry::Revert(
+                    golem_api_grpc::proto::golem::worker::RevertParameters {
+                        timestamp: Some(revert.timestamp.into()),
+                        start: revert.dropped_region.start.0,
+                        end: revert.dropped_region.end.0,
+                    },
+                )),
+            },
             PublicOplogEntry::CancelInvocation(cancel) => {
                 golem_api_grpc::proto::golem::worker::OplogEntry {
                     entry: Some(oplog_entry::Entry::CancelInvocation(
@@ -840,8 +842,8 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                                 .into_iter()
                                 .map(|attr| (attr.key, attr.value.into()))
                                 .collect(),
-                        }
-                    ))
+                        },
+                    )),
                 }
             }
             PublicOplogEntry::FinishSpan(finish) => {
@@ -850,8 +852,8 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                         golem_api_grpc::proto::golem::worker::FinishSpanParameters {
                             timestamp: Some(finish.timestamp.into()),
                             span_id: finish.span_id.0.get(),
-                        }
-                    ))
+                        },
+                    )),
                 }
             }
             PublicOplogEntry::SetSpanAttribute(set) => {
@@ -862,8 +864,8 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                             span_id: set.span_id.0.get(),
                             key: set.key,
                             value: Some(set.value.into()),
-                        }
-                    ))
+                        },
+                    )),
                 }
             }
             PublicOplogEntry::ChangePersistenceLevel(change) => {
@@ -871,11 +873,63 @@ impl TryFrom<PublicOplogEntry> for golem_api_grpc::proto::golem::worker::OplogEn
                     entry: Some(oplog_entry::Entry::ChangePersistenceLevel(
                         golem_api_grpc::proto::golem::worker::ChangePersistenceLevelParameters {
                             timestamp: Some(change.timestamp.into()),
-                            persistence_level: Into::<golem_api_grpc::proto::golem::worker::PersistenceLevel>::into(
-                                change.persistence_level,
+                            persistence_level: Into::<
+                                golem_api_grpc::proto::golem::worker::PersistenceLevel,
+                            >::into(
+                                change.persistence_level
                             ) as i32,
-                        }
-                    ))
+                        },
+                    )),
+                }
+            }
+            PublicOplogEntry::BeginRemoteTransaction(begin_remote_write) => {
+                golem_api_grpc::proto::golem::worker::OplogEntry {
+                    entry: Some(oplog_entry::Entry::BeginRemoteTransaction(
+                        golem_api_grpc::proto::golem::worker::BeginRemoteTransactionParameters {
+                            timestamp: Some(begin_remote_write.timestamp.into()),
+                            transaction_id: begin_remote_write.transaction_id.into(),
+                        },
+                    )),
+                }
+            }
+            PublicOplogEntry::PreCommitRemoteTransaction(end_remote_write) => {
+                golem_api_grpc::proto::golem::worker::OplogEntry {
+                    entry: Some(oplog_entry::Entry::PreCommitRemoteTransaction(
+                        golem_api_grpc::proto::golem::worker::RemoteTransactionParameters {
+                            timestamp: Some(end_remote_write.timestamp.into()),
+                            begin_index: end_remote_write.begin_index.into(),
+                        },
+                    )),
+                }
+            }
+            PublicOplogEntry::PreRollbackRemoteTransaction(end_remote_write) => {
+                golem_api_grpc::proto::golem::worker::OplogEntry {
+                    entry: Some(oplog_entry::Entry::PreRollbackRemoteTransaction(
+                        golem_api_grpc::proto::golem::worker::RemoteTransactionParameters {
+                            timestamp: Some(end_remote_write.timestamp.into()),
+                            begin_index: end_remote_write.begin_index.into(),
+                        },
+                    )),
+                }
+            }
+            PublicOplogEntry::CommittedRemoteTransaction(end_remote_write) => {
+                golem_api_grpc::proto::golem::worker::OplogEntry {
+                    entry: Some(oplog_entry::Entry::CommittedRemoteTransaction(
+                        golem_api_grpc::proto::golem::worker::RemoteTransactionParameters {
+                            timestamp: Some(end_remote_write.timestamp.into()),
+                            begin_index: end_remote_write.begin_index.into(),
+                        },
+                    )),
+                }
+            }
+            PublicOplogEntry::RolledBackRemoteTransaction(end_remote_write) => {
+                golem_api_grpc::proto::golem::worker::OplogEntry {
+                    entry: Some(oplog_entry::Entry::RolledBackRemoteTransaction(
+                        golem_api_grpc::proto::golem::worker::RemoteTransactionParameters {
+                            timestamp: Some(end_remote_write.timestamp.into()),
+                            begin_index: end_remote_write.begin_index.into(),
+                        },
+                    )),
                 }
             }
         })
@@ -908,6 +962,13 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::WrappedFunctionType>
                     index: value.oplog_index.map(OplogIndex::from_u64),
                 }),
             ),
+            wrapped_function_type::Type::WriteRemoteTransaction => {
+                Ok(PublicDurableFunctionType::WriteRemoteTransaction(
+                    WriteRemoteTransactionParameters {
+                        index: value.oplog_index.map(OplogIndex::from_u64),
+                    },
+                ))
+            }
         }
     }
 }
@@ -942,6 +1003,12 @@ impl From<PublicDurableFunctionType> for golem_api_grpc::proto::golem::worker::W
             PublicDurableFunctionType::WriteRemoteBatched(parameters) => {
                 golem_api_grpc::proto::golem::worker::WrappedFunctionType {
                     r#type: wrapped_function_type::Type::WriteRemoteBatched as i32,
+                    oplog_index: parameters.index.map(|index| index.into()),
+                }
+            }
+            PublicDurableFunctionType::WriteRemoteTransaction(parameters) => {
+                golem_api_grpc::proto::golem::worker::WrappedFunctionType {
+                    r#type: wrapped_function_type::Type::WriteRemoteTransaction as i32,
                     oplog_index: parameters.index.map(|index| index.into()),
                 }
             }
@@ -1068,11 +1135,7 @@ impl TryFrom<PublicWorkerInvocation> for golem_api_grpc::proto::golem::worker::W
                                 .function_input
                                 .unwrap_or_default()
                                 .into_iter()
-                                .map(|input| input.try_into().map_err(
-                                    |errors: Vec<String>| {
-                                        format!("Failed to convert request: {}", errors.join(", "))
-                                    },
-                                )).collect::<Result<Vec<_>, _>>()?,
+                                .map(|input| input.into()).collect(),
                             trace_id: exported_function.trace_id.to_string(),
                             trace_states: exported_function.trace_states,
                             invocation_context: decode_public_span_data(&exported_function.invocation_context, 0),

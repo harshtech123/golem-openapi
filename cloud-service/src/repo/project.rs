@@ -1,11 +1,24 @@
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::model::{Project, ProjectData, ProjectPluginInstallationTarget, ProjectType};
 use crate::repo::plugin_installation::ProjectPluginInstallationTargetRow;
 use async_trait::async_trait;
-use cloud_common::model::CloudPluginOwner;
-use cloud_common::repo::CloudPluginOwnerRow;
 use conditional_trait_gen::trait_gen;
 use futures::{future, TryFutureExt};
 use golem_common::model::ProjectId;
+use golem_common::repo::PluginOwnerRow;
 use golem_service_base::db::Pool;
 use golem_service_base::repo::plugin_installation::{
     DbPluginInstallationRepoQueries, PluginInstallationRecord, PluginInstallationRepoQueries,
@@ -63,7 +76,7 @@ pub struct OwnerAccountIdRow {
 }
 
 #[async_trait]
-pub trait ProjectRepo {
+pub trait ProjectRepo: Send + Sync {
     async fn create(&self, project: &ProjectRecord) -> Result<(), RepoError>;
 
     async fn get(&self, project_id: &Uuid) -> Result<Option<ProjectRecord>, RepoError>;
@@ -87,28 +100,25 @@ pub trait ProjectRepo {
 
     async fn get_installed_plugins(
         &self,
-        owner: &CloudPluginOwnerRow,
+        owner: &PluginOwnerRow,
         project_id: &Uuid,
-    ) -> Result<
-        Vec<PluginInstallationRecord<CloudPluginOwner, ProjectPluginInstallationTarget>>,
-        RepoError,
-    >;
+    ) -> Result<Vec<PluginInstallationRecord<ProjectPluginInstallationTarget>>, RepoError>;
 
     async fn install_plugin(
         &self,
-        record: &PluginInstallationRecord<CloudPluginOwner, ProjectPluginInstallationTarget>,
+        record: &PluginInstallationRecord<ProjectPluginInstallationTarget>,
     ) -> Result<(), RepoError>;
 
     async fn uninstall_plugin(
         &self,
-        owner: &CloudPluginOwnerRow,
+        owner: &PluginOwnerRow,
         project_id: &Uuid,
         plugin_installation_id: &Uuid,
     ) -> Result<(), RepoError>;
 
     async fn update_plugin_installation(
         &self,
-        owner: &CloudPluginOwnerRow,
+        owner: &PluginOwnerRow,
         project_id: &Uuid,
         plugin_installation_id: &Uuid,
         new_priority: i32,
@@ -119,16 +129,14 @@ pub trait ProjectRepo {
 pub struct DbProjectRepo<DB: Pool> {
     db_pool: DB,
     plugin_installation_queries: Arc<
-        dyn PluginInstallationRepoQueries<DB::Db, CloudPluginOwner, ProjectPluginInstallationTarget>
-            + Send
-            + Sync,
+        dyn PluginInstallationRepoQueries<DB::Db, ProjectPluginInstallationTarget> + Send + Sync,
     >,
 }
 
 impl<DB: Pool + Sync> DbProjectRepo<DB>
 where
     DbPluginInstallationRepoQueries<DB::Db>:
-        PluginInstallationRepoQueries<DB::Db, CloudPluginOwner, ProjectPluginInstallationTarget>,
+        PluginInstallationRepoQueries<DB::Db, ProjectPluginInstallationTarget>,
 {
     pub fn new(db_pool: DB) -> Self {
         let plugin_installation_queries = Arc::new(DbPluginInstallationRepoQueries::new());
@@ -338,19 +346,16 @@ impl ProjectRepo for DbProjectRepo<golem_service_base::db::postgres::PostgresPoo
 
     async fn get_installed_plugins(
         &self,
-        owner: &CloudPluginOwnerRow,
+        owner: &PluginOwnerRow,
         project_id: &Uuid,
-    ) -> Result<
-        Vec<PluginInstallationRecord<CloudPluginOwner, ProjectPluginInstallationTarget>>,
-        RepoError,
-    > {
+    ) -> Result<Vec<PluginInstallationRecord<ProjectPluginInstallationTarget>>, RepoError> {
         let target = ProjectPluginInstallationTargetRow {
             project_id: *project_id,
         };
         let mut query = self.plugin_installation_queries.get_all(owner, &target);
 
-        let query = query
-            .build_query_as::<PluginInstallationRecord<CloudPluginOwner, ProjectPluginInstallationTarget>>();
+        let query =
+            query.build_query_as::<PluginInstallationRecord<ProjectPluginInstallationTarget>>();
 
         Ok(self
             .db_pool
@@ -361,12 +366,12 @@ impl ProjectRepo for DbProjectRepo<golem_service_base::db::postgres::PostgresPoo
 
     async fn install_plugin(
         &self,
-        record: &PluginInstallationRecord<CloudPluginOwner, ProjectPluginInstallationTarget>,
+        record: &PluginInstallationRecord<ProjectPluginInstallationTarget>,
     ) -> Result<(), RepoError> {
         let mut query = self.plugin_installation_queries.create(record);
 
         self.db_pool
-            .with_rw("project", "get_installed_plugins")
+            .with_rw("project", "install_plugin")
             .execute(query.build())
             .await?;
 
@@ -375,7 +380,7 @@ impl ProjectRepo for DbProjectRepo<golem_service_base::db::postgres::PostgresPoo
 
     async fn uninstall_plugin(
         &self,
-        owner: &CloudPluginOwnerRow,
+        owner: &PluginOwnerRow,
         project_id: &Uuid,
         plugin_installation_id: &Uuid,
     ) -> Result<(), RepoError> {
@@ -396,7 +401,7 @@ impl ProjectRepo for DbProjectRepo<golem_service_base::db::postgres::PostgresPoo
 
     async fn update_plugin_installation(
         &self,
-        owner: &CloudPluginOwnerRow,
+        owner: &PluginOwnerRow,
         project_id: &Uuid,
         plugin_installation_id: &Uuid,
         new_priority: i32,

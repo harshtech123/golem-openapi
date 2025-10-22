@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::components::cloud_service::CloudService;
 use crate::components::component_service::ComponentService;
 use crate::components::redis::Redis;
 use crate::components::shard_manager::ShardManager;
@@ -27,7 +28,7 @@ use tokio::sync::Mutex;
 use tracing::{info, Instrument, Level};
 
 pub struct SpawnedWorkerExecutorCluster {
-    worker_executors: Vec<Arc<dyn WorkerExecutor + Send + Sync + 'static>>,
+    worker_executors: Vec<Arc<dyn WorkerExecutor>>,
     stopped_indices: Arc<Mutex<HashSet<usize>>>,
 }
 
@@ -37,15 +38,16 @@ impl SpawnedWorkerExecutorCluster {
         working_directory: PathBuf,
         http_port: u16,
         grpc_port: u16,
-        redis: Arc<dyn Redis + Send + Sync + 'static>,
-        component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
-        shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
-        worker_service: Arc<dyn WorkerService + 'static>,
+        redis: Arc<dyn Redis>,
+        component_service: Arc<dyn ComponentService>,
+        shard_manager: Arc<dyn ShardManager>,
+        worker_service: Arc<dyn WorkerService>,
         verbosity: Level,
         out_level: Level,
         err_level: Level,
         shared_client: bool,
-    ) -> Arc<dyn WorkerExecutor + Send + Sync + 'static> {
+        cloud_service: Arc<dyn CloudService>,
+    ) -> Arc<dyn WorkerExecutor> {
         Arc::new(
             SpawnedWorkerExecutor::new(
                 &executable,
@@ -60,6 +62,7 @@ impl SpawnedWorkerExecutorCluster {
                 out_level,
                 err_level,
                 shared_client,
+                cloud_service,
             )
             .await,
         )
@@ -79,39 +82,7 @@ impl SpawnedWorkerExecutorCluster {
         out_level: Level,
         err_level: Level,
         shared_client: bool,
-    ) -> Self {
-        Self::new_base(
-            size,
-            base_http_port,
-            base_grpc_port,
-            executable,
-            working_directory,
-            redis,
-            component_service,
-            shard_manager,
-            worker_service,
-            verbosity,
-            out_level,
-            err_level,
-            shared_client,
-        )
-        .await
-    }
-
-    pub async fn new_base(
-        size: usize,
-        base_http_port: u16,
-        base_grpc_port: u16,
-        executable: &Path,
-        working_directory: &Path,
-        redis: Arc<dyn Redis + Send + Sync + 'static>,
-        component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
-        shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
-        worker_service: Arc<dyn WorkerService + 'static>,
-        verbosity: Level,
-        out_level: Level,
-        err_level: Level,
-        shared_client: bool,
+        cloud_service: Arc<dyn CloudService>,
     ) -> Self {
         info!("Starting a cluster of golem-worker-executors of size {size}");
         let mut worker_executors_joins = Vec::new();
@@ -134,6 +105,7 @@ impl SpawnedWorkerExecutorCluster {
                     out_level,
                     err_level,
                     shared_client,
+                    cloud_service.clone(),
                 )
                 .in_current_span(),
             );
@@ -189,7 +161,7 @@ impl WorkerExecutorCluster for SpawnedWorkerExecutorCluster {
         }
     }
 
-    fn to_vec(&self) -> Vec<Arc<dyn WorkerExecutor + Send + Sync + 'static>> {
+    fn to_vec(&self) -> Vec<Arc<dyn WorkerExecutor>> {
         self.worker_executors.to_vec()
     }
 

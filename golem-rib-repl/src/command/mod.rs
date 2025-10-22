@@ -35,6 +35,14 @@ pub trait Command {
     /// Error type returned when command execution fails.
     type ExecutionError;
 
+    /*
+     * Argument names to command,
+     * mainly for documentation purpose
+     */
+    fn command_argument_names() -> Vec<String> {
+        vec![]
+    }
+
     fn name(&self) -> String {
         let full = std::any::type_name::<Self>();
         let last = full.rsplit("::").next().unwrap_or(full);
@@ -76,19 +84,19 @@ pub trait Command {
     /// # Parameters
     /// - `output`: The result returned by `execute` if it completed successfully.
     /// - `repl_context`: An immutable projection of internal ReplState
-    fn print_output(&self, output: &Self::Output, repl_context: &ReplContext);
+    fn print_output(&self, output: Self::Output, repl_context: &ReplContext);
 
     /// Prints an error that occurred during input parsing.
     ///
     /// # Parameters
     /// - `error`: The error returned by `parse` when the user input is invalid.
     /// - `repl_context`: An immutable projection of internal ReplState
-    fn print_input_parse_error(&self, error: &Self::InputParseError, repl_context: &ReplContext);
+    fn print_input_parse_error(&self, error: Self::InputParseError, repl_context: &ReplContext);
 
     /// Prints an error that occurred during command execution.
     ///
     /// # Parameters
     /// - `error`: The error returned by `execute` when something goes wrong during execution.
     /// - `repl_context`: An immutable projection of internal ReplState
-    fn print_execution_error(&self, error: &Self::ExecutionError, repl_context: &ReplContext);
+    fn print_execution_error(&self, error: Self::ExecutionError, repl_context: &ReplContext);
 }

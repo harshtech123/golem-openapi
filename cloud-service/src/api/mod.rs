@@ -1,3 +1,19 @@
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::bootstrap::Services;
+use crate::login::{LoginError, OAuth2Error};
 use crate::service::account::AccountError;
 use crate::service::account_grant::AccountGrantServiceError;
 use crate::service::auth::AuthServiceError;
@@ -5,68 +21,24 @@ use crate::service::project::ProjectError;
 use crate::service::project_grant::ProjectGrantError;
 use crate::service::project_policy::ProjectPolicyError;
 use crate::service::token::TokenServiceError;
-use crate::service::Services;
-use cloud_common::clients::plugin::PluginError;
 use golem_common::metrics::api::TraceErrorKind;
 use golem_common::model::error::{ErrorBody, ErrorsBody};
 use golem_common::SafeDisplay;
-use poem::endpoint::PrometheusExporter;
-use poem::Route;
+use golem_service_base::api::HealthcheckApi;
+use golem_service_base::clients::plugin::PluginError;
 use poem_openapi::payload::Json;
-use poem_openapi::{ApiResponse, OpenApiService, Tags};
-use prometheus::Registry;
-use std::ops::Deref;
-use std::sync::Arc;
+use poem_openapi::{ApiResponse, OpenApiService};
 
 mod account;
 mod account_summary;
 mod dto;
 mod grant;
-mod healthcheck;
 mod limits;
 mod login;
 mod project;
 mod project_grant;
 mod project_policy;
 mod token;
-
-#[derive(Tags)]
-enum ApiTags {
-    /// The account API allows users to query and manipulate their own account data.
-    Account,
-    AccountSummary,
-    Grant,
-    HealthCheck,
-    /// The limits API allows users to query their current resource limits.
-    Limits,
-    /// The login endpoints are implementing an OAuth2 flow.
-    Login,
-    /// Projects are groups of components and their workers, providing both a separate namespace for these entities and allows sharing between accounts.
-    ///
-    /// Every account has a default project which is assumed when no specific project ID is passed in some component and worker related APIs.
-    Project,
-    /// Projects can have grants providing access to other accounts than the project's owner.
-    ///
-    /// The project grant API allows listing, creating and deleting such grants. What the grants allow exactly are defined by policies, covered by the Project policy API.
-    ProjectGrant,
-    /// Project policies describe a set of actions one account can perform when it was associated with a grant for a project.
-    ///
-    /// The following actions can be used in the projectActions fields of this API:
-    /// - `ViewComponent` grants read access to a component
-    /// - `CreateComponent` allows creating new components in a project
-    /// - `UpdateComponent` allows uploading new versions for existing components in a project
-    /// - `DeleteComponent` allows deleting components from a project
-    /// - `ViewWorker` allows querying existing workers of a component belonging to the project
-    /// - `CreateWorker` allows launching new workers of a component in the project
-    /// - `UpdateWorker` allows manipulating existing workers of a component belonging to the project
-    /// - `DeleteWorker` allows deleting workers of a component belonging to the project
-    /// - `ViewProjectGrants` allows listing the existing grants of the project
-    /// - `CreateProjectGrants` allows creating new grants for the project
-    /// - `DeleteProjectGrants` allows deleting existing grants of the project
-    ProjectPolicy,
-    /// The token API allows creating custom access tokens for the Golem Cloud REST API to be used by tools and services.
-    Token,
-}
 
 #[derive(ApiResponse, Debug, Clone)]
 pub enum ApiError {
@@ -76,12 +48,40 @@ pub enum ApiError {
     /// Unauthorized request
     #[oai(status = 401)]
     Unauthorized(Json<ErrorBody>),
-    /// Account not found
+    /// Forbidden Request
+    #[oai(status = 403)]
+    Forbidden(Json<ErrorBody>),
+    /// Entity not found
     #[oai(status = 404)]
     NotFound(Json<ErrorBody>),
+    #[oai(status = 409)]
+    Conflict(Json<ErrorBody>),
     /// Internal server error
     #[oai(status = 500)]
     InternalError(Json<ErrorBody>),
+}
+
+impl ApiError {
+    pub fn logins_disabled() -> Self {
+        Self::Conflict(Json(ErrorBody {
+            error: "Logins are disabled by configuration".to_string(),
+        }))
+    }
+
+    pub fn limit_exceeded(error: impl SafeDisplay) -> Self {
+        Self::Conflict(Json(ErrorBody {
+            error: format!(
+                "Allowed number of requests exceeded: {}",
+                error.to_safe_string()
+            ),
+        }))
+    }
+
+    pub fn bad_request(error: impl Into<String>) -> Self {
+        ApiError::BadRequest(Json(ErrorsBody {
+            errors: vec![error.into()],
+        }))
+    }
 }
 
 impl TraceErrorKind for ApiError {
@@ -91,6 +91,8 @@ impl TraceErrorKind for ApiError {
             ApiError::NotFound(_) => "NotFound",
             ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::InternalError(_) => "InternalError",
+            ApiError::Conflict(_) => "Conflict",
+            ApiError::Forbidden(_) => "Forbidden",
         }
     }
 
@@ -100,6 +102,8 @@ impl TraceErrorKind for ApiError {
             ApiError::NotFound(_) => true,
             ApiError::Unauthorized(_) => true,
             ApiError::InternalError(_) => false,
+            ApiError::Forbidden(_) => true,
+            ApiError::Conflict(_) => true,
         }
     }
 }
@@ -153,12 +157,7 @@ impl From<AccountError> for ApiError {
 impl From<TokenServiceError> for ApiError {
     fn from(value: TokenServiceError) -> Self {
         match value {
-            TokenServiceError::Unauthorized(_) => ApiError::Unauthorized(Json(ErrorBody {
-                error: value.to_safe_string(),
-            })),
-            TokenServiceError::InternalTokenError(_)
-            | TokenServiceError::InternalRepoError(_)
-            | TokenServiceError::InternalSerializationError { .. }
+            TokenServiceError::InternalRepoError(_)
             | TokenServiceError::InternalSecretAlreadyExists { .. } => {
                 ApiError::InternalError(Json(ErrorBody {
                     error: value.to_safe_string(),
@@ -211,201 +210,105 @@ impl From<ProjectPolicyError> for ApiError {
     }
 }
 
-#[derive(ApiResponse, Debug, Clone)]
-pub enum LimitedApiError {
-    /// Invalid request, returning with a list of issues detected in the request
-    #[oai(status = 400)]
-    BadRequest(Json<ErrorsBody>),
-    /// Unauthorized
-    #[oai(status = 401)]
-    Unauthorized(Json<ErrorBody>),
-    /// Maximum number of projects exceeded
-    #[oai(status = 403)]
-    LimitExceeded(Json<ErrorBody>),
-    /// Project not found
-    #[oai(status = 404)]
-    NotFound(Json<ErrorBody>),
-    /// Project already exists
-    #[oai(status = 500)]
-    InternalError(Json<ErrorBody>),
-}
-
-impl TraceErrorKind for LimitedApiError {
-    fn trace_error_kind(&self) -> &'static str {
-        match &self {
-            LimitedApiError::BadRequest(_) => "BadRequest",
-            LimitedApiError::NotFound(_) => "NotFound",
-            LimitedApiError::LimitExceeded(_) => "LimitExceeded",
-            LimitedApiError::Unauthorized(_) => "Unauthorized",
-            LimitedApiError::InternalError(_) => "InternalError",
-        }
-    }
-
-    fn is_expected(&self) -> bool {
-        match &self {
-            LimitedApiError::BadRequest(_) => true,
-            LimitedApiError::NotFound(_) => true,
-            LimitedApiError::LimitExceeded(_) => true,
-            LimitedApiError::Unauthorized(_) => true,
-            LimitedApiError::InternalError(_) => false,
+impl From<LoginError> for ApiError {
+    fn from(value: LoginError) -> Self {
+        match &value {
+            LoginError::UnknownTokenState(_) => Self::NotFound(Json(ErrorBody {
+                error: value.to_safe_string(),
+            })),
+            _ => Self::InternalError(Json(ErrorBody {
+                error: value.to_safe_string(),
+            })),
         }
     }
 }
 
-type LimitedApiResult<T> = Result<T, LimitedApiError>;
-
-impl From<AuthServiceError> for LimitedApiError {
-    fn from(value: AuthServiceError) -> Self {
+impl From<OAuth2Error> for ApiError {
+    fn from(value: OAuth2Error) -> Self {
         match value {
-            AuthServiceError::InvalidToken(_)
-            | AuthServiceError::ProjectAccessForbidden { .. }
-            | AuthServiceError::ProjectActionForbidden { .. }
-            | AuthServiceError::RoleMissing { .. }
-            | AuthServiceError::AccountOwnershipRequired
-            | AuthServiceError::AccountAccessForbidden { .. } => {
-                LimitedApiError::Unauthorized(Json(ErrorBody {
+            OAuth2Error::InternalGithubClientError(_) | OAuth2Error::InternalSessionError(_) => {
+                ApiError::InternalError(Json(ErrorBody {
                     error: value.to_safe_string(),
                 }))
             }
-            AuthServiceError::InternalTokenServiceError(_)
-            | AuthServiceError::InternalRepoError(_) => {
-                LimitedApiError::InternalError(Json(ErrorBody {
-                    error: value.to_safe_string(),
+            OAuth2Error::InvalidSession(_) | OAuth2Error::InvalidState(_) => {
+                ApiError::BadRequest(Json(ErrorsBody {
+                    errors: vec![value.to_safe_string()],
                 }))
             }
         }
     }
 }
 
-impl From<ProjectError> for LimitedApiError {
+impl From<ProjectError> for ApiError {
     fn from(value: ProjectError) -> Self {
         match value {
             ProjectError::InternalRepoError(_)
             | ProjectError::FailedToCreateDefaultProject(_)
             | ProjectError::InternalConversionError { .. }
-            | ProjectError::InternalPlanLimitError(_) => {
-                LimitedApiError::InternalError(Json(ErrorBody {
-                    error: value.to_safe_string(),
-                }))
-            }
-            ProjectError::LimitExceeded(_) => LimitedApiError::LimitExceeded(Json(ErrorBody {
+            | ProjectError::InternalPlanLimitError(_) => Self::InternalError(Json(ErrorBody {
                 error: value.to_safe_string(),
             })),
-            ProjectError::PluginNotFound { .. } => LimitedApiError::BadRequest(Json(ErrorsBody {
+            ProjectError::LimitExceeded(_) => Self::limit_exceeded(value),
+            ProjectError::ProjectNotFound(_) => Self::NotFound(Json(ErrorBody {
+                error: value.to_safe_string(),
+            })),
+            ProjectError::PluginNotFound { .. } => Self::BadRequest(Json(ErrorsBody {
                 errors: vec![value.to_safe_string()],
             })),
-            ProjectError::InternalPluginError(_) => {
-                LimitedApiError::InternalError(Json(ErrorBody {
-                    error: value.to_safe_string(),
-                }))
-            }
-            ProjectError::CannotDeleteDefaultProject => {
-                LimitedApiError::BadRequest(Json(ErrorsBody {
-                    errors: vec![value.to_safe_string()],
-                }))
-            }
+            ProjectError::InternalPluginError(_) => Self::InternalError(Json(ErrorBody {
+                error: value.to_safe_string(),
+            })),
+            ProjectError::CannotDeleteDefaultProject => Self::BadRequest(Json(ErrorsBody {
+                errors: vec![value.to_safe_string()],
+            })),
             ProjectError::InternalProjectAuthorisationError(inner) => inner.into(),
         }
     }
 }
 
-impl From<ProjectGrantError> for LimitedApiError {
+impl From<ProjectGrantError> for ApiError {
     fn from(value: ProjectGrantError) -> Self {
         match value {
-            ProjectGrantError::InternalRepoError(_) => {
-                LimitedApiError::InternalError(Json(ErrorBody {
-                    error: value.to_safe_string(),
-                }))
-            }
+            ProjectGrantError::InternalRepoError(_) => Self::InternalError(Json(ErrorBody {
+                error: value.to_safe_string(),
+            })),
             ProjectGrantError::AuthError(inner) => inner.into(),
-            ProjectGrantError::ProjectNotFound(_) => {
-                LimitedApiError::BadRequest(Json(ErrorsBody {
-                    errors: vec![value.to_safe_string()],
-                }))
-            }
-            ProjectGrantError::ProjectPolicyNotFound(_) => {
-                LimitedApiError::BadRequest(Json(ErrorsBody {
-                    errors: vec![value.to_safe_string()],
-                }))
-            }
-            ProjectGrantError::AccountNotFound(_) => {
-                LimitedApiError::BadRequest(Json(ErrorsBody {
-                    errors: vec![value.to_safe_string()],
-                }))
-            }
+            ProjectGrantError::ProjectNotFound(_) => Self::BadRequest(Json(ErrorsBody {
+                errors: vec![value.to_safe_string()],
+            })),
+            ProjectGrantError::ProjectPolicyNotFound(_) => Self::BadRequest(Json(ErrorsBody {
+                errors: vec![value.to_safe_string()],
+            })),
+            ProjectGrantError::AccountNotFound(_) => Self::BadRequest(Json(ErrorsBody {
+                errors: vec![value.to_safe_string()],
+            })),
         }
     }
 }
 
-impl From<ProjectPolicyError> for LimitedApiError {
-    fn from(value: ProjectPolicyError) -> Self {
-        match value {
-            ProjectPolicyError::InternalRepoError(_) => {
-                LimitedApiError::InternalError(Json(ErrorBody {
-                    error: value.to_safe_string(),
-                }))
-            }
-        }
-    }
-}
-
-impl From<PluginError> for LimitedApiError {
+impl From<PluginError> for ApiError {
     fn from(value: PluginError) -> Self {
-        LimitedApiError::InternalError(Json(ErrorBody {
+        Self::InternalError(Json(ErrorBody {
             error: value.to_safe_string(),
         }))
     }
 }
 
-impl From<AccountError> for LimitedApiError {
-    fn from(value: AccountError) -> Self {
-        match value {
-            AccountError::Internal(_) => Self::InternalError(Json(ErrorBody {
-                error: value.to_safe_string(),
-            })),
-            AccountError::ArgValidation(errors) => Self::BadRequest(Json(ErrorsBody { errors })),
-            AccountError::AccountNotFound(_) => Self::NotFound(Json(ErrorBody {
-                error: value.to_safe_string(),
-            })),
-            AccountError::InternalRepoError(_) => Self::InternalError(Json(ErrorBody {
-                error: value.to_safe_string(),
-            })),
-            AccountError::InternalPlanError(_) => Self::InternalError(Json(ErrorBody {
-                error: value.to_safe_string(),
-            })),
-            AccountError::AuthError(inner) => inner.into(),
-        }
-    }
-}
-
-pub fn combined_routes(prometheus_registry: Arc<Registry>, services: &Services) -> Route {
-    let api_service = make_open_api_service(services);
-
-    let ui = api_service.swagger_ui();
-    let spec = api_service.spec_endpoint_yaml();
-    let metrics = PrometheusExporter::new(prometheus_registry.deref().clone());
-
-    Route::new()
-        .nest("/", api_service)
-        .nest("/docs", ui)
-        .nest("/specs", spec)
-        .nest("/metrics", metrics)
-}
-
-type ApiServices = (
+pub type Apis = (
     account::AccountApi,
     account_summary::AccountSummaryApi,
     grant::GrantApi,
     limits::LimitsApi,
     login::LoginApi,
-    healthcheck::HealthcheckApi,
+    HealthcheckApi,
     project::ProjectApi,
     project_grant::ProjectGrantApi,
     project_policy::ProjectPolicyApi,
     token::TokenApi,
 );
 
-pub fn make_open_api_service(services: &Services) -> OpenApiService<ApiServices, ()> {
+pub fn make_open_api_service(services: &Services) -> OpenApiService<Apis, ()> {
     OpenApiService::new(
         (
             account::AccountApi {
@@ -426,10 +329,9 @@ pub fn make_open_api_service(services: &Services) -> OpenApiService<ApiServices,
             },
             login::LoginApi {
                 auth_service: services.auth_service.clone(),
-                login_service: services.login_service.clone(),
-                oauth2_service: services.oauth2_service.clone(),
+                login_system: services.login_system.clone(),
             },
-            healthcheck::HealthcheckApi,
+            HealthcheckApi,
             project::ProjectApi {
                 auth_service: services.auth_service.clone(),
                 project_service: services.project_service.clone(),
@@ -448,6 +350,7 @@ pub fn make_open_api_service(services: &Services) -> OpenApiService<ApiServices,
             token::TokenApi {
                 auth_service: services.auth_service.clone(),
                 token_service: services.token_service.clone(),
+                login_system: services.login_system.clone(),
             },
         ),
         "Golem API",

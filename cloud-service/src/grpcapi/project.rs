@@ -1,13 +1,25 @@
-use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::auth::AccountAuthorisation;
 use crate::grpcapi::get_authorisation_token;
 use crate::model;
 use crate::service::auth::{AuthService, AuthServiceError};
 use crate::service::project;
-use cloud_api_grpc::proto::golem::cloud::project::v1::cloud_project_service_server::CloudProjectService;
-use cloud_api_grpc::proto::golem::cloud::project::v1::{
+use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody};
+use golem_api_grpc::proto::golem::project::v1::cloud_project_service_server::CloudProjectService;
+use golem_api_grpc::proto::golem::project::v1::{
     create_project_response, delete_project_response, get_default_project_response,
     get_project_response, get_projects_response, project_error, CreateProjectRequest,
     CreateProjectResponse, CreateProjectSuccessResponse, DeleteProjectRequest,
@@ -15,13 +27,15 @@ use cloud_api_grpc::proto::golem::cloud::project::v1::{
     GetProjectResponse, GetProjectsRequest, GetProjectsResponse, GetProjectsSuccessResponse,
     ProjectError,
 };
-use cloud_api_grpc::proto::golem::cloud::project::Project;
-use cloud_common::grpc::proto_project_id_string;
-use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody};
+use golem_api_grpc::proto::golem::project::Project;
 use golem_common::metrics::api::TraceErrorKind;
+use golem_common::model::auth::{AccountAction, ProjectAction};
 use golem_common::model::{AccountId, ProjectId};
 use golem_common::recorded_grpc_api_request;
 use golem_common::SafeDisplay;
+use golem_service_base::grpc::proto_project_id_string;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -63,6 +77,11 @@ impl From<project::ProjectError> for ProjectError {
             }
             project::ProjectError::LimitExceeded(_) => {
                 wrap_error(project_error::Error::LimitExceeded(ErrorBody {
+                    error: value.to_safe_string(),
+                }))
+            }
+            project::ProjectError::ProjectNotFound { .. } => {
+                wrap_error(project_error::Error::NotFound(ErrorBody {
                     error: value.to_safe_string(),
                 }))
             }
@@ -125,8 +144,15 @@ impl ProjectGrpcApi {
         metadata: MetadataMap,
     ) -> Result<Project, ProjectError> {
         let auth = self.auth(metadata).await?;
+        let account_id = &auth.token.account_id;
+        self.auth_service
+            .authorize_account_action(&auth, account_id, &AccountAction::ViewDefaultProject)
+            .await?;
 
-        let result = self.project_service.get_default(&auth).await?;
+        let result = self
+            .project_service
+            .get_default(&auth.token.account_id)
+            .await?;
         Ok(result.into())
     }
 
@@ -137,12 +163,16 @@ impl ProjectGrpcApi {
     ) -> Result<Project, ProjectError> {
         let auth = self.auth(metadata).await?;
 
-        let id: ProjectId = request
+        let project_id: ProjectId = request
             .project_id
             .and_then(|id| id.try_into().ok())
             .ok_or_else(|| bad_request_error("Missing project id"))?;
 
-        let result = self.project_service.get(&id, &auth).await?;
+        self.auth_service
+            .authorize_project_action(&auth, &project_id, &ProjectAction::ViewProject)
+            .await?;
+
+        let result = self.project_service.get(&project_id).await?;
 
         match result {
             Some(project) => Ok(project.into()),
@@ -160,10 +190,15 @@ impl ProjectGrpcApi {
         metadata: MetadataMap,
     ) -> Result<Vec<Project>, ProjectError> {
         let auth = self.auth(metadata).await?;
+        let viewable_projects = self.auth_service.viewable_projects(&auth).await?;
 
         let projects = match request.project_name {
-            Some(name) => self.project_service.get_all_by_name(&name, &auth).await?,
-            None => self.project_service.get_all(&auth).await?,
+            Some(name) => {
+                self.project_service
+                    .get_all_by_name(&name, viewable_projects)
+                    .await?
+            }
+            None => self.project_service.get_all(viewable_projects).await?,
         };
 
         Ok(projects.into_iter().map(|p| p.into()).collect())
@@ -175,11 +210,16 @@ impl ProjectGrpcApi {
         metadata: MetadataMap,
     ) -> Result<(), ProjectError> {
         let auth = self.auth(metadata).await?;
-        let id: ProjectId = request
+        let project_id: ProjectId = request
             .project_id
             .and_then(|id| id.try_into().ok())
             .ok_or_else(|| bad_request_error("Missing project id"))?;
-        self.project_service.delete(&id, &auth).await?;
+
+        self.auth_service
+            .authorize_project_action(&auth, &project_id, &ProjectAction::DeleteProject)
+            .await?;
+
+        self.project_service.delete(&project_id).await?;
 
         Ok(())
     }
@@ -196,6 +236,10 @@ impl ProjectGrpcApi {
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
 
+        self.auth_service
+            .authorize_account_action(&auth, &owner_account_id, &AccountAction::CreateProject)
+            .await?;
+
         let project = model::Project {
             project_id: ProjectId::new_v4(),
             project_data: model::ProjectData {
@@ -207,7 +251,7 @@ impl ProjectGrpcApi {
             },
         };
 
-        self.project_service.create(&project, &auth).await?;
+        self.project_service.create(&project).await?;
 
         Ok(project.into())
     }

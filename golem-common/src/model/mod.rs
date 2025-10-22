@@ -12,34 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::model::oplog::{
-    IndexedResourceKey, OplogEntry, TimestampedUpdateDescription, WorkerResourceId,
-};
-use crate::model::regions::DeletedRegions;
-use bincode::de::{BorrowDecoder, Decoder};
-use bincode::enc::Encoder;
-use bincode::error::{DecodeError, EncodeError};
-use bincode::{BorrowDecode, Decode, Encode};
-
-pub use crate::base_model::*;
-use crate::model::invocation_context::InvocationContextStack;
-use golem_wasm_ast::analysis::analysed_type::{field, list, record, str, tuple, u32, u64};
-use golem_wasm_ast::analysis::AnalysedType;
-use golem_wasm_rpc::{IntoValue, Value};
-use golem_wasm_rpc_derive::IntoValue;
-use http::Uri;
-use rand::prelude::IteratorRandom;
-use serde::de::Unexpected;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::{Display, Formatter};
-use std::ops::Add;
-use std::str::FromStr;
-use std::time::{Duration, SystemTime};
-use typed_path::Utf8UnixPathBuf;
-use uuid::{uuid, Uuid};
-
+pub mod agent;
+pub mod auth;
 pub mod base64;
 pub mod component;
 pub mod component_constraint;
@@ -50,26 +24,44 @@ pub mod invocation_context;
 pub mod lucene;
 pub mod oplog;
 pub mod plugin;
+mod poem;
+pub mod project;
+pub mod protobuf;
 pub mod public_oplog;
 pub mod regions;
 pub mod trim_date;
+pub mod worker;
 
-#[cfg(feature = "poem")]
-mod poem;
+pub use crate::base_model::*;
+use crate::model::invocation_context::InvocationContextStack;
+use crate::model::oplog::{TimestampedUpdateDescription, WorkerResourceId};
+use crate::model::regions::DeletedRegions;
+use crate::SafeDisplay;
+use bincode::de::{BorrowDecoder, Decoder};
+use bincode::enc::Encoder;
+use bincode::error::{DecodeError, EncodeError};
+use bincode::{BorrowDecode, Decode, Encode};
+use golem_wasm::analysis::analysed_type::{field, list, record, str, tuple, u32, u64};
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::{IntoValue, Value};
+use golem_wasm_derive::IntoValue;
+use http::Uri;
+use rand::prelude::IteratorRandom;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::{Display, Formatter, Write};
+use std::ops::Add;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime};
+use typed_path::Utf8UnixPathBuf;
+use uuid::{uuid, Uuid};
 
-#[cfg(feature = "protobuf")]
-pub mod protobuf;
-
-#[cfg(feature = "poem")]
 pub trait PoemTypeRequirements:
     poem_openapi::types::Type + poem_openapi::types::ParseFromJSON + poem_openapi::types::ToJSON
 {
 }
 
-#[cfg(not(feature = "poem"))]
-pub trait PoemTypeRequirements {}
-
-#[cfg(feature = "poem")]
 impl<
         T: poem_openapi::types::Type
             + poem_openapi::types::ParseFromJSON
@@ -78,20 +70,9 @@ impl<
 {
 }
 
-#[cfg(not(feature = "poem"))]
-impl<T> PoemTypeRequirements for T {}
-
-#[cfg(feature = "poem")]
 pub trait PoemMultipartTypeRequirements: poem_openapi::types::ParseFromMultipartField {}
 
-#[cfg(not(feature = "poem"))]
-pub trait PoemMultipartTypeRequirements {}
-
-#[cfg(feature = "poem")]
 impl<T: poem_openapi::types::ParseFromMultipartField> PoemMultipartTypeRequirements for T {}
-
-#[cfg(not(feature = "poem"))]
-impl<T> PoemMultipartTypeRequirements for T {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -163,8 +144,8 @@ impl bincode::Encode for Timestamp {
     }
 }
 
-impl bincode::Decode for Timestamp {
-    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<Context> bincode::Decode<Context> for Timestamp {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let timestamp: i64 = bincode::Decode::decode(decoder)?;
         Ok(Timestamp(
             iso8601_timestamp::Timestamp::UNIX_EPOCH.add(Duration::from_millis(timestamp as u64)),
@@ -172,8 +153,10 @@ impl bincode::Decode for Timestamp {
     }
 }
 
-impl<'de> bincode::BorrowDecode<'de> for Timestamp {
-    fn borrow_decode<D: BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<'de, Context> bincode::BorrowDecode<'de, Context> for Timestamp {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         let timestamp: i64 = bincode::BorrowDecode::borrow_decode(decoder)?;
         Ok(Timestamp(
             iso8601_timestamp::Timestamp::UNIX_EPOCH.add(Duration::from_millis(timestamp as u64)),
@@ -203,17 +186,17 @@ impl IntoValue for Timestamp {
     }
 }
 
-/// Associates a worker-id with its owner account
+/// Associates a worker-id with its owner project
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Encode, Decode)]
 pub struct OwnedWorkerId {
-    pub account_id: AccountId,
+    pub project_id: ProjectId,
     pub worker_id: WorkerId,
 }
 
 impl OwnedWorkerId {
-    pub fn new(account_id: &AccountId, worker_id: &WorkerId) -> Self {
+    pub fn new(project_id: &ProjectId, worker_id: &WorkerId) -> Self {
         Self {
-            account_id: account_id.clone(),
+            project_id: project_id.clone(),
             worker_id: worker_id.clone(),
         }
     }
@@ -222,8 +205,8 @@ impl OwnedWorkerId {
         self.worker_id.clone()
     }
 
-    pub fn account_id(&self) -> AccountId {
-        self.account_id.clone()
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id.clone()
     }
 
     pub fn component_id(&self) -> ComponentId {
@@ -237,7 +220,7 @@ impl OwnedWorkerId {
 
 impl Display for OwnedWorkerId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.account_id, self.worker_id)
+        write!(f, "{}/{}", self.project_id, self.worker_id)
     }
 }
 
@@ -253,12 +236,14 @@ pub enum ScheduledAction {
     /// Completes a given promise
     CompletePromise {
         account_id: AccountId,
+        project_id: ProjectId,
         promise_id: PromiseId,
     },
     /// Archives all entries from the first non-empty layer of an oplog to the next layer,
     /// if the last oplog index did not change. If there are more layers below, schedules
     /// a next action to archive the next layer.
     ArchiveOplog {
+        account_id: AccountId,
         owned_worker_id: OwnedWorkerId,
         last_oplog_index: OplogIndex,
         next_after: Duration,
@@ -266,6 +251,7 @@ pub enum ScheduledAction {
     /// Invoke the given action on the worker. The invocation will only
     /// be persisted in the oplog when it's actually getting scheduled.
     Invoke {
+        account_id: AccountId,
         owned_worker_id: OwnedWorkerId,
         idempotency_key: IdempotencyKey,
         full_function_name: String,
@@ -278,9 +264,10 @@ impl ScheduledAction {
     pub fn owned_worker_id(&self) -> OwnedWorkerId {
         match self {
             ScheduledAction::CompletePromise {
-                account_id,
+                project_id,
                 promise_id,
-            } => OwnedWorkerId::new(account_id, &promise_id.worker_id),
+                ..
+            } => OwnedWorkerId::new(project_id, &promise_id.worker_id),
             ScheduledAction::ArchiveOplog {
                 owned_worker_id, ..
             } => owned_worker_id.clone(),
@@ -295,16 +282,16 @@ impl Display for ScheduledAction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ScheduledAction::CompletePromise { promise_id, .. } => {
-                write!(f, "complete[{}]", promise_id)
+                write!(f, "complete[{promise_id}]")
             }
             ScheduledAction::ArchiveOplog {
                 owned_worker_id, ..
             } => {
-                write!(f, "archive[{}]", owned_worker_id)
+                write!(f, "archive[{owned_worker_id}]")
             }
             ScheduledAction::Invoke {
                 owned_worker_id, ..
-            } => write!(f, "invoke[{}]", owned_worker_id),
+            } => write!(f, "invoke[{owned_worker_id}]"),
         }
     }
 }
@@ -464,7 +451,7 @@ impl IdempotencyKey {
         } else {
             Uuid::new_v5(&Self::ROOT_NS, base.value.as_bytes())
         };
-        let name = format!("oplog-index-{}", oplog_index);
+        let name = format!("oplog-index-{oplog_index}");
         Self::from_uuid(Uuid::new_v5(&namespace, name.as_bytes()))
     }
 }
@@ -499,19 +486,27 @@ pub struct WorkerMetadata {
     pub worker_id: WorkerId,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    pub account_id: AccountId,
+    pub project_id: ProjectId,
+    pub created_by: AccountId,
+    pub wasi_config_vars: BTreeMap<String, String>,
     pub created_at: Timestamp,
     pub parent: Option<WorkerId>,
     pub last_known_status: WorkerStatusRecord,
 }
 
 impl WorkerMetadata {
-    pub fn default(worker_id: WorkerId, account_id: AccountId) -> WorkerMetadata {
+    pub fn default(
+        worker_id: WorkerId,
+        created_by: AccountId,
+        project_id: ProjectId,
+    ) -> WorkerMetadata {
         WorkerMetadata {
             worker_id,
             args: vec![],
             env: vec![],
-            account_id,
+            project_id,
+            created_by,
+            wasi_config_vars: BTreeMap::new(),
             created_at: Timestamp::now_utc(),
             parent: None,
             last_known_status: WorkerStatusRecord::default(),
@@ -519,7 +514,7 @@ impl WorkerMetadata {
     }
 
     pub fn owned_worker_id(&self) -> OwnedWorkerId {
-        OwnedWorkerId::new(&self.account_id, &self.worker_id)
+        OwnedWorkerId::new(&self.project_id, &self.worker_id)
     }
 }
 
@@ -529,6 +524,7 @@ impl IntoValue for WorkerMetadata {
             self.worker_id.into_value(),
             self.args.into_value(),
             self.env.into_value(),
+            self.wasi_config_vars.into_value(),
             self.last_known_status.status.into_value(),
             self.last_known_status.component_version.into_value(),
             0u64.into_value(), // retry count could be computed from the worker status record here but we don't support it yet
@@ -540,6 +536,7 @@ impl IntoValue for WorkerMetadata {
             field("worker-id", WorkerId::get_type()),
             field("args", list(str())),
             field("env", list(tuple(vec![str(), str()]))),
+            field("wasi-config-vars", HashMap::<String, String>::get_type()),
             field("status", WorkerStatus::get_type()),
             field("component-version", u64()),
             field("retry-count", u64()),
@@ -547,10 +544,14 @@ impl IntoValue for WorkerMetadata {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(rename_all = "camelCase")]
+#[derive(poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
 pub struct WorkerResourceDescription {
     pub created_at: Timestamp,
-    pub indexed_resource_key: Option<IndexedResourceKey>,
+    pub resource_owner: String,
+    pub resource_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -562,6 +563,22 @@ pub struct RetryConfig {
     pub max_delay: Duration,
     pub multiplier: f64,
     pub max_jitter_factor: Option<f64>,
+}
+
+impl SafeDisplay for RetryConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+
+        let _ = writeln!(&mut result, "max attempts: {}", self.max_attempts);
+        let _ = writeln!(&mut result, "min delay: {:?}", self.min_delay);
+        let _ = writeln!(&mut result, "max delay: {:?}", self.max_delay);
+        let _ = writeln!(&mut result, "multiplier: {}", self.multiplier);
+        if let Some(max_jitter_factor) = &self.max_jitter_factor {
+            let _ = writeln!(&mut result, "max jitter factor: {max_jitter_factor:?}");
+        }
+
+        result
+    }
 }
 
 /// Contains status information about a worker according to a given oplog index.
@@ -585,22 +602,18 @@ pub struct WorkerStatusRecord {
     pub total_linear_memory_size: u64,
     pub owned_resources: HashMap<WorkerResourceId, WorkerResourceDescription>,
     pub oplog_idx: OplogIndex,
-    pub extensions: WorkerStatusRecordExtensions,
+    pub active_plugins: HashSet<PluginInstallationId>,
+    pub deleted_regions: DeletedRegions,
+    /// The component version at the starting point of the replay. Will be the version of the Create oplog entry
+    /// if only automatic updates were used or the version of the latest snapshot-based update
+    pub component_version_for_replay: ComponentVersion,
+    /// The number of encountered error entries grouped by their 'retry_from' index, calculated from
+    /// the last invocation boundary.
+    pub current_retry_count: HashMap<OplogIndex, u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum WorkerStatusRecordExtensions {
-    Extension1 {
-        active_plugins: HashSet<PluginInstallationId>,
-    },
-    Extension2 {
-        active_plugins: HashSet<PluginInstallationId>,
-        deleted_regions: DeletedRegions,
-    },
-}
-
-impl ::bincode::Decode for WorkerStatusRecord {
-    fn decode<__D: Decoder>(decoder: &mut __D) -> Result<Self, DecodeError> {
+impl<Context> bincode::Decode<Context> for WorkerStatusRecord {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         Ok(Self {
             status: Decode::decode(decoder)?,
             skipped_regions: Decode::decode(decoder)?,
@@ -616,12 +629,17 @@ impl ::bincode::Decode for WorkerStatusRecord {
             total_linear_memory_size: Decode::decode(decoder)?,
             owned_resources: Decode::decode(decoder)?,
             oplog_idx: Decode::decode(decoder)?,
-            extensions: WorkerStatusRecord::handle_decoded_extensions(Decode::decode(decoder))?,
+            active_plugins: Decode::decode(decoder)?,
+            deleted_regions: Decode::decode(decoder)?,
+            component_version_for_replay: Decode::decode(decoder)?,
+            current_retry_count: Decode::decode(decoder)?,
         })
     }
 }
-impl<'__de> BorrowDecode<'__de> for WorkerStatusRecord {
-    fn borrow_decode<__D: BorrowDecoder<'__de>>(decoder: &mut __D) -> Result<Self, DecodeError> {
+impl<'de, Context> BorrowDecode<'de, Context> for WorkerStatusRecord {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         Ok(Self {
             status: BorrowDecode::borrow_decode(decoder)?,
             skipped_regions: BorrowDecode::borrow_decode(decoder)?,
@@ -637,65 +655,11 @@ impl<'__de> BorrowDecode<'__de> for WorkerStatusRecord {
             total_linear_memory_size: BorrowDecode::borrow_decode(decoder)?,
             owned_resources: BorrowDecode::borrow_decode(decoder)?,
             oplog_idx: BorrowDecode::borrow_decode(decoder)?,
-            extensions: WorkerStatusRecord::handle_decoded_extensions(
-                BorrowDecode::borrow_decode(decoder),
-            )?,
+            active_plugins: BorrowDecode::borrow_decode(decoder)?,
+            deleted_regions: BorrowDecode::borrow_decode(decoder)?,
+            component_version_for_replay: BorrowDecode::borrow_decode(decoder)?,
+            current_retry_count: BorrowDecode::borrow_decode(decoder)?,
         })
-    }
-}
-
-impl WorkerStatusRecord {
-    pub fn active_plugins(&self) -> &HashSet<PluginInstallationId> {
-        match &self.extensions {
-            WorkerStatusRecordExtensions::Extension1 { active_plugins } => active_plugins,
-            WorkerStatusRecordExtensions::Extension2 { active_plugins, .. } => active_plugins,
-        }
-    }
-
-    pub fn active_plugins_mut(&mut self) -> &mut HashSet<PluginInstallationId> {
-        match &mut self.extensions {
-            WorkerStatusRecordExtensions::Extension1 { active_plugins } => active_plugins,
-            WorkerStatusRecordExtensions::Extension2 { active_plugins, .. } => active_plugins,
-        }
-    }
-
-    pub fn deleted_regions(&self) -> &DeletedRegions {
-        match &self.extensions {
-            WorkerStatusRecordExtensions::Extension1 { .. } => unreachable!(),
-            WorkerStatusRecordExtensions::Extension2 {
-                deleted_regions, ..
-            } => deleted_regions,
-        }
-    }
-
-    pub fn deleted_regions_mut(&mut self) -> &mut DeletedRegions {
-        match &mut self.extensions {
-            WorkerStatusRecordExtensions::Extension1 { .. } => unreachable!(),
-            WorkerStatusRecordExtensions::Extension2 {
-                deleted_regions, ..
-            } => deleted_regions,
-        }
-    }
-
-    fn handle_decoded_extensions(
-        result: Result<WorkerStatusRecordExtensions, DecodeError>,
-    ) -> Result<WorkerStatusRecordExtensions, DecodeError> {
-        match result {
-            Ok(WorkerStatusRecordExtensions::Extension1 { active_plugins }) => {
-                Ok(WorkerStatusRecordExtensions::Extension2 {
-                    active_plugins,
-                    deleted_regions: DeletedRegions::new(),
-                })
-            }
-            Ok(ex @ WorkerStatusRecordExtensions::Extension2 { .. }) => Ok(ex),
-            Err(DecodeError::UnexpectedEnd { .. }) => {
-                Ok(WorkerStatusRecordExtensions::Extension2 {
-                    active_plugins: HashSet::new(),
-                    deleted_regions: DeletedRegions::new(),
-                })
-            }
-            Err(err) => Err(err),
-        }
     }
 }
 
@@ -716,10 +680,10 @@ impl Default for WorkerStatusRecord {
             total_linear_memory_size: 0,
             owned_resources: HashMap::new(),
             oplog_idx: OplogIndex::default(),
-            extensions: WorkerStatusRecordExtensions::Extension2 {
-                active_plugins: HashSet::new(),
-                deleted_regions: DeletedRegions::new(),
-            },
+            active_plugins: HashSet::new(),
+            deleted_regions: DeletedRegions::new(),
+            component_version_for_replay: 0,
+            current_retry_count: HashMap::new(),
         }
     }
 }
@@ -741,8 +705,19 @@ pub struct SuccessfulUpdateRecord {
 ///
 /// This is always recorded together with the current oplog index, and it can only be used
 /// as a source of truth if there are no newer oplog entries since the record.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, IntoValue)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Encode,
+    Decode,
+    IntoValue,
+    poem_openapi::Enum,
+)]
 pub enum WorkerStatus {
     /// The worker is running an invoked function
     Running,
@@ -786,7 +761,7 @@ impl FromStr for WorkerStatus {
             "retrying" => Ok(WorkerStatus::Retrying),
             "failed" => Ok(WorkerStatus::Failed),
             "exited" => Ok(WorkerStatus::Exited),
-            _ => Err(format!("Unknown worker status: {}", s)),
+            _ => Err(format!("Unknown worker status: {s}")),
         }
     }
 }
@@ -817,7 +792,7 @@ impl TryFrom<i32> for WorkerStatus {
             4 => Ok(WorkerStatus::Retrying),
             5 => Ok(WorkerStatus::Failed),
             6 => Ok(WorkerStatus::Exited),
-            _ => Err(format!("Unknown worker status: {}", value)),
+            _ => Err(format!("Unknown worker status: {value}")),
         }
     }
 }
@@ -957,15 +932,17 @@ impl Encode for WorkerInvocation {
     }
 }
 
-impl Decode for WorkerInvocation {
-    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<Context> Decode<Context> for WorkerInvocation {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let serialized: SerializedWorkerInvocation = Decode::decode(decoder)?;
         Ok(serialized.into())
     }
 }
 
-impl<'de> BorrowDecode<'de> for WorkerInvocation {
-    fn borrow_decode<D: BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<'de, Context> BorrowDecode<'de, Context> for WorkerInvocation {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         let serialized: SerializedWorkerInvocation = BorrowDecode::borrow_decode(decoder)?;
         Ok(serialized.into())
     }
@@ -998,12 +975,6 @@ pub struct AccountId {
 }
 
 impl AccountId {
-    pub fn placeholder() -> Self {
-        Self {
-            value: "-1".to_string(),
-        }
-    }
-
     pub fn generate() -> Self {
         Self {
             value: Uuid::new_v4().to_string(),
@@ -1025,9 +996,10 @@ impl Display for AccountId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerNameFilter {
     pub comparator: StringFilterComparator,
@@ -1046,9 +1018,10 @@ impl Display for WorkerNameFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerStatusFilter {
     pub comparator: FilterComparator,
@@ -1067,9 +1040,10 @@ impl Display for WorkerStatusFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerVersionFilter {
     pub comparator: FilterComparator,
@@ -1088,9 +1062,10 @@ impl Display for WorkerVersionFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerCreatedAtFilter {
     pub comparator: FilterComparator,
@@ -1109,9 +1084,10 @@ impl Display for WorkerCreatedAtFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerEnvFilter {
     pub name: String,
@@ -1135,9 +1111,41 @@ impl Display for WorkerEnvFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerWasiConfigVarsFilter {
+    pub name: String,
+    pub comparator: StringFilterComparator,
+    pub value: String,
+}
+
+impl WorkerWasiConfigVarsFilter {
+    pub fn new(name: String, comparator: StringFilterComparator, value: String) -> Self {
+        Self {
+            name,
+            comparator,
+            value,
+        }
+    }
+}
+
+impl Display for WorkerWasiConfigVarsFilter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "wasi_config_vars.{} {} {}",
+            self.name, self.comparator, self.value
+        )
+    }
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerAndFilter {
     pub filters: Vec<WorkerFilter>,
@@ -1163,9 +1171,10 @@ impl Display for WorkerAndFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerOrFilter {
     pub filters: Vec<WorkerFilter>,
@@ -1191,9 +1200,10 @@ impl Display for WorkerOrFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerNotFilter {
     filter: Box<WorkerFilter>,
@@ -1213,9 +1223,10 @@ impl Display for WorkerNotFilter {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Union))]
-#[cfg_attr(feature = "poem", oai(discriminator_name = "type", one_of = true))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Union,
+)]
+#[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
 pub enum WorkerFilter {
     Name(WorkerNameFilter),
@@ -1226,6 +1237,7 @@ pub enum WorkerFilter {
     And(WorkerAndFilter),
     Or(WorkerOrFilter),
     Not(WorkerNotFilter),
+    WasiConfigVars(WorkerWasiConfigVarsFilter),
 }
 
 impl WorkerFilter {
@@ -1275,6 +1287,16 @@ impl WorkerFilter {
                     }
                 }
                 result
+            }
+            WorkerFilter::WasiConfigVars(WorkerWasiConfigVarsFilter {
+                name,
+                comparator,
+                value,
+            }) => {
+                let env_value = metadata.wasi_config_vars.get(&name);
+                env_value
+                    .map(|ev| comparator.matches(ev, &value))
+                    .unwrap_or(false)
             }
             WorkerFilter::CreatedAt(WorkerCreatedAtFilter { comparator, value }) => {
                 comparator.matches(&metadata.created_at, &value)
@@ -1329,6 +1351,14 @@ impl WorkerFilter {
         WorkerFilter::Env(WorkerEnvFilter::new(name, comparator, value))
     }
 
+    pub fn new_wasi_config_vars(
+        name: String,
+        comparator: StringFilterComparator,
+        value: String,
+    ) -> Self {
+        WorkerFilter::WasiConfigVars(WorkerWasiConfigVarsFilter::new(name, comparator, value))
+    }
+
     pub fn new_version(comparator: FilterComparator, value: ComponentVersion) -> Self {
         WorkerFilter::Version(WorkerVersionFilter::new(comparator, value))
     }
@@ -1354,28 +1384,31 @@ impl Display for WorkerFilter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkerFilter::Name(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
             WorkerFilter::Version(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
             WorkerFilter::Status(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
             WorkerFilter::CreatedAt(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
             WorkerFilter::Env(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
+            }
+            WorkerFilter::WasiConfigVars(filter) => {
+                write!(f, "{filter}")
             }
             WorkerFilter::Not(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
             WorkerFilter::And(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
             WorkerFilter::Or(filter) => {
-                write!(f, "{}", filter)
+                write!(f, "{filter}")
             }
         }
     }
@@ -1400,7 +1433,7 @@ impl FromStr for WorkerFilter {
                     comparator.parse()?,
                     value
                         .parse()
-                        .map_err(|e| format!("Invalid filter value: {}", e))?,
+                        .map_err(|e| format!("Invalid filter value: {e}"))?,
                 )),
                 "status" => Ok(WorkerFilter::new_status(
                     comparator.parse()?,
@@ -1418,21 +1451,23 @@ impl FromStr for WorkerFilter {
                         value.to_string(),
                     ))
                 }
-                _ => Err(format!("Invalid filter: {}", s)),
+                _ => Err(format!("Invalid filter: {s}")),
             }
         } else {
-            Err(format!("Invalid filter: {}", s))
+            Err(format!("Invalid filter: {s}"))
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Enum,
+)]
 pub enum StringFilterComparator {
     Equal,
     NotEqual,
     Like,
     NotLike,
+    StartsWith,
 }
 
 impl StringFilterComparator {
@@ -1445,6 +1480,9 @@ impl StringFilterComparator {
             }
             StringFilterComparator::NotLike => {
                 !value1.to_string().contains(value2.to_string().as_str())
+            }
+            StringFilterComparator::StartsWith => {
+                value1.to_string().starts_with(value2.to_string().as_str())
             }
         }
     }
@@ -1459,7 +1497,8 @@ impl FromStr for StringFilterComparator {
             "!=" | "notequal" | "ne" => Ok(StringFilterComparator::NotEqual),
             "like" => Ok(StringFilterComparator::Like),
             "notlike" => Ok(StringFilterComparator::NotLike),
-            _ => Err(format!("Unknown String Filter Comparator: {}", s)),
+            "startswith" => Ok(StringFilterComparator::StartsWith),
+            _ => Err(format!("Unknown String Filter Comparator: {s}")),
         }
     }
 }
@@ -1473,7 +1512,8 @@ impl TryFrom<i32> for StringFilterComparator {
             1 => Ok(StringFilterComparator::NotEqual),
             2 => Ok(StringFilterComparator::Like),
             3 => Ok(StringFilterComparator::NotLike),
-            _ => Err(format!("Unknown String Filter Comparator: {}", value)),
+            4 => Ok(StringFilterComparator::StartsWith),
+            _ => Err(format!("Unknown String Filter Comparator: {value}")),
         }
     }
 }
@@ -1485,6 +1525,7 @@ impl From<StringFilterComparator> for i32 {
             StringFilterComparator::NotEqual => 1,
             StringFilterComparator::Like => 2,
             StringFilterComparator::NotLike => 3,
+            StringFilterComparator::StartsWith => 4,
         }
     }
 }
@@ -1496,13 +1537,15 @@ impl Display for StringFilterComparator {
             StringFilterComparator::NotEqual => "!=",
             StringFilterComparator::Like => "like",
             StringFilterComparator::NotLike => "notlike",
+            StringFilterComparator::StartsWith => "startswith",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode, poem_openapi::Enum,
+)]
 pub enum FilterComparator {
     Equal,
     NotEqual,
@@ -1522,7 +1565,7 @@ impl Display for FilterComparator {
             FilterComparator::LessEqual => "<=",
             FilterComparator::Less => "<",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -1549,7 +1592,7 @@ impl FromStr for FilterComparator {
             ">" | "greater" | "gt" => Ok(FilterComparator::Greater),
             "<=" | "lessequal" | "le" => Ok(FilterComparator::LessEqual),
             "<" | "less" | "lt" => Ok(FilterComparator::Less),
-            _ => Err(format!("Unknown Filter Comparator: {}", s)),
+            _ => Err(format!("Unknown Filter Comparator: {s}")),
         }
     }
 }
@@ -1565,7 +1608,7 @@ impl TryFrom<i32> for FilterComparator {
             3 => Ok(FilterComparator::LessEqual),
             4 => Ok(FilterComparator::Greater),
             5 => Ok(FilterComparator::GreaterEqual),
-            _ => Err(format!("Unknown Filter Comparator: {}", value)),
+            _ => Err(format!("Unknown Filter Comparator: {value}")),
         }
     }
 }
@@ -1583,9 +1626,19 @@ impl From<FilterComparator> for i32 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Default)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Encode,
+    Decode,
+    Default,
+    poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct ScanCursor {
     pub cursor: u64,
@@ -1625,10 +1678,10 @@ impl FromStr for ScanCursor {
             Ok(ScanCursor {
                 layer: parts[0]
                     .parse()
-                    .map_err(|e| format!("Invalid layer part: {}", e))?,
+                    .map_err(|e| format!("Invalid layer part: {e}"))?,
                 cursor: parts[1]
                     .parse()
-                    .map_err(|e| format!("Invalid cursor part: {}", e))?,
+                    .map_err(|e| format!("Invalid cursor part: {e}"))?,
             })
         } else {
             Err("Invalid cursor, must have 'layer/cursor' format".to_string())
@@ -1636,7 +1689,7 @@ impl FromStr for ScanCursor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize)]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -1644,6 +1697,20 @@ pub enum LogLevel {
     Warn,
     Error,
     Critical,
+}
+
+impl Display for LogLevel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+            LogLevel::Critical => "critical",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1672,86 +1739,9 @@ pub enum WorkerEvent {
         function: String,
         idempotency_key: IdempotencyKey,
     },
-    Close,
-}
-
-impl WorkerEvent {
-    pub fn stdout(bytes: Vec<u8>) -> WorkerEvent {
-        WorkerEvent::StdOut {
-            timestamp: Timestamp::now_utc(),
-            bytes,
-        }
-    }
-
-    pub fn stderr(bytes: Vec<u8>) -> WorkerEvent {
-        WorkerEvent::StdErr {
-            timestamp: Timestamp::now_utc(),
-            bytes,
-        }
-    }
-
-    pub fn log(level: LogLevel, context: &str, message: &str) -> WorkerEvent {
-        WorkerEvent::Log {
-            timestamp: Timestamp::now_utc(),
-            level,
-            context: context.to_string(),
-            message: message.to_string(),
-        }
-    }
-
-    pub fn invocation_start(function: &str, idempotency_key: &IdempotencyKey) -> WorkerEvent {
-        WorkerEvent::InvocationStart {
-            timestamp: Timestamp::now_utc(),
-            function: function.to_string(),
-            idempotency_key: idempotency_key.clone(),
-        }
-    }
-
-    pub fn invocation_finished(function: &str, idempotency_key: &IdempotencyKey) -> WorkerEvent {
-        WorkerEvent::InvocationFinished {
-            timestamp: Timestamp::now_utc(),
-            function: function.to_string(),
-            idempotency_key: idempotency_key.clone(),
-        }
-    }
-
-    pub fn as_oplog_entry(&self) -> Option<OplogEntry> {
-        match self {
-            WorkerEvent::StdOut { timestamp, bytes } => Some(OplogEntry::Log {
-                timestamp: *timestamp,
-                level: oplog::LogLevel::Stdout,
-                context: String::new(),
-                message: String::from_utf8_lossy(bytes).to_string(),
-            }),
-            WorkerEvent::StdErr { timestamp, bytes } => Some(OplogEntry::Log {
-                timestamp: *timestamp,
-                level: oplog::LogLevel::Stderr,
-                context: String::new(),
-                message: String::from_utf8_lossy(bytes).to_string(),
-            }),
-            WorkerEvent::Log {
-                timestamp,
-                level,
-                context,
-                message,
-            } => Some(OplogEntry::Log {
-                timestamp: *timestamp,
-                level: match level {
-                    LogLevel::Trace => oplog::LogLevel::Trace,
-                    LogLevel::Debug => oplog::LogLevel::Debug,
-                    LogLevel::Info => oplog::LogLevel::Info,
-                    LogLevel::Warn => oplog::LogLevel::Warn,
-                    LogLevel::Error => oplog::LogLevel::Error,
-                    LogLevel::Critical => oplog::LogLevel::Critical,
-                },
-                context: context.clone(),
-                message: message.clone(),
-            }),
-            WorkerEvent::InvocationStart { .. } => None,
-            WorkerEvent::InvocationFinished { .. } => None,
-            WorkerEvent::Close => None,
-        }
-    }
+    /// The client fell behind and the point it left of is no longer in our buffer.
+    /// {number_of_skipped_messages} is the number of messages between the client left of and the point it is now at.
+    ClientLagged { number_of_missed_messages: u64 },
 }
 
 impl Display for WorkerEvent {
@@ -1777,31 +1767,44 @@ impl Display for WorkerEvent {
                 message,
                 ..
             } => {
-                write!(f, "<log> {:?} {} {}", level, context, message)
+                write!(f, "<log> {level:?} {context} {message}")
             }
             WorkerEvent::InvocationStart {
                 function,
                 idempotency_key,
                 ..
             } => {
-                write!(f, "<invocation-start> {} {}", function, idempotency_key)
+                write!(f, "<invocation-start> {function} {idempotency_key}")
             }
             WorkerEvent::InvocationFinished {
                 function,
                 idempotency_key,
                 ..
             } => {
-                write!(f, "<invocation-finished> {} {}", function, idempotency_key)
+                write!(f, "<invocation-finished> {function} {idempotency_key}")
             }
-            WorkerEvent::Close => {
-                write!(f, "<close>")
+            WorkerEvent::ClientLagged {
+                number_of_missed_messages,
+            } => {
+                write!(f, "<client-lagged> {number_of_missed_messages}")
             }
         }
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    poem_openapi::Enum,
+)]
 #[repr(i32)]
 pub enum ComponentType {
     Durable = 0,
@@ -1815,7 +1818,7 @@ impl TryFrom<i32> for ComponentType {
         match value {
             0 => Ok(ComponentType::Durable),
             1 => Ok(ComponentType::Ephemeral),
-            _ => Err(format!("Unknown Component Type: {}", value)),
+            _ => Err(format!("Unknown Component Type: {value}")),
         }
     }
 }
@@ -1826,7 +1829,7 @@ impl Display for ComponentType {
             ComponentType::Durable => "Durable",
             ComponentType::Ephemeral => "Ephemeral",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -1837,21 +1840,19 @@ impl FromStr for ComponentType {
         match s {
             "Durable" => Ok(ComponentType::Durable),
             "Ephemeral" => Ok(ComponentType::Ephemeral),
-            _ => Err(format!("Unknown Component Type: {}", s)),
+            _ => Err(format!("Unknown Component Type: {s}")),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct Empty {}
 
 /// Key that can be used to identify a component file.
 /// All files with the same content will have the same key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::NewType))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, poem_openapi::NewType)]
 pub struct InitialComponentFileKey(pub String);
 
 impl Display for InitialComponentFileKey {
@@ -1879,7 +1880,7 @@ impl ComponentFilePath {
     }
 
     pub fn from_rel_str(s: &str) -> Result<Self, String> {
-        Self::from_abs_str(&format!("/{}", s))
+        Self::from_abs_str(&format!("/{s}"))
     }
 
     pub fn from_either_str(s: &str) -> Result<Self, String> {
@@ -1935,10 +1936,9 @@ impl TryFrom<&str> for ComponentFilePath {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, poem_openapi::Enum)]
 #[serde(rename_all = "kebab-case")]
-#[cfg_attr(feature = "poem", oai(rename_all = "kebab-case"))]
+#[oai(rename_all = "kebab-case")]
 pub enum ComponentFilePermissions {
     ReadOnly,
     ReadWrite,
@@ -1955,14 +1955,13 @@ impl ComponentFilePermissions {
         match s {
             "ro" => Ok(ComponentFilePermissions::ReadOnly),
             "rw" => Ok(ComponentFilePermissions::ReadWrite),
-            _ => Err(format!("Unknown permissions: {}", s)),
+            _ => Err(format!("Unknown permissions: {s}")),
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct InitialComponentFile {
     pub key: InitialComponentFileKey,
@@ -1976,9 +1975,8 @@ impl InitialComponentFile {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(Clone, Debug, Serialize, Deserialize, poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentFilePathWithPermissions {
     pub path: ComponentFilePath,
@@ -1997,9 +1995,8 @@ impl Display for ComponentFilePathWithPermissions {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(Clone, Debug, Serialize, Deserialize, poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentFilePathWithPermissionsList {
     pub values: Vec<ComponentFilePathWithPermissions>,
@@ -2009,6 +2006,13 @@ impl Display for ComponentFilePathWithPermissionsList {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", serde_json::to_string(self).unwrap())
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GetFileSystemNodeResult {
+    Ok(Vec<ComponentFileSystemNode>),
+    File(ComponentFileSystemNode),
+    NotFound,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2027,48 +2031,19 @@ pub struct ComponentFileSystemNode {
     pub details: ComponentFileSystemNodeDetails,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Encode, Decode, Default)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+// Custom Deserialize is replaced with Simple Deserialize
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Encode, Decode, Default, Deserialize, poem_openapi::Enum,
+)]
 #[serde(rename_all = "kebab-case")]
-#[cfg_attr(feature = "poem", oai(rename_all = "kebab-case"))]
+#[oai(rename_all = "kebab-case")]
 pub enum GatewayBindingType {
     #[default]
     Default,
     FileServer,
     HttpHandler,
     CorsPreflight,
-}
-
-// To keep backward compatibility as we documented wit-worker to be default
-impl<'de> Deserialize<'de> for GatewayBindingType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct GatewayBindingTypeVisitor;
-
-        impl de::Visitor<'_> for GatewayBindingTypeVisitor {
-            type Value = GatewayBindingType;
-
-            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
-                formatter.write_str("a string representing the binding type")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                match value {
-                    "default" | "wit-worker" => Ok(GatewayBindingType::Default),
-                    "file-server" => Ok(GatewayBindingType::FileServer),
-                    "cors-preflight" => Ok(GatewayBindingType::CorsPreflight),
-                    _ => Err(de::Error::invalid_value(Unexpected::Str(value), &self)),
-                }
-            }
-        }
-
-        deserializer.deserialize_str(GatewayBindingTypeVisitor)
-    }
+    SwaggerUi,
 }
 
 impl TryFrom<String> for GatewayBindingType {
@@ -2078,44 +2053,44 @@ impl TryFrom<String> for GatewayBindingType {
         match value.as_str() {
             "default" => Ok(GatewayBindingType::Default),
             "file-server" => Ok(GatewayBindingType::FileServer),
-            _ => Err(format!("Invalid WorkerBindingType: {}", value)),
+            _ => Err(format!("Invalid WorkerBindingType: {value}")),
         }
     }
 }
 
-impl From<crate::model::WorkerId> for golem_wasm_rpc::WorkerId {
-    fn from(worker_id: crate::model::WorkerId) -> Self {
-        golem_wasm_rpc::WorkerId {
+impl From<WorkerId> for golem_wasm::AgentId {
+    fn from(worker_id: WorkerId) -> Self {
+        golem_wasm::AgentId {
             component_id: worker_id.component_id.into(),
-            worker_name: worker_id.worker_name,
+            agent_id: worker_id.worker_name,
         }
     }
 }
 
-impl From<golem_wasm_rpc::WorkerId> for crate::model::WorkerId {
-    fn from(host: golem_wasm_rpc::WorkerId) -> Self {
+impl From<golem_wasm::AgentId> for WorkerId {
+    fn from(host: golem_wasm::AgentId) -> Self {
         Self {
             component_id: host.component_id.into(),
-            worker_name: host.worker_name,
+            worker_name: host.agent_id,
         }
     }
 }
 
-impl From<golem_wasm_rpc::ComponentId> for crate::model::ComponentId {
-    fn from(host: golem_wasm_rpc::ComponentId) -> Self {
+impl From<golem_wasm::ComponentId> for ComponentId {
+    fn from(host: golem_wasm::ComponentId) -> Self {
         let high_bits = host.uuid.high_bits;
         let low_bits = host.uuid.low_bits;
 
-        Self(uuid::Uuid::from_u64_pair(high_bits, low_bits))
+        Self(Uuid::from_u64_pair(high_bits, low_bits))
     }
 }
 
-impl From<crate::model::ComponentId> for golem_wasm_rpc::ComponentId {
-    fn from(component_id: crate::model::ComponentId) -> Self {
+impl From<ComponentId> for golem_wasm::ComponentId {
+    fn from(component_id: ComponentId) -> Self {
         let (high_bits, low_bits) = component_id.0.as_u64_pair();
 
-        golem_wasm_rpc::ComponentId {
-            uuid: golem_wasm_rpc::Uuid {
+        golem_wasm::ComponentId {
+            uuid: golem_wasm::Uuid {
                 high_bits,
                 low_bits,
             },
@@ -2125,23 +2100,20 @@ impl From<crate::model::ComponentId> for golem_wasm_rpc::ComponentId {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::BTreeMap;
     use std::str::FromStr;
-    use std::time::SystemTime;
     use std::vec;
     use test_r::test;
-    use tracing::info;
 
     use crate::model::oplog::OplogIndex;
 
     use crate::model::{
-        AccountId, ComponentFilePath, ComponentId, FilterComparator, IdempotencyKey, ShardId,
-        StringFilterComparator, TargetWorkerId, Timestamp, WorkerFilter, WorkerId, WorkerMetadata,
-        WorkerStatus, WorkerStatusRecord,
+        AccountId, ComponentFilePath, ComponentId, FilterComparator, IdempotencyKey, ProjectId,
+        StringFilterComparator, Timestamp, WorkerFilter, WorkerId, WorkerMetadata, WorkerStatus,
+        WorkerStatusRecord,
     };
     use bincode::{Decode, Encode};
 
-    use rand::{rng, Rng};
     use serde::{Deserialize, Serialize};
 
     #[test]
@@ -2315,9 +2287,11 @@ mod tests {
                 ("env1".to_string(), "value1".to_string()),
                 ("env2".to_string(), "value2".to_string()),
             ],
-            account_id: AccountId {
+            project_id: ProjectId::new_v4(),
+            created_by: AccountId {
                 value: "account-1".to_string(),
             },
+            wasi_config_vars: BTreeMap::from([("var1".to_string(), "value1".to_string())]),
             created_at: Timestamp::now_utc(),
             parent: None,
             last_known_status: WorkerStatusRecord {
@@ -2378,41 +2352,20 @@ mod tests {
                 "worker-2".to_string(),
             ))
             .matches(&worker_metadata));
-    }
 
-    #[test]
-    fn target_worker_id_force_shards() {
-        let mut rng = rng();
-        const SHARD_COUNT: usize = 1000;
-        const EXAMPLE_COUNT: usize = 1000;
-        for _ in 0..EXAMPLE_COUNT {
-            let mut shard_ids = HashSet::new();
-            let count = rng.random_range(0..100);
-            for _ in 0..count {
-                let shard_id = rng.random_range(0..SHARD_COUNT);
-                shard_ids.insert(ShardId {
-                    value: shard_id as i64,
-                });
-            }
+        assert!(WorkerFilter::new_wasi_config_vars(
+            "var1".to_string(),
+            StringFilterComparator::Equal,
+            "value1".to_string(),
+        )
+        .matches(&worker_metadata));
 
-            let component_id = ComponentId::new_v4();
-            let target_worker_id = TargetWorkerId {
-                component_id,
-                worker_name: None,
-            };
-
-            let start = SystemTime::now();
-            let worker_id = target_worker_id.into_worker_id(&shard_ids, SHARD_COUNT);
-            let end = SystemTime::now();
-            info!(
-                "Time with {count} valid shards: {:?}",
-                end.duration_since(start).unwrap()
-            );
-
-            if !shard_ids.is_empty() {
-                assert!(shard_ids.contains(&ShardId::from_worker_id(&worker_id, SHARD_COUNT)));
-            }
-        }
+        assert!(!WorkerFilter::new_wasi_config_vars(
+            "var1".to_string(),
+            StringFilterComparator::Equal,
+            "value2".to_string(),
+        )
+        .matches(&worker_metadata));
     }
 
     #[test]

@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::components::redis::Redis;
+use crate::components::{wait_for_startup_grpc, EnvVarBuilder};
+use async_trait::async_trait;
+use golem_api_grpc::proto::golem::shardmanager::v1::shard_manager_service_client::ShardManagerServiceClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-
-use async_trait::async_trait;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
 use tracing::Level;
-
-use golem_api_grpc::proto::golem::shardmanager::v1::shard_manager_service_client::ShardManagerServiceClient;
-
-use crate::components::redis::Redis;
-use crate::components::{wait_for_startup_grpc, EnvVarBuilder};
 
 pub mod docker;
 pub mod k8s;
@@ -32,7 +29,7 @@ pub mod provided;
 pub mod spawned;
 
 #[async_trait]
-pub trait ShardManager {
+pub trait ShardManager: Send + Sync {
     async fn client(&self) -> ShardManagerServiceClient<Channel> {
         new_client(&self.public_host(), self.public_grpc_port()).await
     }

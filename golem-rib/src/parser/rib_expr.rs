@@ -12,39 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bigdecimal::BigDecimal;
-use combine::parser::char;
-use combine::parser::char::{char, digit, spaces};
-use combine::{attempt, choice, many, many1, optional, parser, position, Stream};
-use combine::{ParseError, Parser};
-use std::str::FromStr;
-
 use super::binary_op::{binary_op, BinaryOp};
 use crate::expr::Expr;
 use crate::parser::boolean::boolean_literal;
 use crate::parser::call::call;
+use crate::parser::comment::comments;
 use crate::parser::cond::conditional;
 use crate::parser::errors::RibParseError;
 use crate::parser::flag::flag;
 use crate::parser::identifier::identifier;
 use crate::parser::integer::integer;
 use crate::parser::let_binding::let_binding;
+use crate::parser::list_aggregation::list_aggregation;
+use crate::parser::list_comprehension::list_comprehension;
 use crate::parser::literal::literal;
+use crate::parser::multi_line_code_block::multi_line_block;
 use crate::parser::not::not;
 use crate::parser::optional::option;
 use crate::parser::pattern_match::pattern_match;
 use crate::parser::range_type::{range_type, RangeType};
-use crate::parser::sequence::sequence;
-use crate::parser::tuple::tuple;
-use crate::rib_source_span::{GetSourcePosition, SourceSpan};
-
-use crate::parser::list_aggregation::list_aggregation;
-use crate::parser::list_comprehension::list_comprehension;
-use crate::parser::multi_line_code_block::multi_line_block;
 use crate::parser::record::record;
 use crate::parser::result::result;
+use crate::parser::sequence::sequence;
+use crate::parser::tuple::tuple;
 use crate::parser::type_name::type_name;
+use crate::rib_source_span::{GetSourcePosition, SourceSpan};
 use crate::TypeName;
+use bigdecimal::BigDecimal;
+use combine::parser::char;
+use combine::parser::char::{char, digit, spaces};
+use combine::{attempt, choice, many, many1, optional, parser, position, Stream};
+use combine::{ParseError, Parser};
+use std::str::FromStr;
 
 // A rib expression := (simple_expr, rib_expr_rest*)
 // A simple_expr never has any expression that starts with rib_expression
@@ -151,7 +150,7 @@ where
     >,
     Input::Position: GetSourcePosition,
 {
-    (position(), parser, position()).map(|(start, expr, end)| {
+    (position(), comments(), parser, comments(), position()).map(|(start, _, expr, _, end)| {
         let start_pos: Input::Position = start;
         let start = start_pos.get_source_position();
         let end_pos: Input::Position = end;
@@ -340,8 +339,7 @@ fn build_selection(base: Expr, next: Expr) -> Result<Expr, RibParseError> {
             })
         }
         expr => Err(RibParseError::Message(format!(
-            "unable to select field from expression: {:?}",
-            expr
+            "unable to select field from expression: {expr:?}"
         ))),
     }
 }
@@ -396,8 +394,8 @@ impl Fraction {
     pub fn combine_with_integer(&self, big: BigDecimal) -> Result<BigDecimal, String> {
         let left = big.to_string();
         let right = self.0.to_string();
-        let result = format!("{}.{}", left, right);
-        BigDecimal::from_str(&result).map_err(|e| format!("unable to parse number. {}", e))
+        let result = format!("{left}.{right}");
+        BigDecimal::from_str(&result).map_err(|e| format!("unable to parse number. {e}"))
     }
 }
 
@@ -552,7 +550,11 @@ fn combine_with_range_info(
 #[cfg(test)]
 mod tests {
     use crate::generic_type_parameter::GenericTypeParameter;
-    use crate::{ArmPattern, DynamicParsedFunctionName, Expr, InferredType, MatchArm, TypeName};
+    use crate::ParsedFunctionSite::PackagedInterface;
+    use crate::{
+        ArmPattern, DynamicParsedFunctionName, DynamicParsedFunctionReference, Expr, InferredType,
+        MatchArm, TypeName,
+    };
     use bigdecimal::{BigDecimal, FromPrimitive};
     use std::str::FromStr;
     use test_r::test;
@@ -1095,6 +1097,7 @@ mod tests {
                     None,
                     None,
                     vec![Expr::literal("my-worker")],
+                    None,
                 ),
                 None,
             ),
@@ -1133,6 +1136,7 @@ mod tests {
                     None,
                     None,
                     vec![Expr::literal("my-worker")],
+                    None,
                 ),
                 None,
             ),
@@ -1175,6 +1179,7 @@ mod tests {
                     Some(type_parameter1),
                     None,
                     vec![Expr::literal("my-worker")],
+                    None,
                 ),
                 None,
             ),
@@ -1190,5 +1195,255 @@ mod tests {
             ),
         ]);
         assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn test_single_expr_in_interpolation_wrapped_in_quotes() {
+        let input = r#""${foo}""#;
+        let result = Expr::from_text(input);
+        assert_eq!(
+            result,
+            Ok(Expr::concat(vec![Expr::identifier_global("foo", None)]))
+        );
+
+        let input = r#""${{foo}}""#;
+        let result = Expr::from_text(input);
+        assert_eq!(
+            result,
+            Ok(Expr::concat(vec![Expr::flags(vec!["foo".to_string()])]))
+        );
+
+        let input = r#""${{foo: "bar"}}""#;
+        let result = Expr::from_text(input);
+        assert_eq!(
+            result,
+            Ok(Expr::concat(vec![Expr::record(vec![(
+                "foo".to_string(),
+                Expr::literal("bar")
+            )])]))
+        );
+    }
+
+    fn expected() -> Expr {
+        Expr::expr_block(vec![
+            Expr::let_binding("x", Expr::number(BigDecimal::from(1)), None),
+            Expr::let_binding("y", Expr::number(BigDecimal::from(2)), None),
+            Expr::let_binding(
+                "result",
+                Expr::greater_than(
+                    Expr::identifier_global("x", None),
+                    Expr::identifier_global("y", None),
+                ),
+                None,
+            ),
+            Expr::let_binding(
+                "foo",
+                Expr::option(Some(Expr::identifier_global("result", None))),
+                None,
+            ),
+            Expr::let_binding(
+                "bar",
+                Expr::ok(Expr::identifier_global("result", None), None),
+                None,
+            ),
+            Expr::let_binding(
+                "baz",
+                Expr::pattern_match(
+                    Expr::identifier_global("foo", None),
+                    vec![
+                        MatchArm::new(
+                            ArmPattern::constructor(
+                                "some",
+                                vec![ArmPattern::Literal(Box::new(Expr::identifier_global(
+                                    "x", None,
+                                )))],
+                            ),
+                            Expr::identifier_global("x", None),
+                        ),
+                        MatchArm::new(
+                            ArmPattern::constructor("none", vec![]),
+                            Expr::boolean(false),
+                        ),
+                    ],
+                ),
+                None,
+            ),
+            Expr::let_binding(
+                "qux",
+                Expr::pattern_match(
+                    Expr::identifier_global("bar", None),
+                    vec![
+                        MatchArm::new(
+                            ArmPattern::constructor(
+                                "ok",
+                                vec![ArmPattern::Literal(Box::new(Expr::identifier_global(
+                                    "x", None,
+                                )))],
+                            ),
+                            Expr::identifier_global("x", None),
+                        ),
+                        MatchArm::new(
+                            ArmPattern::constructor(
+                                "err",
+                                vec![ArmPattern::Literal(Box::new(Expr::identifier_global(
+                                    "msg", None,
+                                )))],
+                            ),
+                            Expr::boolean(false),
+                        ),
+                    ],
+                ),
+                None,
+            ),
+            Expr::let_binding(
+                "result",
+                Expr::call_worker_function(
+                    DynamicParsedFunctionName {
+                        site: PackagedInterface {
+                            namespace: "ns".to_string(),
+                            package: "name".to_string(),
+                            interface: "interface".to_string(),
+                            version: None,
+                        },
+                        function: DynamicParsedFunctionReference::RawResourceStaticMethod {
+                            resource: "resource1".to_string(),
+                            method: "do-something-static".to_string(),
+                        },
+                    },
+                    None,
+                    None,
+                    vec![
+                        Expr::identifier_global("baz", None),
+                        Expr::identifier_global("qux", None),
+                    ],
+                    None,
+                ),
+                None,
+            ),
+            Expr::identifier_global("result", None),
+        ])
+    }
+
+    #[test]
+    fn test_rib() {
+        let sample_rib = r#"
+         let x = 1;
+
+         let y = 2;
+
+         let result = x > y;
+
+         let foo = some(result);
+         let bar = ok(result);
+
+         let baz = match foo {
+           some(x) => x,
+           none => false
+         };
+
+         let qux = match bar {
+           ok(x) => x,
+           err(msg) => false
+         };
+
+
+         let result = ns:name/interface.{[static]resource1.do-something-static}(baz, qux);
+
+         result
+       "#;
+
+        let result = Expr::from_text(sample_rib);
+        assert_eq!(result, Ok(expected()));
+    }
+
+    #[test]
+    fn test_rib_with_comments_1() {
+        let sample_rib = r#"
+         // this is x
+         let x = 1;
+
+         // this is y
+         let y = 2; // the result is 2
+
+         // this is result
+         let result = x > y; // this is a comment
+
+         // this is foo
+         // this is bar
+         // baz
+         let foo = some(result);
+         let bar = ok(result);
+
+         /// this is foo
+         // this is bar
+         /// baz
+         let baz = match foo {
+           some(x) => x, // the result is x
+           none => false
+         };
+
+         // this is qux
+         let qux = match bar {
+           // this is ok
+           ok(x) => x,
+           // this is err
+           err(msg) => false // the result is false
+         };
+
+         // this is a bad function currently and will fail during compilation
+         let result = ns:name/interface.{[static]resource1.do-something-static}(baz, qux);
+
+         result
+         // the final result is result
+       "#;
+
+        let result = Expr::from_text(sample_rib);
+        assert_eq!(result, Ok(expected()));
+    }
+
+    #[test]
+    fn test_rib_with_comments_2() {
+        let sample_rib = r#"
+         /** single line comment style 1 */
+         let x = 1; /**  single line comment style 1 */
+
+         /*  single line comment style 2 */
+         let y = 2; /*  single line comment style 2 */
+
+         /* multi line comment one line
+          */
+         let result = x > y; /* multi line comment with one line
+          */
+
+         /** */
+         let foo = some(result); /** */
+         let bar = ok(result); /** */
+
+         /***/
+         let baz = match foo { /** foo */
+           some(x) => /**foo*/ x,  /** some comment */
+           none => /**foo*/ false
+         };
+
+         let qux  = match  /** some comment */ bar {
+          /** some comment */  ok(/**x*/ x) => x,
+           /** some comment */ err(msg) => false
+         };
+
+         if /**foo*/ 1 then /* 0 */ 0 else /***/ 1;
+
+         /**
+            * this is a comment
+            * that spans multiple lines
+            */
+         let result = ns:name/interface.{[static]resource1.do-something-static}(baz, qux);
+
+         result
+
+         /** the result should never end with ; */
+       "#;
+
+        let result = Expr::from_text(sample_rib);
+        assert!(result.is_ok());
     }
 }

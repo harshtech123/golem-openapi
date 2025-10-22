@@ -10,7 +10,7 @@ use golem_rust::value_and_type::type_builder::TypeNodeBuilder;
 use golem_rust::value_and_type::{FromValueAndType, IntoValue};
 use golem_rust::wasm_rpc::{NodeBuilder, Pollable, WitValueExtractor};
 use golem_rust::{with_persistence_level, PersistenceLevel};
-use reqwest::{Client, InputStream, Method};
+use reqwest::{Client, IncomingBody, InputStream, Method};
 use std::cell::RefCell;
 use std::fmt::{Display, Formatter};
 
@@ -25,7 +25,14 @@ impl IntoValue for StructuredInput {
     }
 
     fn add_to_type_builder<T: TypeNodeBuilder>(builder: T) -> T::Result {
-        builder.record().field("payload").string().finish()
+        builder
+            .record(
+                Some("StructuredInput".to_string()),
+                Some("golem:it/golem-it-api".to_string()),
+            )
+            .field("payload")
+            .string()
+            .finish()
     }
 }
 
@@ -55,7 +62,14 @@ impl IntoValue for StructuredResult {
     }
 
     fn add_to_type_builder<T: TypeNodeBuilder>(builder: T) -> T::Result {
-        builder.record().field("result").string().finish()
+        builder
+            .record(
+                Some("StructuredResult".to_string()),
+                Some("golem:it/golem-it-api".to_string()),
+            )
+            .field("result")
+            .string()
+            .finish()
     }
 }
 
@@ -89,7 +103,13 @@ impl IntoValue for UnusedError {
     }
 
     fn add_to_type_builder<T: TypeNodeBuilder>(builder: T) -> T::Result {
-        builder.variant().unit_case("unused-error").finish()
+        builder
+            .variant(
+                Some("UnusedError".to_string()),
+                Some("golem:it/golem-it-api".to_string()),
+            )
+            .unit_case("unused-error")
+            .finish()
     }
 }
 
@@ -150,6 +170,7 @@ struct LazyPollableTest {
     pub pollable: Pollable,
     pub response: RefCell<Option<reqwest::Response>>,
     pub input_stream: RefCell<Option<InputStream>>,
+    pub body: RefCell<Option<IncomingBody>>,
 }
 
 impl GuestLazyPollableTest for LazyPollableTest {
@@ -161,6 +182,7 @@ impl GuestLazyPollableTest for LazyPollableTest {
             pollable,
             response: RefCell::new(None),
             input_stream: RefCell::new(None),
+            body: RefCell::new(None),
         }
     }
 
@@ -183,11 +205,12 @@ impl GuestLazyPollableTest for LazyPollableTest {
                         )
                         .send()
                         .expect("Request failed");
-                    let input_stream = new_response.get_raw_input_stream();
+                    let (input_stream, body) = new_response.get_raw_input_stream();
                     let pollable = input_stream.subscribe();
                     self.lazy_pollable
                         .set(unsafe { std::mem::transmute(pollable) });
                     *response = Some(new_response);
+                    self.body.replace(Some(body));
                     self.input_stream.replace(Some(input_stream));
                 }
 

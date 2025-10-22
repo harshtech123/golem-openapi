@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use tracing::{debug, Instrument};
 
-use golem_common::cache::{BackgroundEvictionMode, Cache, FullCacheEvictionMode, SimpleCache};
-use golem_common::model::{OwnedWorkerId, WorkerId};
-
-use crate::error::GolemError;
 use crate::services::golem_config::MemoryConfig;
 use crate::services::HasAll;
 use crate::worker::Worker;
 use crate::workerctx::WorkerCtx;
+use golem_common::cache::{BackgroundEvictionMode, Cache, FullCacheEvictionMode, SimpleCache};
+use golem_common::model::invocation_context::InvocationContextStack;
+use golem_common::model::{AccountId, OwnedWorkerId, WorkerId};
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 
 /// Holds the metadata and wasmtime structures of currently active Golem workers
 pub struct ActiveWorkers<Ctx: WorkerCtx> {
-    workers: Cache<WorkerId, (), Arc<Worker<Ctx>>, GolemError>,
+    workers: Cache<WorkerId, (), Arc<Worker<Ctx>>, WorkerExecutorError>,
     worker_memory: Arc<Semaphore>,
     priority_allocation_lock: Arc<Mutex<()>>,
     acquire_retry_delay: Duration,
@@ -55,29 +56,37 @@ impl<Ctx: WorkerCtx> ActiveWorkers<Ctx> {
         &self,
         deps: &T,
         owned_worker_id: &OwnedWorkerId,
+        account_id: &AccountId,
         worker_args: Option<Vec<String>>,
         worker_env: Option<Vec<(String, String)>>,
+        worker_wasi_config_vars: Option<BTreeMap<String, String>>,
         component_version: Option<u64>,
         parent: Option<WorkerId>,
-    ) -> Result<Arc<Worker<Ctx>>, GolemError>
+        invocation_context_stack: &InvocationContextStack,
+    ) -> Result<Arc<Worker<Ctx>>, WorkerExecutorError>
     where
         T: HasAll<Ctx> + Clone + Send + Sync + 'static,
     {
         let worker_id = owned_worker_id.worker_id();
 
         let owned_worker_id = owned_worker_id.clone();
+        let account_id = account_id.clone();
         let deps = deps.clone();
+        let invocation_context_stack = invocation_context_stack.clone();
         self.workers
             .get_or_insert_simple(&worker_id, || {
                 Box::pin(async move {
                     Ok(Arc::new(
                         Worker::new(
                             &deps,
+                            &account_id,
                             owned_worker_id,
                             worker_args,
                             worker_env,
+                            worker_wasi_config_vars,
                             component_version,
                             parent,
+                            &invocation_context_stack,
                         )
                         .in_current_span()
                         .await?,
@@ -92,12 +101,12 @@ impl<Ctx: WorkerCtx> ActiveWorkers<Ctx> {
         self.workers.get(&worker_id).await
     }
 
-    pub fn remove(&self, worker_id: &WorkerId) {
-        self.workers.remove(worker_id);
+    pub async fn remove(&self, worker_id: &WorkerId) {
+        self.workers.remove(worker_id).await;
     }
 
-    pub fn snapshot(&self) -> Vec<(WorkerId, Arc<Worker<Ctx>>)> {
-        self.workers.iter().collect::<Vec<_>>()
+    pub async fn snapshot(&self) -> Vec<(WorkerId, Arc<Worker<Ctx>>)> {
+        self.workers.iter().await
     }
 
     pub async fn acquire(&self, memory: u64) -> OwnedSemaphorePermit {
@@ -189,10 +198,10 @@ impl<Ctx: WorkerCtx> ActiveWorkers<Ctx> {
 
             debug!("Collecting possibilities");
             // Collecting the workers which are currently idle but loaded into memory
-            let pairs = self.workers.iter().collect::<Vec<_>>();
+            let pairs = self.workers.iter().await;
             for (worker_id, worker) in pairs {
                 if worker.is_currently_idle_but_running().await {
-                    if let Ok(mem) = worker.memory_requirement() {
+                    if let Ok(mem) = worker.memory_requirement().await {
                         let last_changed = worker.last_execution_state_change();
                         possibilities.push((worker_id, worker, mem, last_changed));
                     }

@@ -12,29 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
-use crate::grpc::authorised_grpc_request;
-use crate::services::golem_config::PluginServiceConfig;
-use crate::{DefaultGolemTypes, GolemTypes};
+use super::golem_config::PluginServiceConfig;
 use async_trait::async_trait;
-use golem_api_grpc::proto::golem::component::v1::component_service_client::ComponentServiceClient;
-use golem_api_grpc::proto::golem::component::v1::plugin_service_client::PluginServiceClient;
-use golem_api_grpc::proto::golem::component::v1::{
-    get_installed_plugins_response, get_plugin_by_id_response, GetInstalledPluginsRequest,
-    GetPluginByIdRequest,
-};
 use golem_common::cache::{BackgroundEvictionMode, Cache, FullCacheEvictionMode, SimpleCache};
-use golem_common::client::{GrpcClient, GrpcClientConfig};
-use golem_common::model::plugin::{
-    DefaultPluginOwner, DefaultPluginScope, PluginDefinition, PluginInstallation,
-};
+use golem_common::model::plugin::{PluginDefinition, PluginInstallation};
+use golem_common::model::PluginId;
 use golem_common::model::{AccountId, ComponentId, ComponentVersion, PluginInstallationId};
-use golem_common::model::{PluginId, RetryConfig};
-use http::Uri;
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 use std::sync::Arc;
-use std::time::Duration;
-use tonic::codec::CompressionEncoding;
-use tonic::transport::Channel;
 use uuid::Uuid;
 
 /// Part of the `Plugins` service for recording observed information as a way to pre-cache
@@ -54,11 +39,11 @@ pub trait PluginsObservations: Send + Sync {
         component_id: &ComponentId,
         component_version: ComponentVersion,
         plugin_installation: &PluginInstallation,
-    ) -> Result<(), GolemError>;
+    ) -> Result<(), WorkerExecutorError>;
 }
 
 #[async_trait]
-pub trait Plugins<T: GolemTypes>: PluginsObservations {
+pub trait Plugins: PluginsObservations {
     /// Gets a plugin installation and the plugin definition it refers to for a given plugin
     /// installation id belonging to a specific component version
     async fn get(
@@ -67,13 +52,7 @@ pub trait Plugins<T: GolemTypes>: PluginsObservations {
         component_id: &ComponentId,
         component_version: ComponentVersion,
         installation_id: &PluginInstallationId,
-    ) -> Result<
-        (
-            PluginInstallation,
-            PluginDefinition<T::PluginOwner, T::PluginScope>,
-        ),
-        GolemError,
-    > {
+    ) -> Result<(PluginInstallation, PluginDefinition), WorkerExecutorError> {
         let plugin_installation = self
             .get_plugin_installation(account_id, component_id, component_version, installation_id)
             .await?;
@@ -94,7 +73,7 @@ pub trait Plugins<T: GolemTypes>: PluginsObservations {
         component_id: &ComponentId,
         component_version: ComponentVersion,
         installation_id: &PluginInstallationId,
-    ) -> Result<PluginInstallation, GolemError>;
+    ) -> Result<PluginInstallation, WorkerExecutorError>;
 
     async fn get_plugin_definition(
         &self,
@@ -102,19 +81,14 @@ pub trait Plugins<T: GolemTypes>: PluginsObservations {
         component_id: &ComponentId,
         component_version: ComponentVersion,
         plugin_installation: &PluginInstallation,
-    ) -> Result<PluginDefinition<T::PluginOwner, T::PluginScope>, GolemError>;
+    ) -> Result<PluginDefinition, WorkerExecutorError>;
 }
 
-pub fn default_configured(
-    config: &PluginServiceConfig,
-) -> (
-    Arc<dyn Plugins<DefaultGolemTypes>>,
-    Arc<dyn PluginsObservations>,
-) {
+pub fn configured(config: &PluginServiceConfig) -> Arc<dyn Plugins> {
     match config {
         PluginServiceConfig::Grpc(config) => {
-            let client1 = CachedPlugins::new(
-                DefaultGrpcPlugins::new(
+            let client = CachedPlugins::new(
+                self::grpc::PluginsGrpc::new(
                     config.uri(),
                     config
                         .access_token
@@ -125,19 +99,14 @@ pub fn default_configured(
                 ),
                 config.plugin_cache_size,
             );
-            let client2 = client1.clone();
-            (Arc::new(client1), Arc::new(client2))
+            Arc::new(client)
         }
-        PluginServiceConfig::Local(_) => {
-            let client1 = PluginsUnavailable;
-            let client2 = client1.clone();
-            (Arc::new(client1), Arc::new(client2))
-        }
+        PluginServiceConfig::Local(_) => Arc::new(PluginsUnavailable),
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub struct CachedPlugins<T: GolemTypes, Inner: Plugins<T>> {
+pub struct CachedPlugins<Inner: Plugins> {
     inner: Inner,
     cached_plugin_installations: Cache<
         (
@@ -148,17 +117,13 @@ pub struct CachedPlugins<T: GolemTypes, Inner: Plugins<T>> {
         ),
         (),
         PluginInstallation,
-        GolemError,
+        WorkerExecutorError,
     >,
-    cached_plugin_definitions: Cache<
-        (AccountId, PluginId),
-        (),
-        PluginDefinition<T::PluginOwner, T::PluginScope>,
-        GolemError,
-    >,
+    cached_plugin_definitions:
+        Cache<(AccountId, PluginId), (), PluginDefinition, WorkerExecutorError>,
 }
 
-impl<T: GolemTypes, Inner: Plugins<T> + Clone> Clone for CachedPlugins<T, Inner> {
+impl<Inner: Plugins + Clone> Clone for CachedPlugins<Inner> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -168,7 +133,7 @@ impl<T: GolemTypes, Inner: Plugins<T> + Clone> Clone for CachedPlugins<T, Inner>
     }
 }
 
-impl<T: GolemTypes, Inner: Plugins<T>> CachedPlugins<T, Inner> {
+impl<Inner: Plugins> CachedPlugins<Inner> {
     pub fn new(inner: Inner, plugin_cache_capacity: usize) -> Self {
         Self {
             inner,
@@ -189,14 +154,14 @@ impl<T: GolemTypes, Inner: Plugins<T>> CachedPlugins<T, Inner> {
 }
 
 #[async_trait]
-impl<T: GolemTypes, Inner: Plugins<T>> PluginsObservations for CachedPlugins<T, Inner> {
+impl<Inner: Plugins> PluginsObservations for CachedPlugins<Inner> {
     async fn observe_plugin_installation(
         &self,
         account_id: &AccountId,
         component_id: &ComponentId,
         component_version: ComponentVersion,
         plugin_installation: &PluginInstallation,
-    ) -> Result<(), GolemError> {
+    ) -> Result<(), WorkerExecutorError> {
         let key = (
             account_id.clone(),
             component_id.clone(),
@@ -213,14 +178,14 @@ impl<T: GolemTypes, Inner: Plugins<T>> PluginsObservations for CachedPlugins<T, 
 }
 
 #[async_trait]
-impl<T: GolemTypes, Inner: Plugins<T> + Clone + 'static> Plugins<T> for CachedPlugins<T, Inner> {
+impl<Inner: Plugins + Clone + 'static> Plugins for CachedPlugins<Inner> {
     async fn get_plugin_installation(
         &self,
         account_id: &AccountId,
         component_id: &ComponentId,
         component_version: ComponentVersion,
         installation_id: &PluginInstallationId,
-    ) -> Result<PluginInstallation, GolemError> {
+    ) -> Result<PluginInstallation, WorkerExecutorError> {
         let key = (
             account_id.clone(),
             component_id.clone(),
@@ -253,7 +218,7 @@ impl<T: GolemTypes, Inner: Plugins<T> + Clone + 'static> Plugins<T> for CachedPl
         component_id: &ComponentId,
         component_version: ComponentVersion,
         plugin_installation: &PluginInstallation,
-    ) -> Result<PluginDefinition<T::PluginOwner, T::PluginScope>, GolemError> {
+    ) -> Result<PluginDefinition, WorkerExecutorError> {
         let key = (account_id.clone(), plugin_installation.plugin_id.clone());
         let inner = self.inner.clone();
         let account_id = account_id.clone();
@@ -277,161 +242,6 @@ impl<T: GolemTypes, Inner: Plugins<T> + Clone + 'static> Plugins<T> for CachedPl
 }
 
 #[derive(Clone)]
-struct DefaultGrpcPlugins {
-    plugins_client: GrpcClient<PluginServiceClient<Channel>>,
-    components_client: GrpcClient<ComponentServiceClient<Channel>>,
-    access_token: Uuid,
-}
-
-impl DefaultGrpcPlugins {
-    pub fn new(
-        endpoint: Uri,
-        access_token: Uuid,
-        retry_config: RetryConfig,
-        connect_timeout: Duration,
-    ) -> Self {
-        Self {
-            plugins_client: GrpcClient::new(
-                "plugins_service",
-                move |channel| {
-                    PluginServiceClient::new(channel)
-                        .send_compressed(CompressionEncoding::Gzip)
-                        .accept_compressed(CompressionEncoding::Gzip)
-                },
-                endpoint.clone(),
-                GrpcClientConfig {
-                    retries_on_unavailable: retry_config.clone(),
-                    connect_timeout,
-                },
-            ),
-            components_client: GrpcClient::new(
-                "component_service",
-                move |channel| {
-                    ComponentServiceClient::new(channel)
-                        .send_compressed(CompressionEncoding::Gzip)
-                        .accept_compressed(CompressionEncoding::Gzip)
-                },
-                endpoint,
-                GrpcClientConfig {
-                    retries_on_unavailable: retry_config.clone(),
-                    ..Default::default()
-                },
-            ),
-            access_token,
-        }
-    }
-}
-
-#[async_trait]
-impl PluginsObservations for DefaultGrpcPlugins {
-    async fn observe_plugin_installation(
-        &self,
-        _account_id: &AccountId,
-        _component_id: &ComponentId,
-        _component_version: ComponentVersion,
-        _plugin_installation: &PluginInstallation,
-    ) -> Result<(), GolemError> {
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Plugins<DefaultGolemTypes> for DefaultGrpcPlugins {
-    async fn get_plugin_installation(
-        &self,
-        account_id: &AccountId,
-        component_id: &ComponentId,
-        component_version: ComponentVersion,
-        installation_id: &PluginInstallationId,
-    ) -> Result<PluginInstallation, GolemError> {
-        let response = self
-            .components_client
-            .call("get_installed_plugins", move |client| {
-                let request = authorised_grpc_request(
-                    GetInstalledPluginsRequest {
-                        component_id: Some(component_id.clone().into()),
-                        version: Some(component_version),
-                    },
-                    &self.access_token,
-                );
-                Box::pin(client.get_installed_plugins(request))
-            })
-            .await
-            .map_err(|err| {
-                GolemError::runtime(format!("Failed to get installed plugins: {err:?}"))
-            })?
-            .into_inner();
-        let installations: Vec<PluginInstallation> = match response.result {
-            None => Err(GolemError::runtime("Empty response"))?,
-            Some(get_installed_plugins_response::Result::Success(response)) => response
-                .installations
-                .into_iter()
-                .map(|i| i.try_into())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(GolemError::runtime)?,
-            Some(get_installed_plugins_response::Result::Error(error)) => {
-                Err(GolemError::runtime(format!("{error:?}")))?
-            }
-        };
-
-        let mut result = None;
-        for installation in installations {
-            self.observe_plugin_installation(
-                account_id,
-                component_id,
-                component_version,
-                &installation,
-            )
-            .await?;
-
-            if installation.id == *installation_id {
-                result = Some(installation);
-            }
-        }
-
-        result.ok_or(GolemError::runtime("Plugin installation not found"))
-    }
-
-    async fn get_plugin_definition(
-        &self,
-        _account_id: &AccountId,
-        _component_id: &ComponentId,
-        _component_version: ComponentVersion,
-        plugin_installation: &PluginInstallation,
-    ) -> Result<PluginDefinition<DefaultPluginOwner, DefaultPluginScope>, GolemError> {
-        let response = self
-            .plugins_client
-            .call("get_plugin_by_id", move |client| {
-                let request = authorised_grpc_request(
-                    GetPluginByIdRequest {
-                        id: Some(plugin_installation.plugin_id.clone().into()),
-                    },
-                    &self.access_token,
-                );
-                Box::pin(client.get_plugin_by_id(request))
-            })
-            .await
-            .map_err(|err| {
-                GolemError::runtime(format!("Failed to get plugin definition: {err:?}"))
-            })?
-            .into_inner();
-
-        match response.result {
-            None => Err(GolemError::runtime("Empty response"))?,
-            Some(get_plugin_by_id_response::Result::Success(response)) => Ok(response
-                .plugin
-                .ok_or("Missing plugin field")
-                .map_err(GolemError::runtime)?
-                .try_into()
-                .map_err(GolemError::runtime)?),
-            Some(get_plugin_by_id_response::Result::Error(error)) => {
-                Err(GolemError::runtime(format!("{error:?}")))?
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
 pub struct PluginsUnavailable;
 
 #[async_trait]
@@ -442,21 +252,21 @@ impl PluginsObservations for PluginsUnavailable {
         _component_id: &ComponentId,
         _component_version: ComponentVersion,
         _plugin_installation: &PluginInstallation,
-    ) -> Result<(), GolemError> {
+    ) -> Result<(), WorkerExecutorError> {
         Ok(())
     }
 }
 
 #[async_trait]
-impl<T: GolemTypes> Plugins<T> for PluginsUnavailable {
+impl Plugins for PluginsUnavailable {
     async fn get_plugin_installation(
         &self,
         _account_id: &AccountId,
         _component_id: &ComponentId,
         _component_version: ComponentVersion,
         _installation_id: &PluginInstallationId,
-    ) -> Result<PluginInstallation, GolemError> {
-        Err(GolemError::runtime("Not available"))
+    ) -> Result<PluginInstallation, WorkerExecutorError> {
+        Err(WorkerExecutorError::runtime("Not available"))
     }
 
     async fn get_plugin_definition(
@@ -465,7 +275,213 @@ impl<T: GolemTypes> Plugins<T> for PluginsUnavailable {
         _component_id: &ComponentId,
         _component_version: ComponentVersion,
         _plugin_installation: &PluginInstallation,
-    ) -> Result<PluginDefinition<T::PluginOwner, T::PluginScope>, GolemError> {
-        Err(GolemError::runtime("Not available"))
+    ) -> Result<PluginDefinition, WorkerExecutorError> {
+        Err(WorkerExecutorError::runtime("Not available"))
+    }
+}
+
+mod grpc {
+    use crate::grpc::authorised_grpc_request;
+    use crate::services::plugins::{Plugins, PluginsObservations};
+    use applying::Apply;
+    use async_trait::async_trait;
+    use golem_api_grpc::proto::golem::component::v1::component_service_client::ComponentServiceClient;
+    use golem_api_grpc::proto::golem::component::v1::plugin_service_client::PluginServiceClient;
+    use golem_api_grpc::proto::golem::component::v1::{
+        get_installed_plugins_response, GetInstalledPluginsRequest,
+    };
+    use golem_api_grpc::proto::golem::component::v1::{
+        get_plugin_by_id_response, GetPluginByIdRequest,
+    };
+    use golem_common::client::{GrpcClient, GrpcClientConfig};
+    use golem_common::model::plugin::PluginOwner;
+    use golem_common::model::plugin::{PluginDefinition, PluginInstallation};
+    use golem_common::model::RetryConfig;
+    use golem_common::model::{AccountId, ComponentId, ComponentVersion, PluginInstallationId};
+    use golem_service_base::error::worker_executor::WorkerExecutorError;
+    use http::Uri;
+    use std::time::Duration;
+    use tonic::codec::CompressionEncoding;
+    use tonic::transport::Channel;
+    use uuid::Uuid;
+
+    #[derive(Clone)]
+    pub struct PluginsGrpc {
+        plugins_client: GrpcClient<PluginServiceClient<Channel>>,
+        components_client: GrpcClient<ComponentServiceClient<Channel>>,
+        access_token: Uuid,
+    }
+
+    impl PluginsGrpc {
+        pub fn new(
+            endpoint: Uri,
+            access_token: Uuid,
+            retry_config: RetryConfig,
+            connect_timeout: Duration,
+        ) -> Self {
+            Self {
+                plugins_client: GrpcClient::new(
+                    "plugins_service",
+                    move |channel| {
+                        PluginServiceClient::new(channel)
+                            .send_compressed(CompressionEncoding::Gzip)
+                            .accept_compressed(CompressionEncoding::Gzip)
+                    },
+                    endpoint.clone(),
+                    GrpcClientConfig {
+                        retries_on_unavailable: retry_config.clone(),
+                        connect_timeout,
+                    },
+                ),
+                components_client: GrpcClient::new(
+                    "component_service",
+                    move |channel| {
+                        ComponentServiceClient::new(channel)
+                            .send_compressed(CompressionEncoding::Gzip)
+                            .accept_compressed(CompressionEncoding::Gzip)
+                    },
+                    endpoint,
+                    GrpcClientConfig {
+                        retries_on_unavailable: retry_config.clone(),
+                        ..Default::default()
+                    },
+                ),
+                access_token,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PluginsObservations for PluginsGrpc {
+        async fn observe_plugin_installation(
+            &self,
+            _account_id: &AccountId,
+            _component_id: &ComponentId,
+            _component_version: ComponentVersion,
+            _plugin_installation: &PluginInstallation,
+        ) -> Result<(), WorkerExecutorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Plugins for PluginsGrpc {
+        async fn get_plugin_installation(
+            &self,
+            account_id: &AccountId,
+            component_id: &ComponentId,
+            component_version: ComponentVersion,
+            installation_id: &PluginInstallationId,
+        ) -> Result<PluginInstallation, WorkerExecutorError> {
+            let response = self
+                .components_client
+                .call("get_installed_plugins", move |client| {
+                    let request = authorised_grpc_request(
+                        GetInstalledPluginsRequest {
+                            component_id: Some(component_id.clone().into()),
+                            version: Some(component_version),
+                        },
+                        &self.access_token,
+                    );
+                    Box::pin(client.get_installed_plugins(request))
+                })
+                .await
+                .map_err(|err| {
+                    WorkerExecutorError::runtime(format!(
+                        "Failed to get installed plugins: {err:?}"
+                    ))
+                })?
+                .into_inner();
+            let installations: Vec<PluginInstallation> = match response.result {
+                None => Err(WorkerExecutorError::runtime("Empty response"))?,
+                Some(get_installed_plugins_response::Result::Success(response)) => response
+                    .installations
+                    .into_iter()
+                    .map(|i| i.try_into())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(WorkerExecutorError::runtime)?,
+                Some(get_installed_plugins_response::Result::Error(error)) => {
+                    Err(WorkerExecutorError::runtime(format!("{error:?}")))?
+                }
+            };
+
+            let mut result = None;
+            for installation in installations {
+                self.observe_plugin_installation(
+                    account_id,
+                    component_id,
+                    component_version,
+                    &installation,
+                )
+                .await?;
+
+                if installation.id == *installation_id {
+                    result = Some(installation);
+                }
+            }
+
+            result.ok_or(WorkerExecutorError::runtime(
+                "Plugin installation not found",
+            ))
+        }
+
+        async fn get_plugin_definition(
+            &self,
+            _account_id: &AccountId,
+            _component_id: &ComponentId,
+            _component_version: ComponentVersion,
+            plugin_installation: &PluginInstallation,
+        ) -> Result<PluginDefinition, WorkerExecutorError> {
+            let response = self
+                .plugins_client
+                .call("get_plugin_by_id", move |client| {
+                    let request = authorised_grpc_request(
+                        GetPluginByIdRequest {
+                            id: Some(plugin_installation.plugin_id.clone().into()),
+                        },
+                        &self.access_token,
+                    );
+                    Box::pin(client.get_plugin_by_id(request))
+                })
+                .await
+                .map_err(|err| {
+                    WorkerExecutorError::runtime(format!(
+                        "Failed to get plugin definition: {err:?}"
+                    ))
+                })?
+                .into_inner();
+
+            match response.result {
+                None => Err(WorkerExecutorError::runtime("Empty response"))?,
+                Some(get_plugin_by_id_response::Result::Success(response)) => Ok(response
+                    .plugin
+                    .ok_or("Missing plugin field")
+                    .map_err(WorkerExecutorError::runtime)?
+                    .apply(convert_grpc_plugin_definition)
+                    .map_err(WorkerExecutorError::runtime)?),
+                Some(get_plugin_by_id_response::Result::Error(error)) => {
+                    Err(WorkerExecutorError::runtime(format!("{error:?}")))?
+                }
+            }
+        }
+    }
+
+    fn convert_grpc_plugin_definition(
+        value: golem_api_grpc::proto::golem::component::PluginDefinition,
+    ) -> Result<PluginDefinition, String> {
+        let account_id: AccountId = value.account_id.ok_or("Missing account id")?.into();
+
+        Ok(PluginDefinition {
+            id: value.id.ok_or("Missing plugin id")?.try_into()?,
+            name: value.name,
+            version: value.version,
+            description: value.description,
+            icon: value.icon,
+            homepage: value.homepage,
+            specs: value.specs.ok_or("Missing plugin specs")?.try_into()?,
+            scope: value.scope.ok_or("Missing plugin scope")?.try_into()?,
+            owner: PluginOwner { account_id },
+            deleted: value.deleted,
+        })
     }
 }

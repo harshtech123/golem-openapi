@@ -12,67 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use shadow_rs::shadow;
 use std::convert::Infallible;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
-#[cfg(feature = "base-model")]
 pub mod base_model;
-
-#[cfg(feature = "tokio")]
 pub mod cache;
-
-#[cfg(feature = "protobuf")]
 pub mod client;
-
-#[cfg(feature = "config")]
 pub mod config;
-
-pub mod golem_version;
-
-#[cfg(feature = "protobuf")]
 pub mod grpc;
-
-#[cfg(feature = "poem")]
 pub mod json_yaml;
-
-#[cfg(feature = "observability")]
 pub mod metrics;
-
-#[cfg(feature = "model")]
 pub mod model;
-
-#[cfg(any(feature = "model", feature = "base-model"))]
 pub mod newtype;
-
-#[cfg(feature = "redis")]
+pub mod one_shot;
+pub mod read_only_lock;
 pub mod redis;
-
-#[cfg(feature = "sql")]
 pub mod repo;
-
-#[cfg(feature = "model")]
 pub mod retriable_error;
-
-#[cfg(feature = "tokio")]
 pub mod retries;
-
-#[cfg(feature = "serialization")]
 pub mod serialization;
-
-#[cfg(feature = "observability")]
 pub mod tracing;
-
 pub mod virtual_exports;
-
-pub mod testing;
 
 #[cfg(test)]
 test_r::enable!();
 
+shadow!(build);
+
+pub fn golem_version() -> &'static str {
+    if build::PKG_VERSION != "0.0.0" {
+        build::PKG_VERSION
+    } else {
+        build::GIT_DESCRIBE_TAGS
+            .strip_prefix("golem-rust-v")
+            .unwrap_or(build::GIT_DESCRIBE_TAGS)
+    }
+}
+
 /// Trait to convert a value to a string which is safe to return through a public API.
 pub trait SafeDisplay {
     fn to_safe_string(&self) -> String;
+
+    fn to_safe_string_indented(&self) -> String {
+        let result = self.to_safe_string();
+        result
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 pub struct SafeString(String);
@@ -95,4 +85,10 @@ pub fn safe(value: String) -> impl SafeDisplay {
 
 pub fn widen_infallible<T>(_inf: Infallible) -> T {
     panic!("impossible")
+}
+
+impl SafeDisplay for () {
+    fn to_safe_string(&self) -> String {
+        "".to_string()
+    }
 }

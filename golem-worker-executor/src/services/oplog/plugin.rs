@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
 use crate::model::public_oplog::PublicOplogEntryOps;
 use crate::model::ExecutionStatus;
 use crate::services::component::ComponentService;
 use crate::services::oplog::{CommitLevel, OpenOplogs, Oplog, OplogConstructor, OplogService};
 use crate::services::plugins::Plugins;
+use crate::services::projects::ProjectService;
 use crate::services::shard::ShardService;
 use crate::services::worker_activator::WorkerActivator;
 use crate::services::{
     HasComponentService, HasOplogProcessorPlugin, HasPlugins, HasShardService, HasWorkerActivator,
 };
 use crate::workerctx::WorkerCtx;
-use crate::GolemTypes;
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use async_mutex::Mutex;
 use async_trait::async_trait;
@@ -37,17 +36,20 @@ use golem_common::model::plugin::{
 use golem_common::model::public_oplog::PublicOplogEntry;
 use golem_common::model::{
     AccountId, ComponentId, ComponentVersion, IdempotencyKey, OwnedWorkerId, PluginInstallationId,
-    ScanCursor, ShardId, TargetWorkerId, WorkerId, WorkerMetadata,
+    ProjectId, ScanCursor, ShardId, WorkerId, WorkerMetadata, WorkerStatusRecord,
 };
-use golem_wasm_rpc::{IntoValue, Value};
+use golem_common::read_only_lock;
+use golem_service_base::error::worker_executor::WorkerExecutorError;
+use golem_wasm::{IntoValue, Value};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::Instrument;
+use uuid::Uuid;
 
 #[async_trait]
 pub trait OplogProcessorPlugin: Send + Sync {
@@ -57,9 +59,9 @@ pub trait OplogProcessorPlugin: Send + Sync {
         plugin_installation_id: &PluginInstallationId,
         initial_oplog_index: OplogIndex,
         entries: Vec<PublicOplogEntry>,
-    ) -> Result<(), GolemError>;
+    ) -> Result<(), WorkerExecutorError>;
 
-    async fn on_shard_assignment_changed(&self) -> Result<(), GolemError>;
+    async fn on_shard_assignment_changed(&self) -> Result<(), WorkerExecutorError>;
 }
 
 /// An implementation of the `OplogProcessorPlugin` trait that runs a single instance of each
@@ -67,16 +69,18 @@ pub trait OplogProcessorPlugin: Send + Sync {
 pub struct PerExecutorOplogProcessorPlugin<Ctx: WorkerCtx> {
     workers: Arc<RwLock<HashMap<WorkerKey, RunningPlugin>>>,
 
-    component_service: Arc<dyn ComponentService<Ctx::Types>>,
+    component_service: Arc<dyn ComponentService>,
     shard_service: Arc<dyn ShardService>,
     worker_activator: Arc<dyn WorkerActivator<Ctx>>,
-    plugins: Arc<dyn Plugins<Ctx::Types>>,
+    plugins: Arc<dyn Plugins>,
+    project_service: Arc<dyn ProjectService>,
 }
 
-type WorkerKey = (AccountId, String, String);
+type WorkerKey = (ProjectId, String, String);
 
 #[derive(Debug, Clone)]
 struct RunningPlugin {
+    pub account_id: AccountId,
     pub owned_worker_id: OwnedWorkerId,
     pub configuration: HashMap<String, String>,
     pub component_version: ComponentVersion,
@@ -84,10 +88,11 @@ struct RunningPlugin {
 
 impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
     pub fn new(
-        component_service: Arc<dyn ComponentService<Ctx::Types>>,
+        component_service: Arc<dyn ComponentService>,
         shard_service: Arc<dyn ShardService>,
         worker_activator: Arc<dyn WorkerActivator<Ctx>>,
-        plugins: Arc<dyn Plugins<Ctx::Types>>,
+        plugins: Arc<dyn Plugins>,
+        project_service: Arc<dyn ProjectService>,
     ) -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -95,20 +100,22 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
             shard_service,
             worker_activator,
             plugins,
+            project_service,
         }
     }
 
     async fn resolve_plugin_worker(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         component_id: &ComponentId,
         component_version: ComponentVersion,
         plugin_installation_id: &PluginInstallationId,
-    ) -> Result<RunningPlugin, GolemError> {
+    ) -> Result<RunningPlugin, WorkerExecutorError> {
+        let project_owner = self.project_service.get_project_owner(project_id).await?;
         let (installation, definition) = self
             .plugins
             .get(
-                account_id,
+                &project_owner,
                 component_id,
                 component_version,
                 plugin_installation_id,
@@ -117,7 +124,7 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
 
         let workers = self.workers.upgradable_read().await;
         let key = (
-            account_id.clone(),
+            project_id.clone(),
             definition.name.to_string(),
             definition.version.to_string(),
         );
@@ -132,10 +139,11 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
                             Self::get_oplog_processor_component_id(&definition)?;
                         let worker_id = self.generate_worker_id_for(&plugin_component_id).await?;
                         let owned_worker_id = OwnedWorkerId {
-                            account_id: account_id.clone(),
+                            project_id: project_id.clone(),
                             worker_id: worker_id.clone(),
                         };
                         let running_plugin = RunningPlugin {
+                            account_id: project_owner,
                             owned_worker_id: owned_worker_id.clone(),
                             configuration: installation.parameters.clone(),
                             component_version: plugin_component_version,
@@ -151,14 +159,10 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
     async fn generate_worker_id_for(
         &self,
         plugin_component_id: &ComponentId,
-    ) -> Result<WorkerId, GolemError> {
-        let target_worker_id = TargetWorkerId {
-            component_id: plugin_component_id.clone(),
-            worker_name: None,
-        };
-
+    ) -> Result<WorkerId, WorkerExecutorError> {
         let current_assignment = self.shard_service.current_assignment()?;
-        let worker_id = target_worker_id.into_worker_id(
+        let worker_id = Self::generate_local_worker_id(
+            plugin_component_id.clone(),
             &current_assignment.shard_ids,
             current_assignment.number_of_shards,
         );
@@ -167,17 +171,50 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
     }
 
     fn get_oplog_processor_component_id(
-        definition: &PluginDefinition<
-            <Ctx::Types as GolemTypes>::PluginOwner,
-            <Ctx::Types as GolemTypes>::PluginScope,
-        >,
-    ) -> Result<(ComponentId, ComponentVersion), GolemError> {
+        definition: &PluginDefinition,
+    ) -> Result<(ComponentId, ComponentVersion), WorkerExecutorError> {
         match &definition.specs {
             PluginTypeSpecificDefinition::OplogProcessor(OplogProcessorDefinition {
                 component_id,
                 component_version,
             }) => Ok((component_id.clone(), *component_version)),
-            _ => Err(GolemError::runtime("Plugin is not an oplog processor")),
+            _ => Err(WorkerExecutorError::runtime(
+                "Plugin is not an oplog processor",
+            )),
+        }
+    }
+
+    /// Converts a `TargetWorkerId` to a `WorkerId`. If the worker name was not specified,
+    /// it generates a new unique one, and if the `force_in_shard` set is not empty, it guarantees
+    /// that the generated worker ID will belong to one of the provided shards.
+    ///
+    /// If the worker name was specified, `force_in_shard` is ignored.
+    fn generate_local_worker_id(
+        component_id: ComponentId,
+        force_in_shard: &HashSet<ShardId>,
+        number_of_shards: usize,
+    ) -> WorkerId {
+        if force_in_shard.is_empty() || number_of_shards == 0 {
+            let worker_name = Uuid::new_v4().to_string();
+            WorkerId {
+                component_id,
+                worker_name,
+            }
+        } else {
+            let mut current = Uuid::new_v4().to_u128_le();
+            loop {
+                let uuid = Uuid::from_u128_le(current);
+                let worker_name = uuid.to_string();
+                let worker_id = WorkerId {
+                    component_id: component_id.clone(),
+                    worker_name,
+                };
+                let shard_id = ShardId::from_worker_id(&worker_id, number_of_shards);
+                if force_in_shard.contains(&shard_id) {
+                    return worker_id;
+                }
+                current += 1;
+            }
         }
     }
 }
@@ -190,10 +227,10 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         plugin_installation_id: &PluginInstallationId,
         initial_oplog_index: OplogIndex,
         entries: Vec<PublicOplogEntry>,
-    ) -> Result<(), GolemError> {
+    ) -> Result<(), WorkerExecutorError> {
         let running_plugin = self
             .resolve_plugin_worker(
-                &worker_metadata.account_id,
+                &worker_metadata.project_id,
                 &worker_metadata.worker_id.component_id,
                 worker_metadata.last_known_status.component_version,
                 plugin_installation_id,
@@ -203,35 +240,30 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         let worker = self
             .worker_activator
             .get_or_create_running(
+                &running_plugin.account_id,
                 &running_plugin.owned_worker_id,
+                None,
                 None,
                 None,
                 Some(running_plugin.component_version),
                 None,
+                &InvocationContextStack::fresh(),
             )
             .await?;
 
         let idempotency_key = IdempotencyKey::fresh();
 
-        let (component_id_hi, component_id_lo) =
-            worker_metadata.worker_id.component_id.0.as_u64_pair();
-        let wave_account_info = format!(
-            "{{ account-id: {{ value: \"{}\" }} }}",
-            worker_metadata.account_id.value
-        );
-        let wave_component_id = format!(
-            "{{ uuid: {{ high-bits: {}, low-bits: {} }} }}",
-            component_id_hi, component_id_lo
-        );
-        let mut wave_config = "[".to_string();
-        for (idx, (key, value)) in running_plugin.configuration.iter().enumerate() {
-            wave_config.push_str(&format!("( \"{}\", \"{}\")", key, value));
-            if idx != running_plugin.configuration.len() - 1 {
-                wave_config.push_str(", ");
-            }
+        let val_account_info = Value::Record(vec![worker_metadata.created_by.clone().into_value()]);
+        let val_component_id = worker_metadata.worker_id.component_id.clone().into_value();
+        let mut config_pairs = Vec::new();
+        for (key, value) in running_plugin.configuration.iter() {
+            config_pairs.push(Value::Tuple(vec![
+                key.clone().into_value(),
+                value.clone().into_value(),
+            ]));
         }
-        wave_config.push(']');
-        let function_name = format!("golem:api/oplog-processor@1.1.7.{{processor({wave_account_info}, {wave_component_id}, {wave_config}).process}}");
+        let val_config = Value::List(config_pairs);
+        let function_name = "golem:api/oplog-processor@1.1.7.{process}".to_string();
 
         let val_worker_id = worker_metadata.worker_id.clone().into_value();
         let val_metadata = worker_metadata.into_value();
@@ -244,6 +276,9 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         );
 
         let function_input = vec![
+            val_account_info,
+            val_config,
+            val_component_id,
             val_worker_id,
             val_metadata,
             val_first_entry_index,
@@ -262,7 +297,7 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         Ok(())
     }
 
-    async fn on_shard_assignment_changed(&self) -> Result<(), GolemError> {
+    async fn on_shard_assignment_changed(&self) -> Result<(), WorkerExecutorError> {
         let new_assignment = self.shard_service.current_assignment()?;
 
         let mut workers = self.workers.write().await;
@@ -300,12 +335,13 @@ impl<Ctx: WorkerCtx> Clone for PerExecutorOplogProcessorPlugin<Ctx> {
             shard_service: self.shard_service.clone(),
             worker_activator: self.worker_activator.clone(),
             plugins: self.plugins.clone(),
+            project_service: self.project_service.clone(),
         }
     }
 }
 
-impl<Ctx: WorkerCtx> HasComponentService<Ctx::Types> for PerExecutorOplogProcessorPlugin<Ctx> {
-    fn component_service(&self) -> Arc<dyn ComponentService<Ctx::Types>> {
+impl<Ctx: WorkerCtx> HasComponentService for PerExecutorOplogProcessorPlugin<Ctx> {
+    fn component_service(&self) -> Arc<dyn ComponentService> {
         self.component_service.clone()
     }
 }
@@ -322,8 +358,8 @@ impl<Ctx: WorkerCtx> HasWorkerActivator<Ctx> for PerExecutorOplogProcessorPlugin
     }
 }
 
-impl<Ctx: WorkerCtx> HasPlugins<Ctx::Types> for PerExecutorOplogProcessorPlugin<Ctx> {
-    fn plugins(&self) -> Arc<dyn Plugins<Ctx::Types>> {
+impl<Ctx: WorkerCtx> HasPlugins for PerExecutorOplogProcessorPlugin<Ctx> {
+    fn plugins(&self) -> Arc<dyn Plugins> {
         self.plugins.clone()
     }
 }
@@ -334,47 +370,34 @@ impl<Ctx: WorkerCtx> HasOplogProcessorPlugin for PerExecutorOplogProcessorPlugin
     }
 }
 
-struct CreateOplogConstructor<T: GolemTypes> {
+#[derive(Clone)]
+struct CreateOplogConstructor {
     owned_worker_id: OwnedWorkerId,
     initial_entry: Option<OplogEntry>,
     inner: Arc<dyn OplogService>,
     last_oplog_index: OplogIndex,
     oplog_plugins: Arc<dyn OplogProcessorPlugin>,
-    components: Arc<dyn ComponentService<T>>,
-    plugins: Arc<dyn Plugins<T>>,
-    execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
+    components: Arc<dyn ComponentService>,
+    plugins: Arc<dyn Plugins>,
     initial_worker_metadata: WorkerMetadata,
+    last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
+    execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
+    project_service: Arc<dyn ProjectService>,
 }
 
-// We can have clone here independently of whether T is clone due to the Arcs, so deriving
-// does the wrong thing here
-impl<T: GolemTypes> Clone for CreateOplogConstructor<T> {
-    fn clone(&self) -> Self {
-        Self {
-            owned_worker_id: self.owned_worker_id.clone(),
-            initial_entry: self.initial_entry.clone(),
-            inner: self.inner.clone(),
-            last_oplog_index: self.last_oplog_index,
-            oplog_plugins: self.oplog_plugins.clone(),
-            components: self.components.clone(),
-            plugins: self.plugins.clone(),
-            execution_status: self.execution_status.clone(),
-            initial_worker_metadata: self.initial_worker_metadata.clone(),
-        }
-    }
-}
-
-impl<T: GolemTypes> CreateOplogConstructor<T> {
+impl CreateOplogConstructor {
     pub fn new(
         owned_worker_id: OwnedWorkerId,
         initial_entry: Option<OplogEntry>,
         inner: Arc<dyn OplogService>,
         last_oplog_index: OplogIndex,
         oplog_plugins: Arc<dyn OplogProcessorPlugin>,
-        components: Arc<dyn ComponentService<T>>,
-        plugins: Arc<dyn Plugins<T>>,
-        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
+        components: Arc<dyn ComponentService>,
+        plugins: Arc<dyn Plugins>,
         initial_worker_metadata: WorkerMetadata,
+        last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
+        execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
+        project_service: Arc<dyn ProjectService>,
     ) -> Self {
         Self {
             owned_worker_id,
@@ -384,14 +407,16 @@ impl<T: GolemTypes> CreateOplogConstructor<T> {
             oplog_plugins,
             components,
             plugins,
-            execution_status,
             initial_worker_metadata,
+            last_known_status,
+            execution_status,
+            project_service,
         }
     }
 }
 
 #[async_trait]
-impl<T: GolemTypes> OplogConstructor for CreateOplogConstructor<T> {
+impl OplogConstructor for CreateOplogConstructor {
     async fn create_oplog(self, close: Box<dyn FnOnce() + Send + Sync>) -> Arc<dyn Oplog> {
         let inner = if let Some(initial_entry) = self.initial_entry {
             self.inner
@@ -399,6 +424,7 @@ impl<T: GolemTypes> OplogConstructor for CreateOplogConstructor<T> {
                     &self.owned_worker_id,
                     initial_entry,
                     self.initial_worker_metadata.clone(),
+                    self.last_known_status.clone(),
                     self.execution_status.clone(),
                 )
                 .await
@@ -408,6 +434,7 @@ impl<T: GolemTypes> OplogConstructor for CreateOplogConstructor<T> {
                     &self.owned_worker_id,
                     self.last_oplog_index,
                     self.initial_worker_metadata.clone(),
+                    self.last_known_status.clone(),
                     self.execution_status.clone(),
                 )
                 .await
@@ -419,29 +446,32 @@ impl<T: GolemTypes> OplogConstructor for CreateOplogConstructor<T> {
             self.inner,
             self.components,
             self.plugins,
-            self.execution_status,
+            self.project_service,
             self.initial_worker_metadata,
+            self.last_known_status,
             self.last_oplog_index,
             close,
         ))
     }
 }
 
-pub struct ForwardingOplogService<T: GolemTypes> {
+pub struct ForwardingOplogService {
     pub inner: Arc<dyn OplogService>,
     oplogs: OpenOplogs,
 
     oplog_plugins: Arc<dyn OplogProcessorPlugin>,
-    components: Arc<dyn ComponentService<T>>,
-    plugins: Arc<dyn Plugins<T> + Send + Sync>,
+    components: Arc<dyn ComponentService>,
+    plugins: Arc<dyn Plugins>,
+    project_service: Arc<dyn ProjectService>,
 }
 
-impl<T: GolemTypes> ForwardingOplogService<T> {
+impl ForwardingOplogService {
     pub fn new(
         inner: Arc<dyn OplogService>,
         oplog_plugins: Arc<dyn OplogProcessorPlugin>,
-        components: Arc<dyn ComponentService<T>>,
-        plugins: Arc<dyn Plugins<T>>,
+        components: Arc<dyn ComponentService>,
+        plugins: Arc<dyn Plugins>,
+        project_service: Arc<dyn ProjectService>,
     ) -> Self {
         Self {
             inner,
@@ -449,24 +479,26 @@ impl<T: GolemTypes> ForwardingOplogService<T> {
             oplog_plugins,
             components,
             plugins,
+            project_service,
         }
     }
 }
 
-impl<T: GolemTypes> Debug for ForwardingOplogService<T> {
+impl Debug for ForwardingOplogService {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForwardingOplogService").finish()
     }
 }
 
 #[async_trait]
-impl<T: GolemTypes> OplogService for ForwardingOplogService<T> {
+impl OplogService for ForwardingOplogService {
     async fn create(
         &self,
         owned_worker_id: &OwnedWorkerId,
         initial_entry: OplogEntry,
         initial_worker_metadata: WorkerMetadata,
-        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
+        last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
+        execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
     ) -> Arc<dyn Oplog + 'static> {
         self.oplogs
             .get_or_open(
@@ -479,8 +511,10 @@ impl<T: GolemTypes> OplogService for ForwardingOplogService<T> {
                     self.oplog_plugins.clone(),
                     self.components.clone(),
                     self.plugins.clone(),
-                    execution_status,
                     initial_worker_metadata,
+                    last_known_status,
+                    execution_status,
+                    self.project_service.clone(),
                 ),
             )
             .await
@@ -491,7 +525,8 @@ impl<T: GolemTypes> OplogService for ForwardingOplogService<T> {
         owned_worker_id: &OwnedWorkerId,
         last_oplog_index: OplogIndex,
         initial_worker_metadata: WorkerMetadata,
-        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
+        last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
+        execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
     ) -> Arc<dyn Oplog + 'static> {
         self.oplogs
             .get_or_open(
@@ -504,8 +539,10 @@ impl<T: GolemTypes> OplogService for ForwardingOplogService<T> {
                     self.oplog_plugins.clone(),
                     self.components.clone(),
                     self.plugins.clone(),
-                    execution_status,
                     initial_worker_metadata,
+                    last_known_status,
+                    execution_status,
+                    self.project_service.clone(),
                 ),
             )
             .await
@@ -534,11 +571,11 @@ impl<T: GolemTypes> OplogService for ForwardingOplogService<T> {
 
     async fn scan_for_component(
         &self,
-        account_id: &AccountId,
+        account_id: &ProjectId,
         component_id: &ComponentId,
         cursor: ScanCursor,
         count: u64,
-    ) -> Result<(ScanCursor, Vec<OwnedWorkerId>), GolemError> {
+    ) -> Result<(ScanCursor, Vec<OwnedWorkerId>), WorkerExecutorError> {
         self.inner
             .scan_for_component(account_id, component_id, cursor, count)
             .await
@@ -562,24 +599,25 @@ impl<T: GolemTypes> OplogService for ForwardingOplogService<T> {
 }
 
 /// A wrapper for `Oplog` that periodically sends buffered oplog entries to oplog processor plugins
-pub struct ForwardingOplog<T: GolemTypes> {
+pub struct ForwardingOplog {
     inner: Arc<dyn Oplog>,
-    state: Arc<Mutex<ForwardingOplogState<T>>>,
+    state: Arc<Mutex<ForwardingOplogState>>,
     timer: Option<JoinHandle<()>>,
     close_fn: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
-impl<T: GolemTypes> ForwardingOplog<T> {
+impl ForwardingOplog {
     const MAX_COMMIT_COUNT: usize = 3;
 
     pub fn new(
         inner: Arc<dyn Oplog>,
         oplog_plugins: Arc<dyn OplogProcessorPlugin>,
         oplog_service: Arc<dyn OplogService>,
-        components: Arc<dyn ComponentService<T>>,
-        plugins: Arc<dyn Plugins<T>>,
-        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
+        components: Arc<dyn ComponentService>,
+        plugins: Arc<dyn Plugins>,
+        project_service: Arc<dyn ProjectService>,
         initial_worker_metadata: WorkerMetadata,
+        last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
         last_oplog_idx: OplogIndex,
         close_fn: Box<dyn FnOnce() + Send + Sync>,
     ) -> Self {
@@ -588,12 +626,13 @@ impl<T: GolemTypes> ForwardingOplog<T> {
             commit_count: 0,
             last_send: Instant::now(),
             oplog_plugins,
-            execution_status,
             initial_worker_metadata,
+            last_known_status,
             last_oplog_idx,
             oplog_service,
             components,
             plugins,
+            project_service,
         }));
 
         let timer = tokio::spawn({
@@ -619,13 +658,13 @@ impl<T: GolemTypes> ForwardingOplog<T> {
     }
 }
 
-impl<T: GolemTypes> Debug for ForwardingOplog<T> {
+impl Debug for ForwardingOplog {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForwardingOplog").finish()
     }
 }
 
-impl<T: GolemTypes> Drop for ForwardingOplog<T> {
+impl Drop for ForwardingOplog {
     fn drop(&mut self) {
         if let Some(close_fn) = self.close_fn.take() {
             close_fn();
@@ -637,8 +676,8 @@ impl<T: GolemTypes> Drop for ForwardingOplog<T> {
 }
 
 #[async_trait]
-impl<T: GolemTypes> Oplog for ForwardingOplog<T> {
-    async fn add(&self, entry: OplogEntry) {
+impl Oplog for ForwardingOplog {
+    async fn add(&self, entry: OplogEntry) -> OplogIndex {
         let mut state = self.state.lock().await;
         state.buffer.push_back(entry.clone());
         state.last_oplog_idx = state.last_oplog_idx.next();
@@ -649,17 +688,22 @@ impl<T: GolemTypes> Oplog for ForwardingOplog<T> {
         self.inner.drop_prefix(last_dropped_id).await
     }
 
-    async fn commit(&self, level: CommitLevel) {
+    async fn commit(&self, level: CommitLevel) -> BTreeMap<OplogIndex, OplogEntry> {
         let mut state = self.state.lock().await;
-        self.inner.commit(level).await;
+        let result = self.inner.commit(level).await;
         state.commit_count += 1;
         if state.commit_count > Self::MAX_COMMIT_COUNT {
             state.send_buffer().await;
         }
+        result
     }
 
     async fn current_oplog_index(&self) -> OplogIndex {
         self.inner.current_oplog_index().await
+    }
+
+    async fn last_added_non_hint_entry(&self) -> Option<OplogIndex> {
+        self.inner.last_added_non_hint_entry().await
     }
 
     async fn wait_for_replicas(&self, replicas: u8, timeout: Duration) -> bool {
@@ -683,32 +727,31 @@ impl<T: GolemTypes> Oplog for ForwardingOplog<T> {
     }
 }
 
-struct ForwardingOplogState<T: GolemTypes> {
+struct ForwardingOplogState {
     buffer: VecDeque<OplogEntry>,
     commit_count: usize,
     last_send: Instant,
     oplog_plugins: Arc<dyn OplogProcessorPlugin>,
-    execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
     initial_worker_metadata: WorkerMetadata,
+    last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
     last_oplog_idx: OplogIndex,
     oplog_service: Arc<dyn OplogService>,
-    components: Arc<dyn ComponentService<T>>,
-    plugins: Arc<dyn Plugins<T>>,
+    components: Arc<dyn ComponentService>,
+    plugins: Arc<dyn Plugins>,
+    project_service: Arc<dyn ProjectService>,
 }
 
-impl<T: GolemTypes> ForwardingOplogState<T> {
+impl ForwardingOplogState {
     pub async fn send_buffer(&mut self) {
         let metadata = {
-            let execution_status = self.execution_status.read().unwrap();
-            let status = execution_status.last_known_status().clone();
+            let status = self.last_known_status.read().await.clone();
             WorkerMetadata {
                 last_known_status: status,
                 ..self.initial_worker_metadata.clone()
             }
         };
 
-        let active_plugins = metadata.last_known_status.active_plugins();
-        if !active_plugins.is_empty() {
+        if !metadata.last_known_status.active_plugins.is_empty() {
             let entries: Vec<_> = self.buffer.drain(..).collect();
             let initial_oplog_index =
                 OplogIndex::from_u64(Into::<u64>::into(self.last_oplog_idx) - entries.len() as u64);
@@ -717,7 +760,7 @@ impl<T: GolemTypes> ForwardingOplogState<T> {
                 .try_send_entries(metadata, initial_oplog_index, &entries)
                 .await
             {
-                log::error!("Failed to send oplog entries: {}", err);
+                log::error!("Failed to send oplog entries: {err}");
                 // In case of an error we keep the unsent entries in the buffer.
                 // This does not guarantee that we don't double-send entries (in case the error happened
                 // only for one of the `send` calls, for example) - this is going to be handled
@@ -740,21 +783,24 @@ impl<T: GolemTypes> ForwardingOplogState<T> {
         metadata: WorkerMetadata,
         initial_oplog_index: OplogIndex,
         entries: &[OplogEntry],
-    ) -> Result<(), GolemError> {
+    ) -> Result<(), WorkerExecutorError> {
         let mut public_entries = Vec::new();
 
-        for entry in entries {
+        for (delta, entry) in entries.iter().enumerate() {
+            let idx = initial_oplog_index.range_end(delta as u64 + 1);
             let public_entry = PublicOplogEntry::from_oplog_entry(
+                idx,
                 entry.clone(),
                 self.oplog_service.clone(),
                 self.components.clone(),
                 self.plugins.clone(),
+                self.project_service.clone(),
                 &metadata.owned_worker_id(),
                 metadata.last_known_status.component_version, // NOTE: this is only safe if the component version is not changing within one batch
             )
             .await
             .map_err(|err| {
-                GolemError::runtime(format!(
+                WorkerExecutorError::runtime(format!(
                     "Failed to enrich oplog entry for oplog processors: {err}"
                 ))
             })?;
@@ -762,7 +808,7 @@ impl<T: GolemTypes> ForwardingOplogState<T> {
             public_entries.push(public_entry);
         }
 
-        for installation_id in metadata.last_known_status.active_plugins() {
+        for installation_id in metadata.last_known_status.active_plugins.iter() {
             self.oplog_plugins
                 .send(
                     metadata.clone(),

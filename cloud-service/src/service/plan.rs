@@ -1,13 +1,27 @@
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::config::PlansConfig;
 use crate::model::Plan;
 use crate::repo::plan::{PlanRecord, PlanRepo};
 use async_trait::async_trait;
-use cloud_common::model::PlanId;
+use golem_common::model::PlanId;
 use golem_common::SafeDisplay;
 use golem_service_base::repo::RepoError;
 use std::fmt::Debug;
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +42,7 @@ impl SafeDisplay for PlanError {
 }
 
 #[async_trait]
-pub trait PlanService {
+pub trait PlanService: Send + Sync {
     async fn create_initial_plan(&self) -> Result<Plan, PlanError>;
 
     async fn get_default_plan(&self) -> Result<Plan, PlanError>;
@@ -37,12 +51,12 @@ pub trait PlanService {
 }
 
 pub struct PlanServiceDefault {
-    plan_repo: Arc<dyn PlanRepo + Sync + Send>,
+    plan_repo: Arc<dyn PlanRepo>,
     plans_config: PlansConfig,
 }
 
 impl PlanServiceDefault {
-    pub fn new(plan_repo: Arc<dyn PlanRepo + Sync + Send>, plans_config: PlansConfig) -> Self {
+    pub fn new(plan_repo: Arc<dyn PlanRepo>, plans_config: PlansConfig) -> Self {
         PlanServiceDefault {
             plan_repo,
             plans_config,
@@ -55,7 +69,7 @@ impl PlanService for PlanServiceDefault {
     async fn create_initial_plan(&self) -> Result<Plan, PlanError> {
         let default_plan: Plan = self.plans_config.default.clone().into();
 
-        info!("Create initial plan {}", default_plan.plan_id);
+        debug!("Create initial plan {}", default_plan.plan_id);
 
         let record: PlanRecord = default_plan.clone().into();
 
@@ -67,7 +81,7 @@ impl PlanService for PlanServiceDefault {
     async fn get_default_plan(&self) -> Result<Plan, PlanError> {
         let plan_id = self.plans_config.default.plan_id;
 
-        info!("Getting default plan {}", plan_id);
+        debug!("Getting default plan {}", plan_id);
 
         let plan = self.plan_repo.get(&plan_id).await?;
 
@@ -78,7 +92,7 @@ impl PlanService for PlanServiceDefault {
     }
 
     async fn get(&self, plan_id: &PlanId) -> Result<Option<Plan>, PlanError> {
-        info!("Getting plan {}", plan_id);
+        debug!("Getting plan {}", plan_id);
         let result = self.plan_repo.get(&plan_id.0).await?;
         Ok(result.map(|p| p.into()))
     }

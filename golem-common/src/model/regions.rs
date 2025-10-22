@@ -23,9 +23,10 @@ use bincode::{Decode, Encode};
 use range_set_blaze::RangeSetBlaze;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Encode, Decode, Serialize, Deserialize, poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct OplogRegion {
     pub start: OplogIndex,
@@ -247,6 +248,29 @@ impl Display for DeletedRegions {
                 .collect::<Vec<String>>()
                 .join(", ")
         )
+    }
+}
+
+pub mod protobuf {
+    use crate::model::regions::OplogRegion;
+    use crate::model::OplogIndex;
+
+    impl From<golem_api_grpc::proto::golem::worker::OplogRegion> for OplogRegion {
+        fn from(value: golem_api_grpc::proto::golem::worker::OplogRegion) -> Self {
+            OplogRegion {
+                start: OplogIndex::from_u64(value.start),
+                end: OplogIndex::from_u64(value.end),
+            }
+        }
+    }
+
+    impl From<OplogRegion> for golem_api_grpc::proto::golem::worker::OplogRegion {
+        fn from(value: OplogRegion) -> Self {
+            golem_api_grpc::proto::golem::worker::OplogRegion {
+                start: value.start.into(),
+                end: value.end.into(),
+            }
+        }
     }
 }
 

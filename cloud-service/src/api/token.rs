@@ -1,11 +1,30 @@
-use crate::api::{ApiResult, ApiTags};
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::ApiError;
+use crate::api::ApiResult;
+use crate::login::LoginSystem;
 use crate::model::*;
 use crate::service::auth::AuthService;
-use crate::service::token::TokenService;
-use cloud_common::auth::GolemSecurityScheme;
-use cloud_common::model::TokenId;
+use crate::service::token::{TokenService, TokenServiceError};
+use golem_common::model::auth::AccountAction;
+use golem_common::model::error::ErrorBody;
 use golem_common::model::AccountId;
+use golem_common::model::TokenId;
 use golem_common::recorded_http_api_request;
+use golem_service_base::api_tags::ApiTags;
+use golem_service_base::model::auth::GolemSecurityScheme;
 use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::*;
@@ -13,8 +32,9 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 pub struct TokenApi {
-    pub auth_service: Arc<dyn AuthService + Sync + Send>,
-    pub token_service: Arc<dyn TokenService + Sync + Send>,
+    pub auth_service: Arc<dyn AuthService>,
+    pub token_service: Arc<dyn TokenService>,
+    pub login_system: Arc<LoginSystem>,
 }
 
 #[OpenApi(prefix_path = "/v1/accounts", tag = ApiTags::Token)]
@@ -49,7 +69,11 @@ impl TokenApi {
         token: GolemSecurityScheme,
     ) -> ApiResult<Json<Vec<Token>>> {
         let auth = self.auth_service.authorization(token.as_ref()).await?;
-        let result = self.token_service.find(&account_id, &auth).await?;
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::ViewTokens)
+            .await?;
+
+        let result = self.token_service.find(&account_id).await?;
         Ok(Json(result))
     }
 
@@ -88,7 +112,10 @@ impl TokenApi {
         token: GolemSecurityScheme,
     ) -> ApiResult<Json<Token>> {
         let auth = self.auth_service.authorization(token.as_ref()).await?;
-        let result = self.token_service.get(&token_id, &auth).await?;
+        let result = self.token_service.get(&token_id).await?;
+        self.auth_service
+            .authorize_account_action(&auth, &result.account_id, &AccountAction::ViewTokens)
+            .await?;
         Ok(Json(result))
     }
 
@@ -126,9 +153,13 @@ impl TokenApi {
         token: GolemSecurityScheme,
     ) -> ApiResult<Json<UnsafeToken>> {
         let auth = self.auth_service.authorization(token.as_ref()).await?;
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::CreateToken)
+            .await?;
+
         let response = self
             .token_service
-            .create(&account_id, &request.expires_at, &auth)
+            .create(&account_id, &request.expires_at)
             .await?;
         Ok(Json(response))
     }
@@ -167,8 +198,33 @@ impl TokenApi {
         token: GolemSecurityScheme,
     ) -> ApiResult<Json<DeleteTokenResponse>> {
         let auth = self.auth_service.authorization(token.as_ref()).await?;
-        // FIXME account_id check
-        self.token_service.delete(&token_id, &auth).await?;
-        Ok(Json(DeleteTokenResponse {}))
+
+        match self.token_service.get(&token_id).await {
+            Ok(existing) => {
+                self.auth_service
+                    .authorize_account_action(
+                        &auth,
+                        &existing.account_id,
+                        &AccountAction::DeleteToken,
+                    )
+                    .await?;
+
+                if let LoginSystem::Enabled(login_system) = &*self.login_system {
+                    login_system
+                        .login_service
+                        .unlink_temp_token(&token_id)
+                        .await?;
+                };
+
+                self.token_service.delete(&token_id).await?;
+                Ok(Json(DeleteTokenResponse {}))
+            }
+            Err(TokenServiceError::UnknownToken(_)) => {
+                Err(ApiError::Unauthorized(Json(ErrorBody {
+                    error: "Invalid token".to_string(),
+                })))?
+            }
+            Err(e) => Err(e)?,
+        }
     }
 }

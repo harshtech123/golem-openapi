@@ -18,7 +18,6 @@ use fred::types::SetOptions;
 use golem_common::metrics::redis::{record_redis_deserialized_size, record_redis_serialized_size};
 use golem_common::redis::RedisPool;
 use std::collections::HashMap;
-use tracing::debug;
 
 use crate::storage::keyvalue::{KeyValueStorage, KeyValueStorageNamespace};
 
@@ -37,8 +36,8 @@ impl RedisKeyValueStorage {
             KeyValueStorageNamespace::Worker => None,
             KeyValueStorageNamespace::Promise => Some("promises".to_string()),
             KeyValueStorageNamespace::Schedule => None,
-            KeyValueStorageNamespace::UserDefined { account_id, bucket } => {
-                Some(format!("user-defined:{account_id}:{bucket}"))
+            KeyValueStorageNamespace::UserDefined { project_id, bucket } => {
+                Some(format!("user-defined:{project_id}:{bucket}"))
             }
         }
     }
@@ -122,7 +121,6 @@ impl KeyValueStorage for RedisKeyValueStorage {
                     .await
                     .map_err(|redis_err| redis_err.to_string())?;
 
-                debug!("set_if_not_exists hsetnx result: {:?}", result);
                 Ok(result)
             }
             None => {
@@ -133,7 +131,6 @@ impl KeyValueStorage for RedisKeyValueStorage {
                     .await
                     .map_err(|redis_err| redis_err.to_string())?;
 
-                debug!("set_if_not_exists result: {:?}", result);
                 Ok(result == Some("OK".to_string()))
             }
         }
@@ -303,7 +300,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         record_redis_serialized_size(svc_name, entity_name, value.len());
 
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         self.redis
@@ -325,7 +322,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         record_redis_serialized_size(svc_name, entity_name, value.len());
 
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         self.redis
@@ -344,7 +341,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         key: &str,
     ) -> Result<Vec<Bytes>, String> {
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         let members: Vec<Bytes> = self
@@ -374,7 +371,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         record_redis_serialized_size(svc_name, entity_name, value.len());
 
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         self.redis
@@ -396,7 +393,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         record_redis_serialized_size(svc_name, entity_name, value.len());
 
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         self.redis
@@ -415,7 +412,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         key: &str,
     ) -> Result<Vec<(f64, Bytes)>, String> {
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         let pairs: Vec<(Bytes, f64)> = self
@@ -446,7 +443,7 @@ impl KeyValueStorage for RedisKeyValueStorage {
         max: f64,
     ) -> Result<Vec<(f64, Bytes)>, String> {
         let key = match Self::use_hash(&namespace) {
-            Some(ns) => format!("{}:{}", ns, key),
+            Some(ns) => format!("{ns}:{key}"),
             None => key.to_string(),
         };
         let pairs: Vec<(Bytes, f64)> = self

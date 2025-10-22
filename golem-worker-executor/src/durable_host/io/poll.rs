@@ -12,20 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::model::InterruptKind;
-use chrono::{Duration, Utc};
-use golem_common::model::oplog::DurableFunctionType;
-use wasmtime::component::Resource;
-use wasmtime_wasi::bindings::io::poll::{Host, HostPollable, Pollable};
-
 use crate::durable_host::serialized::SerializableError;
 use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep};
 use crate::workerctx::WorkerCtx;
+use chrono::{Duration, Utc};
+use golem_common::model::oplog::DurableFunctionType;
+use golem_service_base::error::worker_executor::InterruptKind;
+use tracing::debug;
+use wasmtime::component::Resource;
+use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable, Pollable};
 
 impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
     async fn ready(&mut self, self_: Resource<Pollable>) -> anyhow::Result<bool> {
         self.observe_function_call("io::poll:pollable", "ready");
-        HostPollable::ready(&mut self.as_wasi_view().0, self_).await
+        let durability = Durability::<bool, SerializableError>::new(
+            self,
+            "golem io::poll",
+            "ready",
+            DurableFunctionType::ReadLocal,
+        )
+        .await?;
+
+        if durability.is_live() {
+            let result = HostPollable::ready(&mut self.as_wasi_view().0, self_).await;
+            durability.persist(self, (), result).await
+        } else {
+            durability.replay(self).await
+        }
     }
 
     async fn block(&mut self, self_: Resource<Pollable>) -> anyhow::Result<()> {
@@ -44,6 +57,32 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
 
 impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
     async fn poll(&mut self, in_: Vec<Resource<Pollable>>) -> anyhow::Result<Vec<u32>> {
+        // check if all pollables are promise backed. In this case we can suspend immediately
+        // This check only needs to be done in live mode, as we will never even persist the oplog entry for polling
+        // if we suspended in the last pass. Doing it this way also prevents us from initializing the promises until we are actually in live mode.
+        if self.durable_execution_state().is_live {
+            let promise_backed_pollables = self.state.promise_backed_pollables.read().await;
+            let mut all_blocked = true;
+
+            for res in &in_ {
+                if let Some(promise_handle) = promise_backed_pollables.get(&res.rep()) {
+                    let ready = promise_handle.get_handle().await.is_ready().await;
+                    if ready {
+                        all_blocked = false;
+                        break;
+                    }
+                } else {
+                    all_blocked = false;
+                    break;
+                }
+            }
+
+            if all_blocked {
+                debug!("Suspending worker until a promise gets completed");
+                return Err(InterruptKind::Suspend.into());
+            }
+        };
+
         let durability = Durability::<Vec<u32>, SerializableError>::new(
             self,
             "golem io::poll",
@@ -53,9 +92,10 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         .await?;
 
         let result = if durability.is_live() {
+            let count = in_.len();
             let result = Host::poll(&mut self.as_wasi_view().0, in_).await;
             if is_suspend_for_sleep(&result).is_none() {
-                durability.persist(self, (), result).await
+                durability.persist(self, count, result).await
             } else {
                 result
             }

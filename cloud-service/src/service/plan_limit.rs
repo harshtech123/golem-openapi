@@ -1,5 +1,19 @@
-use crate::auth::AccountAuthorisation;
-use crate::model::{AccountAction, Plan, ResourceLimits};
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::auth::AuthServiceError;
+use crate::model::{Plan, ResourceLimits};
 use crate::repo::account::AccountRepo;
 use crate::repo::account_components::AccountComponentsRepo;
 use crate::repo::account_connections::AccountConnectionsRepo;
@@ -18,8 +32,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::num::TryFromIntError;
 use std::sync::Arc;
-
-use super::auth::{AuthService, AuthServiceError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanLimitError {
@@ -92,7 +104,7 @@ impl CheckLimitResult {
 }
 
 #[async_trait]
-pub trait PlanLimitService {
+pub trait PlanLimitService: Send + Sync {
     /// Get Account Limits.
     async fn get_account_limits(
         &self,
@@ -115,14 +127,12 @@ pub trait PlanLimitService {
     async fn get_resource_limits(
         &self,
         account_id: &AccountId,
-        auth: &AccountAuthorisation,
     ) -> Result<ResourceLimits, PlanLimitError>;
 
     /// Record fuel consumption - internal API for executors
     async fn record_fuel_consumption(
         &self,
         updates: HashMap<AccountId, i64>,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError>;
 
     /// Update component limit.
@@ -131,7 +141,6 @@ pub trait PlanLimitService {
         account_id: &AccountId,
         count: i32,
         size: i64,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError>;
 
     /// Update worker limit.
@@ -139,7 +148,6 @@ pub trait PlanLimitService {
         &self,
         account_id: &AccountId,
         value: i32,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError>;
 
     /// Update worker connection limit.
@@ -147,21 +155,19 @@ pub trait PlanLimitService {
         &self,
         account_id: &AccountId,
         value: i32,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError>;
 }
 
 pub struct PlanLimitServiceDefault {
-    auth_service: Arc<dyn AuthService>,
-    plan_repo: Arc<dyn PlanRepo + Sync + Send>,
-    account_repo: Arc<dyn AccountRepo + Sync + Send>,
-    account_workers_repo: Arc<dyn AccountWorkersRepo + Sync + Send>,
-    account_connections_repo: Arc<dyn AccountConnectionsRepo + Send + Sync>,
-    account_components_repo: Arc<dyn AccountComponentsRepo + Sync + Send>,
-    account_used_storage_repo: Arc<dyn AccountUsedStorageRepo + Sync + Send>,
-    account_uploads_repo: Arc<dyn AccountUploadsRepo + Sync + Send>,
-    project_repo: Arc<dyn ProjectRepo + Sync + Send>,
-    account_fuel_repo: Arc<dyn AccountFuelRepo + Sync + Send>,
+    plan_repo: Arc<dyn PlanRepo>,
+    account_repo: Arc<dyn AccountRepo>,
+    account_workers_repo: Arc<dyn AccountWorkersRepo>,
+    account_connections_repo: Arc<dyn AccountConnectionsRepo>,
+    account_components_repo: Arc<dyn AccountComponentsRepo>,
+    account_used_storage_repo: Arc<dyn AccountUsedStorageRepo>,
+    account_uploads_repo: Arc<dyn AccountUploadsRepo>,
+    project_repo: Arc<dyn ProjectRepo>,
+    account_fuel_repo: Arc<dyn AccountFuelRepo>,
 }
 
 #[async_trait]
@@ -206,31 +212,27 @@ impl PlanLimitService for PlanLimitServiceDefault {
     async fn get_resource_limits(
         &self,
         account_id: &AccountId,
-        auth: &AccountAuthorisation,
     ) -> Result<ResourceLimits, PlanLimitError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::ViewLimits)
-            .await?;
-
         let plan = self.get_plan(account_id).await?;
         let fuel = self.account_fuel_repo.get(account_id).await?;
-        let available_fuel = plan.plan_data.monthly_gas_limit - fuel;
+        let available_fuel = plan
+            .plan_data
+            .monthly_gas_limit
+            .checked_sub(fuel)
+            .unwrap_or(0);
+
         Ok(ResourceLimits {
             available_fuel,
-            max_memory_per_worker: 100 * 1024 * 1024,
+            max_memory_per_worker: plan.plan_data.max_memory_per_worker,
         })
     }
 
     async fn record_fuel_consumption(
         &self,
         updates: HashMap<AccountId, i64>,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError> {
         // TODO: Should we do this in parallel?
         for (account_id, update) in updates {
-            self.auth_service
-                .authorize_account_action(auth, &account_id, &AccountAction::UpdateLimits)
-                .await?;
             self.get_plan(&account_id).await?;
             self.account_fuel_repo.update(&account_id, update).await?;
         }
@@ -242,12 +244,7 @@ impl PlanLimitService for PlanLimitServiceDefault {
         account_id: &AccountId,
         count: i32,
         size: i64,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::UpdateLimits)
-            .await?;
-
         if size > 50000000 {
             return Err(PlanLimitError::limit_exceeded(
                 "Component size limit exceeded (limit: 50MB)",
@@ -319,12 +316,7 @@ impl PlanLimitService for PlanLimitServiceDefault {
         &self,
         account_id: &AccountId,
         value: i32,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::UpdateLimits)
-            .await?;
-
         let plan = self.get_plan(account_id).await?;
         let num_workers = self.account_workers_repo.get(account_id).await?;
 
@@ -354,12 +346,7 @@ impl PlanLimitService for PlanLimitServiceDefault {
         &self,
         account_id: &AccountId,
         value: i32,
-        auth: &AccountAuthorisation,
     ) -> Result<(), PlanLimitError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::UpdateLimits)
-            .await?;
-
         let connections = self.account_connections_repo.get(account_id).await?;
 
         if value > 0 {
@@ -392,19 +379,17 @@ impl PlanLimitService for PlanLimitServiceDefault {
 // Helper functions.
 impl PlanLimitServiceDefault {
     pub fn new(
-        auth_service: Arc<dyn AuthService>,
-        plan_repo: Arc<dyn PlanRepo + Sync + Send>,
-        account_repo: Arc<dyn AccountRepo + Sync + Send>,
-        account_workers_repo: Arc<dyn AccountWorkersRepo + Sync + Send>,
-        account_connections_repo: Arc<dyn AccountConnectionsRepo + Send + Sync>,
-        account_components_repo: Arc<dyn AccountComponentsRepo + Sync + Send>,
-        account_used_storage_repo: Arc<dyn AccountUsedStorageRepo + Sync + Send>,
-        account_uploads_repo: Arc<dyn AccountUploadsRepo + Sync + Send>,
-        project_repo: Arc<dyn ProjectRepo + Sync + Send>,
-        account_fuel_repo: Arc<dyn AccountFuelRepo + Sync + Send>,
+        plan_repo: Arc<dyn PlanRepo>,
+        account_repo: Arc<dyn AccountRepo>,
+        account_workers_repo: Arc<dyn AccountWorkersRepo>,
+        account_connections_repo: Arc<dyn AccountConnectionsRepo>,
+        account_components_repo: Arc<dyn AccountComponentsRepo>,
+        account_used_storage_repo: Arc<dyn AccountUsedStorageRepo>,
+        account_uploads_repo: Arc<dyn AccountUploadsRepo>,
+        project_repo: Arc<dyn ProjectRepo>,
+        account_fuel_repo: Arc<dyn AccountFuelRepo>,
     ) -> Self {
         PlanLimitServiceDefault {
-            auth_service,
             plan_repo,
             account_repo,
             account_workers_repo,

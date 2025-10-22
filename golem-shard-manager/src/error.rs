@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Debug;
-
-use std::fmt::Formatter;
-
 use golem_api_grpc::proto::golem;
 use golem_api_grpc::proto::golem::shardmanager::v1::shard_manager_error;
 use golem_common::metrics::api::TraceErrorKind;
-use golem_common::model::error::GolemError;
 use golem_common::retriable_error::IsRetriableError;
+use golem_service_base::error::worker_executor::WorkerExecutorError;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ShardManagerError {
@@ -35,7 +33,7 @@ pub enum ShardManagerError {
     #[error("No result")]
     NoResult,
     #[error("Worker execution error: {0}")]
-    WorkerExecutionError(GolemError),
+    WorkerExecutionError(WorkerExecutorError),
     #[error("Persistence serialization error {0}")]
     SerializationError(String),
     #[error("Redis error {0}")]

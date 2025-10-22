@@ -28,7 +28,9 @@ use tracing::Level;
 use crate::components::component_service::ComponentService;
 use crate::components::{wait_for_startup_grpc, EnvVarBuilder};
 use golem_api_grpc::proto::golem::componentcompilation::v1::component_compilation_service_client::ComponentCompilationServiceClient;
-use golem_common::model::ComponentId;
+use golem_common::model::{ComponentId, ProjectId};
+
+use super::cloud_service::CloudService;
 
 pub mod docker;
 pub mod k8s;
@@ -36,12 +38,17 @@ pub mod provided;
 pub mod spawned;
 
 #[async_trait]
-pub trait ComponentCompilationService {
+pub trait ComponentCompilationService: Send + Sync {
     async fn client(&self) -> ComponentCompilationServiceClient<Channel> {
         new_client(&self.public_host(), self.public_grpc_port()).await
     }
 
-    async fn enqueue_compilation(&self, component_id: &ComponentId, component_version: u64) {
+    async fn enqueue_compilation(
+        &self,
+        project_id: ProjectId,
+        component_id: &ComponentId,
+        component_version: u64,
+    ) {
         let response = self
             .client()
             .await
@@ -49,6 +56,7 @@ pub trait ComponentCompilationService {
                 component_id: Some(component_id.clone().into()),
                 component_version,
                 component_service_port: None,
+                project_id: Some(project_id.into()),
             })
             .await
             .expect("Failed to enqueue component compilation")
@@ -104,7 +112,8 @@ async fn wait_for_startup(host: &str, grpc_port: u16, timeout: Duration) {
 async fn env_vars(
     http_port: u16,
     grpc_port: u16,
-    component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
+    component_service: Arc<dyn ComponentService + Send + Sync>,
+    cloud_service: &Arc<dyn CloudService>,
     verbosity: Level,
 ) -> HashMap<String, String> {
     EnvVarBuilder::golem_service(verbosity)
@@ -115,9 +124,9 @@ async fn env_vars(
             "/tmp/ittest-local-object-store/golem",
         )
         .with_str("GOLEM__COMPONENT_SERVICE__TYPE", "Static")
-        .with_str(
+        .with(
             "GOLEM__COMPONENT_SERVICE__CONFIG__ACCESS_TOKEN",
-            "2A354594-7A63-4091-A46B-CC58D379F677",
+            cloud_service.admin_token().to_string(),
         )
         .with(
             "GOLEM__COMPONENT_SERVICE__CONFIG__HOST",

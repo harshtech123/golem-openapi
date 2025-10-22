@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use test_r::{inherit_test_dep, test};
-
 use crate::common::{start, TestContext, TestWorkerExecutor};
 use crate::{LastUniqueId, Tracing, WorkerExecutorTestDependencies};
 use golem_common::model::{WorkerId, WorkerStatus};
 use golem_common::serialization::{deserialize, serialize};
-use golem_test_framework::config::TestDependencies;
+use golem_test_framework::config::{TestDependencies, TestDependenciesDsl};
 use golem_test_framework::dsl::TestDslUnsafe;
 use redis::AsyncCommands;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
+use test_r::{inherit_test_dep, test};
 use tracing::info;
 
 inherit_test_dep!(WorkerExecutorTestDependencies);
@@ -32,13 +31,14 @@ inherit_test_dep!(Tracing);
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_shopping_cart_example(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id = restore_from_recovery_golden_file(
         &executor,
@@ -57,13 +57,14 @@ async fn recover_shopping_cart_example(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_shopping_cart_resource_example(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id = restore_from_recovery_golden_file(
         &executor,
@@ -82,13 +83,14 @@ async fn recover_shopping_cart_resource_example(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_environment_example(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id = restore_from_recovery_golden_file(
         &executor,
@@ -107,13 +109,14 @@ async fn recover_environment_example(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_read_stdin(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id =
         restore_from_recovery_golden_file(&executor, &context, "read_stdin_fails", &["read-stdin"])
@@ -128,13 +131,14 @@ async fn recover_read_stdin(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_jump(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id =
         restore_from_recovery_golden_file(&executor, &context, "jump", &["runtime-service"]).await;
@@ -148,13 +152,14 @@ async fn recover_jump(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_js_example_1(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id =
         restore_from_recovery_golden_file(&executor, &context, "js_example_1", &["js-1"]).await;
@@ -168,13 +173,14 @@ async fn recover_js_example_1(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_auto_update_on_running(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let worker_id = restore_from_recovery_golden_file(
         &executor,
@@ -193,13 +199,14 @@ async fn recover_auto_update_on_running(
 
 #[test]
 #[tracing::instrument]
+#[ignore] // TODO: 1.3 breaks worker recovery compatibility. to be regenerated once 1.3 is final
 async fn recover_counter_resource_test_2(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let caller_worker_id = restore_from_recovery_golden_file(
         &executor,
@@ -225,7 +232,7 @@ async fn recover_counter_resource_test_2(
 }
 
 async fn restore_from_recovery_golden_file(
-    executor: &TestWorkerExecutor,
+    executor: &TestDependenciesDsl<TestWorkerExecutor>,
     context: &TestContext,
     name: &str,
     component_names: &[&str],
@@ -253,7 +260,7 @@ async fn restore_from_recovery_golden_file(
         }
     }
 
-    let mut redis = executor.redis().get_async_connection(0).await;
+    let mut redis = executor.deps.redis().get_async_connection(0).await;
 
     let oplog_key = &format!(
         "{}worker:oplog:{}",
@@ -323,7 +330,7 @@ pub async fn save_recovery_golden_file(
 }
 
 async fn wait_for_worker_recovery(
-    executor: &TestWorkerExecutor,
+    executor: &TestDependenciesDsl<TestWorkerExecutor>,
     worker_id: &WorkerId,
 ) -> WorkerStatus {
     loop {

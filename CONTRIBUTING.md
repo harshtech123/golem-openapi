@@ -9,7 +9,7 @@ To work on **Golem** you need to install (via package installers or manually) th
 - [Protobuf](https://github.com/protocolbuffers/protobuf#protobuf-compiler-installation)
   - The [prost crate](https://crates.io/crates/prost) requires `protoc`
   - Requires **version 28** or later
-- For integration tests  
+- For integration tests
   - [redis](https://redis.io/downloads/)
   - [docker](https://www.docker.com)
 - To be able to run all services with `cargo-make run` with a merged log view:
@@ -142,18 +142,24 @@ There are two ways now to run Golem locally:
 
 ### Using cargo make run
 
-By running
+By running `cargo make run` all services are going to be built and started as individual native processes.
+Ensure that `lnav`, `nginx` and `redis` commands are available in your PATH.
 
-```shell
-cargo make run
-```
+### Using cargo make run-with-login-enabled
 
-all the services are going to be built and started as individual native processes, configured to communicate with each other. Beside that, an `nginx` process is going to be started to unify the various processes' HTTP APIs, and `lnav` is started to merge their logs.
+By running `cargo make run-with-login-enabled`, all services are started as individual native processes
+and the login system is enabled. In addition to the [requirements for regular run](#using-cargo-make-run), you'll need to set up GitHub OAuth.
 
-### Using the Single Golem Executable
+1. Go to https://github.com
+2. Navigate to `Settings > Developer settings > OAuth Apps`
+3. Create a new OAuth App. Use the following settings:
 
-Golem now contains a **single executable** crate, called `golem`, that links all the services into a single binary. This binary is built using a regular `cargo make build` run and can be executed with
+    Authorization callback URL: `http://localhost`
+4. Generate a new client secret.
+5. Export the following environment variables:
 
-```shell
-cargo run -p golem
-```
+    GITHUB_CLIENT_ID: Client ID of the OAuth application created in step (3)
+
+    GITHUB_CLIENT_SECRET: Client secret created in step (4)
+
+After it is started you can configure the cli to use the local instance using `golem profile new --component-url http://localhost:9881/  cloud cloud-local`.

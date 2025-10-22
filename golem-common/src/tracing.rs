@@ -31,6 +31,7 @@ use tracing_subscriber::Registry;
 
 use crate::config::env_config_provider;
 use crate::tracing::format::JsonFlattenSpanFormatter;
+use crate::SafeDisplay;
 
 pub enum Output {
     Stdout,
@@ -133,6 +134,42 @@ impl OutputConfig {
     }
 }
 
+impl SafeDisplay for OutputConfig {
+    fn to_safe_string(&self) -> String {
+        let mut flags = Vec::new();
+
+        if self.ansi {
+            flags.push("ansi");
+        }
+        if self.compact {
+            flags.push("compact");
+        }
+        if self.json {
+            flags.push("json");
+        }
+        if self.json_flatten {
+            flags.push("json_flatten");
+        }
+        if self.json_flatten_span {
+            flags.push("json_flatten_span");
+        }
+        if self.pretty {
+            flags.push("pretty");
+        }
+        if self.without_time {
+            flags.push("without_time");
+        }
+        if self.span_events_active {
+            flags.push("span_events_active");
+        }
+        if self.span_events_full {
+            flags.push("span_events_full");
+        }
+
+        flags.join(", ")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TracingConfig {
     pub stdout: OutputConfig,
@@ -153,7 +190,7 @@ impl TracingConfig {
                 ..OutputConfig::json_flatten_span()
             },
             file_dir: None,
-            file_name: Some(format!("{}.log", name)),
+            file_name: Some(format!("{name}.log")),
             file_truncate: true,
             console: false,
             dtor_friendly: false,
@@ -201,6 +238,34 @@ impl TracingConfig {
     }
 }
 
+impl SafeDisplay for TracingConfig {
+    fn to_safe_string(&self) -> String {
+        use std::fmt::Write;
+
+        let mut result = String::new();
+
+        if self.stdout.enabled {
+            let _ = writeln!(&mut result, "stdout:");
+            let _ = writeln!(&mut result, "{}", self.stdout.to_safe_string_indented());
+        }
+        if self.file.enabled {
+            let _ = writeln!(&mut result, "file:");
+            let _ = writeln!(&mut result, "{}", self.file.to_safe_string_indented());
+        }
+        if let Some(dir) = &self.file_dir {
+            let _ = writeln!(&mut result, "file directory: {dir}");
+        }
+        if let Some(file) = &self.file_name {
+            let _ = writeln!(&mut result, "file name: {file}");
+        }
+        let _ = writeln!(&mut result, "console: {}", self.console);
+        let _ = writeln!(&mut result, "file truncate: {}", self.file_truncate);
+        let _ = writeln!(&mut result, "destructor friendly: {}", self.dtor_friendly);
+
+        result
+    }
+}
+
 impl Default for TracingConfig {
     fn default() -> Self {
         Self {
@@ -242,19 +307,19 @@ pub mod directive {
     }
 
     pub fn debug(target: &str) -> Directive {
-        format!("{}=debug", target).parse().unwrap()
+        format!("{target}=debug").parse().unwrap()
     }
 
     pub fn info(target: &str) -> Directive {
-        format!("{}=info", target).parse().unwrap()
+        format!("{target}=info").parse().unwrap()
     }
 
     pub fn warn(target: &str) -> Directive {
-        format!("{}=warn", target).parse().unwrap()
+        format!("{target}=warn").parse().unwrap()
     }
 
     pub fn error(target: &str) -> Directive {
-        format!("{}=error", target).parse().unwrap()
+        format!("{target}=error").parse().unwrap()
     }
 
     pub fn default_deps() -> Vec<Directive> {

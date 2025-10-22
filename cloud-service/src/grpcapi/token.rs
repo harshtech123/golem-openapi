@@ -1,27 +1,41 @@
-use std::fmt::{Debug, Formatter};
-use std::str::FromStr;
-use std::sync::Arc;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::auth::AccountAuthorisation;
 use crate::grpcapi::get_authorisation_token;
+use crate::login::{LoginError, LoginSystem};
 use crate::service::auth::{AuthService, AuthServiceError};
-use crate::service::token;
-use cloud_api_grpc::proto::golem::cloud::token::v1::cloud_token_service_server::CloudTokenService;
-use cloud_api_grpc::proto::golem::cloud::token::v1::{
+use crate::service::token::{self, TokenServiceError};
+use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody};
+use golem_api_grpc::proto::golem::token::v1::cloud_token_service_server::CloudTokenService;
+use golem_api_grpc::proto::golem::token::v1::{
     create_token_response, delete_token_response, get_token_response, get_tokens_response,
     token_error, CreateTokenRequest, CreateTokenResponse, DeleteTokenRequest, DeleteTokenResponse,
     GetTokenRequest, GetTokenResponse, GetTokensRequest, GetTokensResponse,
     GetTokensSuccessResponse, TokenError,
 };
-use cloud_api_grpc::proto::golem::cloud::token::{Token, UnsafeToken};
-use cloud_common::grpc::proto_token_id_string;
-use cloud_common::model::TokenId;
-use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody};
+use golem_api_grpc::proto::golem::token::{Token, UnsafeToken};
 use golem_common::grpc::proto_account_id_string;
 use golem_common::metrics::api::TraceErrorKind;
+use golem_common::model::auth::AccountAction;
 use golem_common::model::AccountId;
+use golem_common::model::TokenId;
 use golem_common::recorded_grpc_api_request;
 use golem_common::SafeDisplay;
+use std::fmt::{Debug, Formatter};
+use std::str::FromStr;
+use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -53,14 +67,7 @@ impl From<AuthServiceError> for TokenError {
 impl From<token::TokenServiceError> for TokenError {
     fn from(value: token::TokenServiceError) -> Self {
         let error = match value {
-            token::TokenServiceError::Unauthorized(_) => {
-                token_error::Error::Unauthorized(ErrorBody {
-                    error: value.to_safe_string(),
-                })
-            }
-            token::TokenServiceError::InternalTokenError(_)
-            | token::TokenServiceError::InternalRepoError(_)
-            | token::TokenServiceError::InternalSerializationError { .. }
+            token::TokenServiceError::InternalRepoError(_)
             | token::TokenServiceError::InternalSecretAlreadyExists { .. } => {
                 token_error::Error::InternalError(ErrorBody {
                     error: value.to_safe_string(),
@@ -87,6 +94,16 @@ impl From<token::TokenServiceError> for TokenError {
     }
 }
 
+impl From<LoginError> for TokenError {
+    fn from(value: LoginError) -> Self {
+        TokenError {
+            error: Some(token_error::Error::InternalError(ErrorBody {
+                error: value.to_safe_string(),
+            })),
+        }
+    }
+}
+
 fn bad_request_error(error: &str) -> TokenError {
     TokenError {
         error: Some(token_error::Error::BadRequest(ErrorsBody {
@@ -98,6 +115,7 @@ fn bad_request_error(error: &str) -> TokenError {
 pub struct TokenGrpcApi {
     pub auth_service: Arc<dyn AuthService + Sync + Send>,
     pub token_service: Arc<dyn token::TokenService + Sync + Send>,
+    pub login_system: Arc<LoginSystem>,
 }
 
 impl TokenGrpcApi {
@@ -122,14 +140,40 @@ impl TokenGrpcApi {
         metadata: MetadataMap,
     ) -> Result<(), TokenError> {
         let auth = self.auth(metadata).await?;
-        let id: TokenId = request
+
+        let token_id: TokenId = request
             .token_id
             .and_then(|id| id.try_into().ok())
             .ok_or_else(|| bad_request_error("Missing token id"))?;
 
-        self.token_service.delete(&id, &auth).await?;
+        match self.token_service.get(&token_id).await {
+            Ok(existing) => {
+                self.auth_service
+                    .authorize_account_action(
+                        &auth,
+                        &existing.account_id,
+                        &AccountAction::DeleteToken,
+                    )
+                    .await?;
 
-        Ok(())
+                if let LoginSystem::Enabled(login_system) = &*self.login_system {
+                    login_system
+                        .login_service
+                        .unlink_temp_token(&token_id)
+                        .await?;
+                };
+
+                self.token_service.delete(&token_id).await?;
+
+                Ok(())
+            }
+            Err(TokenServiceError::UnknownToken(_)) => Err(TokenError {
+                error: Some(token_error::Error::NotFound(ErrorBody {
+                    error: "Token not found".to_string(),
+                })),
+            })?,
+            Err(e) => Err(e)?,
+        }
     }
 
     async fn create(
@@ -146,10 +190,12 @@ impl TokenGrpcApi {
             .create_token_dto
             .and_then(|d| chrono::DateTime::<chrono::Utc>::from_str(d.expires_at.as_str()).ok())
             .ok_or_else(|| bad_request_error("Missing expires at"))?;
-        let result = self
-            .token_service
-            .create(&account_id, &expires_at, &auth)
+
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::CreateToken)
             .await?;
+
+        let result = self.token_service.create(&account_id, &expires_at).await?;
         Ok(result.into())
     }
 
@@ -163,7 +209,13 @@ impl TokenGrpcApi {
             .token_id
             .and_then(|id| id.try_into().ok())
             .ok_or_else(|| bad_request_error("Missing token id"))?;
-        let result = self.token_service.get(&id, &auth).await?;
+
+        let result = self.token_service.get(&id).await?;
+
+        self.auth_service
+            .authorize_account_action(&auth, &result.account_id, &AccountAction::ViewTokens)
+            .await?;
+
         Ok(result.into())
     }
 
@@ -178,7 +230,11 @@ impl TokenGrpcApi {
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
 
-        let result = self.token_service.find(&account_id, &auth).await?;
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::ViewTokens)
+            .await?;
+
+        let result = self.token_service.find(&account_id).await?;
         Ok(result.into_iter().map(|p| p.into()).collect())
     }
 }
@@ -322,4 +378,12 @@ impl TraceErrorKind for TokenTraceErrorKind<'_> {
             },
         }
     }
+}
+
+fn proto_token_id_string(
+    id: &Option<golem_api_grpc::proto::golem::token::TokenId>,
+) -> Option<String> {
+    (*id)
+        .and_then(|v| TryInto::<TokenId>::try_into(v).ok())
+        .map(|v| v.to_string())
 }

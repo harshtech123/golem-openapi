@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AnalysedTypeWithUnit, ParsedFunctionSite, VariableId};
+use crate::{AnalysedTypeWithUnit, ComponentDependencyKey, ParsedFunctionSite, VariableId};
 use bincode::{Decode, Encode};
-use golem_wasm_ast::analysis::AnalysedType;
-use golem_wasm_rpc::ValueAndType;
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::ValueAndType;
 use serde::{Deserialize, Serialize};
 
 // To create any type, example, CreateOption, you have to feed a fully formed AnalysedType
@@ -49,7 +49,12 @@ pub enum RibIR {
     Label(InstructionId),
     Deconstruct,
     CreateFunctionName(ParsedFunctionSite, FunctionReferenceType),
-    InvokeFunction(WorkerNamePresence, usize, AnalysedTypeWithUnit),
+    InvokeFunction(
+        ComponentDependencyKey,
+        InstanceVariable,
+        usize,
+        AnalysedTypeWithUnit,
+    ),
     PushVariant(String, AnalysedType), // There is no arg size since the type of each variant case is only 1 from beginning
     PushEnum(String, AnalysedType),
     Throw(String),
@@ -66,38 +71,13 @@ pub enum RibIR {
     PushToSink,
     SinkToList,
     Length,
+    GenerateWorkerName(Option<VariableId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub enum WorkerNamePresence {
-    Present,
-    Absent,
-}
-
-impl From<golem_api_grpc::proto::golem::rib::WorkerNamePresence> for WorkerNamePresence {
-    fn from(value: golem_api_grpc::proto::golem::rib::WorkerNamePresence) -> Self {
-        match value {
-            golem_api_grpc::proto::golem::rib::WorkerNamePresence::Present => {
-                WorkerNamePresence::Present
-            }
-            golem_api_grpc::proto::golem::rib::WorkerNamePresence::Absent => {
-                WorkerNamePresence::Absent
-            }
-        }
-    }
-}
-
-impl From<WorkerNamePresence> for golem_api_grpc::proto::golem::rib::WorkerNamePresence {
-    fn from(value: WorkerNamePresence) -> Self {
-        match value {
-            WorkerNamePresence::Present => {
-                golem_api_grpc::proto::golem::rib::WorkerNamePresence::Present
-            }
-            WorkerNamePresence::Absent => {
-                golem_api_grpc::proto::golem::rib::WorkerNamePresence::Absent
-            }
-        }
-    }
+pub enum InstanceVariable {
+    WitResource(VariableId),
+    WitWorker(VariableId),
 }
 
 impl RibIR {
@@ -111,41 +91,11 @@ impl RibIR {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum FunctionReferenceType {
-    Function {
-        function: String,
-    },
-    RawResourceConstructor {
-        resource: String,
-    },
-    RawResourceDrop {
-        resource: String,
-    },
-    RawResourceMethod {
-        resource: String,
-        method: String,
-    },
-    RawResourceStaticMethod {
-        resource: String,
-        method: String,
-    },
-    IndexedResourceConstructor {
-        resource: String,
-        arg_size: usize,
-    },
-    IndexedResourceMethod {
-        resource: String,
-        arg_size: usize,
-        method: String,
-    },
-    IndexedResourceStaticMethod {
-        resource: String,
-        arg_size: usize,
-        method: String,
-    },
-    IndexedResourceDrop {
-        resource: String,
-        arg_size: usize,
-    },
+    Function { function: String },
+    RawResourceConstructor { resource: String },
+    RawResourceDrop { resource: String },
+    RawResourceMethod { resource: String, method: String },
+    RawResourceStaticMethod { resource: String, method: String },
 }
 
 // Every instruction can have a unique ID, and the compiler
@@ -179,132 +129,82 @@ impl InstructionId {
     }
 }
 
-#[cfg(feature = "protobuf")]
 mod protobuf {
+    use crate::proto::golem::rib::rib_ir::Instruction;
+    use crate::proto::golem::rib::{
+        And, ConcatInstruction, CreateFunctionNameInstruction, EqualTo, GetTag, GreaterThan,
+        GreaterThanOrEqualTo, InvokeFunctionInstruction, IsEmpty, JumpInstruction, LessThan,
+        LessThanOrEqualTo, Negate, Or, PushListInstruction, PushNoneInstruction,
+        PushTupleInstruction, RibIr as ProtoRibIR, WitResource,
+    };
     use crate::{
-        AnalysedTypeWithUnit, FunctionReferenceType, InstructionId, ParsedFunctionSite, RibIR,
-        WorkerNamePresence,
+        AnalysedTypeWithUnit, ComponentDependencyKey, FunctionReferenceType, InstanceVariable,
+        InstructionId, ParsedFunctionSite, RibIR, VariableId,
     };
-    use golem_api_grpc::proto::golem::rib::rib_ir::Instruction;
-    use golem_api_grpc::proto::golem::rib::{
-        And, CallInstruction, ConcatInstruction, CreateFunctionNameInstruction, EqualTo, GetTag,
-        GreaterThan, GreaterThanOrEqualTo, IsEmpty, JumpInstruction, LessThan, LessThanOrEqualTo,
-        Negate, Or, PushListInstruction, PushNoneInstruction, PushTupleInstruction,
-        RibIr as ProtoRibIR,
-    };
-    use golem_wasm_ast::analysis::{AnalysedType, TypeStr};
-    use golem_wasm_rpc::ValueAndType;
+    use golem_wasm::analysis::{AnalysedType, TypeStr};
 
-    impl TryFrom<golem_api_grpc::proto::golem::rib::FunctionReferenceType> for FunctionReferenceType {
+    impl TryFrom<crate::proto::golem::rib::FunctionReferenceType> for FunctionReferenceType {
         type Error = String;
         fn try_from(
-            value: golem_api_grpc::proto::golem::rib::FunctionReferenceType,
+            value: crate::proto::golem::rib::FunctionReferenceType,
         ) -> Result<Self, Self::Error> {
             let value = value.r#type.ok_or("Missing type".to_string())?;
             let function_reference_type = match value {
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::Function(name) => FunctionReferenceType::Function {
+                crate::proto::golem::rib::function_reference_type::Type::Function(name) => FunctionReferenceType::Function {
                     function: name.name
                 },
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceConstructor(name) =>
+                crate::proto::golem::rib::function_reference_type::Type::RawResourceConstructor(name) =>
                     FunctionReferenceType::RawResourceConstructor {
                         resource: name.resource_name
                     },
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceDrop(name) => FunctionReferenceType::RawResourceDrop {
+                crate::proto::golem::rib::function_reference_type::Type::RawResourceDrop(name) => FunctionReferenceType::RawResourceDrop {
                     resource: name.resource_name
                 },
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceMethod(raw_resource_method) => {
+                crate::proto::golem::rib::function_reference_type::Type::RawResourceMethod(raw_resource_method) => {
                     let resource = raw_resource_method.resource_name;
                     let method = raw_resource_method.method_name;
                     FunctionReferenceType::RawResourceMethod { resource, method }
                 }
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceStaticMethod(raw_resource_static_method) => {
+                crate::proto::golem::rib::function_reference_type::Type::RawResourceStaticMethod(raw_resource_static_method) => {
                     let resource = raw_resource_static_method.resource_name;
                     let method = raw_resource_static_method.method_name;
                     FunctionReferenceType::RawResourceStaticMethod { resource, method }
-                }
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceConstructor(indexed_resource_constructor) => {
-                    let resource = indexed_resource_constructor.resource_name;
-                    let arg_size = indexed_resource_constructor.arg_size;
-                    FunctionReferenceType::IndexedResourceConstructor { resource, arg_size: arg_size as usize }
-                }
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceMethod(indexed_resource_method) => {
-                    let resource = indexed_resource_method.resource_name;
-                    let arg_size = indexed_resource_method.arg_size;
-                    let method = indexed_resource_method.method_name;
-                    FunctionReferenceType::IndexedResourceMethod { resource, arg_size: arg_size as usize, method }
-                }
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceStaticMethod(indexed_resource_static_method) => {
-                    let resource = indexed_resource_static_method.resource_name;
-                    let arg_size = indexed_resource_static_method.arg_size;
-                    let method = indexed_resource_static_method.method_name;
-                    FunctionReferenceType::IndexedResourceStaticMethod { resource, arg_size: arg_size as usize, method }
-                }
-                golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceDrop(indexed_resource_drop) => {
-                    let resource = indexed_resource_drop.resource_name;
-                    let arg_size = indexed_resource_drop.arg_size;
-                    FunctionReferenceType::IndexedResourceDrop { resource, arg_size: arg_size as usize }
                 }
             };
             Ok(function_reference_type)
         }
     }
 
-    impl From<FunctionReferenceType> for golem_api_grpc::proto::golem::rib::FunctionReferenceType {
+    impl From<FunctionReferenceType> for crate::proto::golem::rib::FunctionReferenceType {
         fn from(value: FunctionReferenceType) -> Self {
             match value {
-                FunctionReferenceType::Function { function } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::Function(golem_api_grpc::proto::golem::rib::Function {
+                FunctionReferenceType::Function { function } => crate::proto::golem::rib::FunctionReferenceType {
+                    r#type: Some(crate::proto::golem::rib::function_reference_type::Type::Function(crate::proto::golem::rib::Function {
                         name: function
                     }))
                 },
-                FunctionReferenceType::RawResourceConstructor { resource } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceConstructor(golem_api_grpc::proto::golem::rib::RawResourceConstructor {
+                FunctionReferenceType::RawResourceConstructor { resource } => crate::proto::golem::rib::FunctionReferenceType {
+                    r#type: Some(crate::proto::golem::rib::function_reference_type::Type::RawResourceConstructor(crate::proto::golem::rib::RawResourceConstructor {
                         resource_name: resource
                     }))
                 },
-                FunctionReferenceType::RawResourceDrop { resource } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceDrop(golem_api_grpc::proto::golem::rib::RawResourceDrop {
+                FunctionReferenceType::RawResourceDrop { resource } => crate::proto::golem::rib::FunctionReferenceType {
+                    r#type: Some(crate::proto::golem::rib::function_reference_type::Type::RawResourceDrop(crate::proto::golem::rib::RawResourceDrop {
                         resource_name: resource
                     }))
                 },
-                FunctionReferenceType::RawResourceMethod { resource, method } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceMethod(golem_api_grpc::proto::golem::rib::RawResourceMethod {
+                FunctionReferenceType::RawResourceMethod { resource, method } => crate::proto::golem::rib::FunctionReferenceType {
+                    r#type: Some(crate::proto::golem::rib::function_reference_type::Type::RawResourceMethod(crate::proto::golem::rib::RawResourceMethod {
                         resource_name: resource,
                         method_name: method,
                     }))
                 },
-                FunctionReferenceType::RawResourceStaticMethod { resource, method } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::RawResourceStaticMethod(golem_api_grpc::proto::golem::rib::RawResourceStaticMethod {
+                FunctionReferenceType::RawResourceStaticMethod { resource, method } => crate::proto::golem::rib::FunctionReferenceType {
+                    r#type: Some(crate::proto::golem::rib::function_reference_type::Type::RawResourceStaticMethod(crate::proto::golem::rib::RawResourceStaticMethod {
                         resource_name: resource,
                         method_name: method,
                     }))
                 },
-                FunctionReferenceType::IndexedResourceConstructor { resource, arg_size } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceConstructor(golem_api_grpc::proto::golem::rib::IndexedResourceConstructor {
-                        resource_name: resource,
-                        arg_size: arg_size as u32,
-                    }))
-                },
-                FunctionReferenceType::IndexedResourceMethod { resource, arg_size, method } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceMethod(golem_api_grpc::proto::golem::rib::IndexedResourceMethod {
-                        resource_name: resource,
-                        arg_size: arg_size as u32,
-                        method_name: method,
-                    }))
-                },
-                FunctionReferenceType::IndexedResourceStaticMethod { resource, arg_size, method } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceStaticMethod(golem_api_grpc::proto::golem::rib::IndexedResourceStaticMethod {
-                        resource_name: resource,
-                        arg_size: arg_size as u32,
-                        method_name: method,
-                    }))
-                },
-                FunctionReferenceType::IndexedResourceDrop { resource, arg_size } => golem_api_grpc::proto::golem::rib::FunctionReferenceType {
-                    r#type: Some(golem_api_grpc::proto::golem::rib::function_reference_type::Type::IndexedResourceDrop(golem_api_grpc::proto::golem::rib::IndexedResourceDrop {
-                        resource_name: resource,
-                        arg_size: arg_size as u32,
-                    }))
-                }
             }
         }
     }
@@ -318,10 +218,19 @@ mod protobuf {
                 .ok_or_else(|| "Missing instruction".to_string())?;
 
             match instruction {
-                Instruction::PushLit(value) => {
-                    let value: ValueAndType = value.try_into()?;
-                    Ok(RibIR::PushLit(value))
+                Instruction::GenerateWorkerName(generate_worker_name) => {
+                    let variable_id = generate_worker_name
+                        .variable_id
+                        .map(VariableId::try_from)
+                        .transpose()?;
+
+                    Ok(RibIR::GenerateWorkerName(variable_id))
                 }
+                Instruction::PushLit(value) => Ok(RibIR::PushLit(
+                    value
+                        .try_into()
+                        .map_err(|_| "Failed to convert PushLit".to_string())?,
+                )),
                 Instruction::AssignVar(value) => Ok(RibIR::AssignVar(
                     value
                         .try_into()
@@ -415,8 +324,8 @@ mod protobuf {
                     value.instruction_id as usize,
                 ))),
                 Instruction::Deconstruct(_) => Ok(RibIR::Deconstruct),
-                Instruction::Call(call_instruction) => {
-                    let return_type = match call_instruction.return_type {
+                Instruction::InvokeFunction(invoke_function_instruction) => {
+                    let return_type = match invoke_function_instruction.return_type {
                         Some(return_type) => {
                             let analysed_type = (&return_type)
                                 .try_into()
@@ -427,22 +336,50 @@ mod protobuf {
                         None => AnalysedTypeWithUnit::Unit,
                     };
 
-                    let worker_name_presence = call_instruction
-                        .worker_name_presence
-                        .map(|x| {
-                            golem_api_grpc::proto::golem::rib::WorkerNamePresence::try_from(x)
-                                .map_err(|err| err.to_string())
-                        })
-                        .transpose()?;
+                    let instance_variable: InstanceVariable = invoke_function_instruction
+                        .instance_variable
+                        .ok_or("Missing instance_variable".to_string())
+                        .and_then(|iv| {
+                            match iv
+                                .kind
+                                .ok_or("Missing instance_variable kind".to_string())?
+                            {
+                                crate::proto::golem::rib::instance_variable::Kind::Resource(
+                                    wit_resource,
+                                ) => {
+                                    let variable_id = wit_resource
+                                        .variable_id
+                                        .ok_or("Missing variable_id in WitResource".to_string())?
+                                        .try_into()
+                                        .map_err(|_| "Failed to convert VariableId".to_string())?;
+                                    Ok(InstanceVariable::WitResource(variable_id))
+                                }
+                                crate::proto::golem::rib::instance_variable::Kind::Worker(
+                                    wit_worker,
+                                ) => {
+                                    let variable_id = wit_worker
+                                        .variable_id
+                                        .ok_or("Missing variable_id in WitWorker".to_string())?
+                                        .try_into()
+                                        .map_err(|_| "Failed to convert VariableId".to_string())?;
 
-                    // Default is absent because old rib scripts don't have worker name in it
-                    let worker_name_presence = worker_name_presence
-                        .map(|x| x.into())
-                        .unwrap_or(WorkerNamePresence::Absent);
+                                    Ok(InstanceVariable::WitWorker(variable_id))
+                                }
+                            }
+                        })?;
+
+                    let component_dependency_key_proto = invoke_function_instruction
+                        .component
+                        .ok_or("Missing component_dependency_key".to_string())?;
+
+                    let component_dependency_key =
+                        ComponentDependencyKey::try_from(component_dependency_key_proto)
+                            .map_err(|_| "Failed to convert ComponentDependencyKey".to_string())?;
 
                     Ok(RibIR::InvokeFunction(
-                        worker_name_presence,
-                        call_instruction.argument_count as usize,
+                        component_dependency_key,
+                        instance_variable,
+                        invoke_function_instruction.argument_count as usize,
                         return_type,
                     ))
                 }
@@ -475,10 +412,10 @@ mod protobuf {
                     ))
                 }
                 Instruction::Throw(value) => Ok(RibIR::Throw(value)),
-                Instruction::PushFlag(flag) => {
-                    let flag: ValueAndType = flag.try_into()?;
-                    Ok(RibIR::PushFlag(flag))
-                }
+                Instruction::PushFlag(flag) => Ok(RibIR::PushFlag(
+                    flag.try_into()
+                        .map_err(|_| "Failed to convert PushFlag".to_string())?,
+                )),
                 Instruction::GetTag(_) => Ok(RibIR::GetTag),
                 Instruction::PushTuple(tuple_instruction) => {
                     let tuple_type = tuple_instruction
@@ -536,15 +473,14 @@ mod protobuf {
 
         fn try_from(value: RibIR) -> Result<Self, Self::Error> {
             let instruction = match value {
-                RibIR::PushLit(value) => {
-                    Instruction::PushLit(golem_wasm_rpc::protobuf::TypeAnnotatedValue {
-                        type_annotated_value: Some(
-                            value
-                                .try_into()
-                                .map_err(|errs: Vec<String>| errs.join(", "))?,
-                        ),
+                RibIR::GenerateWorkerName(variable_id) => {
+                    let variable_id_proto = variable_id.map(|v| v.into());
+
+                    Instruction::GenerateWorkerName(crate::proto::golem::rib::GenerateWorkerName {
+                        variable_id: variable_id_proto,
                     })
                 }
+                RibIR::PushLit(value) => Instruction::PushLit(value.into()),
                 RibIR::And => Instruction::And(And {}),
                 RibIR::IsEmpty => Instruction::IsEmpty(IsEmpty {}),
                 RibIR::Or => Instruction::Or(Or {}),
@@ -576,9 +512,9 @@ mod protobuf {
                 RibIR::EqualTo => Instruction::EqualTo(EqualTo {}),
                 RibIR::GreaterThan => Instruction::GreaterThan(GreaterThan {}),
                 RibIR::LessThan => Instruction::LessThan(LessThan {}),
-                RibIR::Length => Instruction::Length(golem_api_grpc::proto::golem::rib::Length {}),
+                RibIR::Length => Instruction::Length(crate::proto::golem::rib::Length {}),
                 RibIR::SelectIndexV1 => {
-                    Instruction::SelectIndexV1(golem_api_grpc::proto::golem::rib::SelectIndexV1 {})
+                    Instruction::SelectIndexV1(crate::proto::golem::rib::SelectIndexV1 {})
                 }
                 RibIR::GreaterThanOrEqualTo => {
                     Instruction::GreaterThanOrEqualTo(GreaterThanOrEqualTo {})
@@ -596,57 +532,82 @@ mod protobuf {
                 RibIR::Deconstruct => {
                     Instruction::Deconstruct((&AnalysedType::Str(TypeStr)).into())
                 } //TODO; remove type in deconstruct from protobuf
-                RibIR::InvokeFunction(worker_name_presence, arg_count, return_type) => {
+                RibIR::InvokeFunction(
+                    component_dependency_key,
+                    worker_name_presence,
+                    arg_count,
+                    return_type,
+                ) => {
                     let typ = match return_type {
                         AnalysedTypeWithUnit::Unit => None,
                         AnalysedTypeWithUnit::Type(analysed_type) => {
-                            let typ =
-                                golem_wasm_ast::analysis::protobuf::Type::from(&analysed_type);
+                            let typ = golem_wasm::protobuf::Type::from(&analysed_type);
                             Some(typ)
                         }
                     };
 
-                    let worker_name_presence: golem_api_grpc::proto::golem::rib::WorkerNamePresence =
-                        worker_name_presence.into();
+                    let instance_variable = match worker_name_presence {
+                        InstanceVariable::WitResource(variable_id) => {
+                            crate::proto::golem::rib::InstanceVariable {
+                                kind: Some(
+                                    crate::proto::golem::rib::instance_variable::Kind::Resource(
+                                        WitResource {
+                                            variable_id: Some(variable_id.into()),
+                                        },
+                                    ),
+                                ),
+                            }
+                        }
+                        InstanceVariable::WitWorker(variable_id) => {
+                            crate::proto::golem::rib::InstanceVariable {
+                                kind: Some(
+                                    crate::proto::golem::rib::instance_variable::Kind::Worker(
+                                        crate::proto::golem::rib::WitWorker {
+                                            variable_id: Some(variable_id.into()),
+                                        },
+                                    ),
+                                ),
+                            }
+                        }
+                    };
 
-                    Instruction::Call(CallInstruction {
+                    let component_dependency_key =
+                        crate::proto::golem::rib::ComponentDependencyKey::from(
+                            component_dependency_key,
+                        );
+
+                    Instruction::InvokeFunction(InvokeFunctionInstruction {
+                        component: Some(component_dependency_key),
                         argument_count: arg_count as u64,
                         return_type: typ,
-                        worker_name_presence: Some(worker_name_presence.into()),
+                        instance_variable: Some(instance_variable),
                     })
                 }
                 RibIR::PushVariant(name, return_type) => {
-                    let typ = golem_wasm_ast::analysis::protobuf::Type::from(&return_type);
+                    let typ = golem_wasm::protobuf::Type::from(&return_type);
 
                     Instruction::VariantConstruction(
-                        golem_api_grpc::proto::golem::rib::VariantConstructionInstruction {
+                        crate::proto::golem::rib::VariantConstructionInstruction {
                             variant_name: name,
                             return_type: Some(typ),
                         },
                     )
                 }
                 RibIR::PushEnum(name, return_type) => {
-                    let typ = golem_wasm_ast::analysis::protobuf::Type::from(&return_type);
+                    let typ = golem_wasm::protobuf::Type::from(&return_type);
 
                     Instruction::EnumConstruction(
-                        golem_api_grpc::proto::golem::rib::EnumConstructionInstruction {
+                        crate::proto::golem::rib::EnumConstructionInstruction {
                             enum_name: name,
                             return_type: Some(typ),
                         },
                     )
                 }
                 RibIR::Throw(msg) => Instruction::Throw(msg),
-                RibIR::PushFlag(flag) => {
-                    Instruction::PushFlag(golem_wasm_rpc::protobuf::TypeAnnotatedValue {
-                        type_annotated_value: Some(
-                            flag.try_into()
-                                .map_err(|errs: Vec<String>| errs.join(", "))?,
-                        ),
-                    })
-                }
+                RibIR::PushFlag(flag) => Instruction::PushFlag(flag.into()),
                 RibIR::GetTag => Instruction::GetTag(GetTag {}),
                 RibIR::PushTuple(analysed_type, size) => {
-                    let typ = golem_wasm_ast::analysis::protobuf::Type::from(&analysed_type);
+                    let typ = golem_wasm::protobuf::Type::from(&analysed_type);
 
                     Instruction::PushTuple(PushTupleInstruction {
                         tuple_type: Some(typ),
@@ -664,22 +625,22 @@ mod protobuf {
                     })
                 }
 
-                RibIR::ToIterator => Instruction::ListToIterator(
-                    golem_api_grpc::proto::golem::rib::ListToIterator {},
-                ),
+                RibIR::ToIterator => {
+                    Instruction::ListToIterator(crate::proto::golem::rib::ListToIterator {})
+                }
                 RibIR::CreateSink(analysed_type) => {
-                    Instruction::CreateSink(golem_api_grpc::proto::golem::rib::CreateSink {
+                    Instruction::CreateSink(crate::proto::golem::rib::CreateSink {
                         list_type: Some((&analysed_type).into()),
                     })
                 }
-                RibIR::AdvanceIterator => Instruction::AdvanceIterator(
-                    golem_api_grpc::proto::golem::rib::AdvanceIterator {},
-                ),
+                RibIR::AdvanceIterator => {
+                    Instruction::AdvanceIterator(crate::proto::golem::rib::AdvanceIterator {})
+                }
                 RibIR::PushToSink => {
-                    Instruction::PushToSink(golem_api_grpc::proto::golem::rib::PushToSink {})
+                    Instruction::PushToSink(crate::proto::golem::rib::PushToSink {})
                 }
                 RibIR::SinkToList => {
-                    Instruction::SinkToList(golem_api_grpc::proto::golem::rib::SinkToList {})
+                    Instruction::SinkToList(crate::proto::golem::rib::SinkToList {})
                 }
             };
 

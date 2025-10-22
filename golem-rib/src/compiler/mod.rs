@@ -14,19 +14,18 @@
 
 pub use byte_code::*;
 pub use compiler_output::*;
-use golem_wasm_ast::analysis::{AnalysedExport, TypeEnum, TypeVariant};
 pub use ir::*;
-use std::error::Error;
-use std::fmt::Display;
 pub use type_with_unit::*;
 pub use worker_functions_in_rib::*;
 
 use crate::rib_type_error::RibTypeError;
-use crate::type_registry::FunctionTypeRegistry;
 use crate::{
-    Expr, FunctionDictionary, GlobalVariableTypeSpec, InferredExpr, RibInputTypeInfo,
-    RibOutputTypeInfo,
+    ComponentDependencies, ComponentDependencyKey, CustomInstanceSpec, Expr,
+    GlobalVariableTypeSpec, InferredExpr, RibInputTypeInfo, RibOutputTypeInfo,
 };
+use golem_wasm::analysis::{AnalysedExport, TypeEnum, TypeVariant};
+use std::error::Error;
+use std::fmt::Display;
 
 mod byte_code;
 mod compiler_output;
@@ -35,82 +34,63 @@ mod ir;
 mod type_with_unit;
 mod worker_functions_in_rib;
 
-/// Compiler configuration options for Rib.
-///
-/// # Fields
-/// - `component_metadata`: Component metadata that describes the worker functions available.
-/// - `global_input_spec`: Defines constraints and types for global input variables.
-///   By default, Rib allows any identifier (e.g., `foo`) to be treated as a global variable.
-///   A global variable is a variable that is not defined in the Rib script but is expected to be provided
-///   by the environment in which the Rib script is executed (e.g., `request`, `env`). Hence it is called `global_input`.
-///   This field can restrict global variables to a predefined set. If the field is empty, any identifier
-///   can be used as a global variable.
-///
-///   You can also associate specific types with known global variables using
-///   `GlobalVariableTypeSpec`. For example, the path `request.path.*` can be enforced to always
-///   be of type `string`. Note that not all global variables require a type specification.
-#[derive(Default)]
-pub struct RibCompilerConfig {
-    component_metadata: Vec<AnalysedExport>,
-    input_spec: Vec<GlobalVariableTypeSpec>,
-}
-
-impl RibCompilerConfig {
-    pub fn new(
-        component_metadata: Vec<AnalysedExport>,
-        input_spec: Vec<GlobalVariableTypeSpec>,
-    ) -> RibCompilerConfig {
-        RibCompilerConfig {
-            component_metadata,
-            input_spec,
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct RibCompiler {
-    function_type_registry: FunctionTypeRegistry,
-    input_spec: Vec<GlobalVariableTypeSpec>,
+    component_dependency: ComponentDependencies,
+    global_variable_type_spec: Vec<GlobalVariableTypeSpec>,
+    custom_instance_spec: Vec<CustomInstanceSpec>,
 }
 
 impl RibCompiler {
     pub fn new(config: RibCompilerConfig) -> RibCompiler {
-        let type_registry = FunctionTypeRegistry::from_export_metadata(&config.component_metadata);
+        let component_dependencies = ComponentDependencies::from_raw(
+            config
+                .component_dependencies
+                .iter()
+                .map(|dep| (dep.component_dependency_key.clone(), &dep.component_exports))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
-        let input_spec = config.input_spec;
+        let global_variable_type_spec = config.input_spec;
 
         RibCompiler {
-            function_type_registry: type_registry,
-            input_spec,
+            component_dependency: component_dependencies,
+            global_variable_type_spec,
+            custom_instance_spec: config.custom_instance_spec,
         }
     }
 
-    pub fn with_component_metadata(&mut self, component_metadata: Vec<AnalysedExport>) {
-        let type_registry = FunctionTypeRegistry::from_export_metadata(&component_metadata);
-
-        self.function_type_registry = type_registry;
-    }
-
-    pub fn with_global_variables(&mut self, global_variables: Vec<GlobalVariableTypeSpec>) {
-        self.input_spec = global_variables;
-    }
-
     pub fn infer_types(&self, expr: Expr) -> Result<InferredExpr, RibCompilationError> {
-        InferredExpr::from_expr(expr, &self.function_type_registry, &self.input_spec)
-            .map_err(RibCompilationError::RibTypeError)
+        InferredExpr::from_expr(
+            expr.clone(),
+            &self.component_dependency,
+            &self.global_variable_type_spec,
+            &self.custom_instance_spec,
+        )
+        .map_err(|err| {
+            let rib_type_error = RibTypeError::from_rib_type_error_internal(err, expr);
+            RibCompilationError::RibTypeError(Box::new(rib_type_error))
+        })
+    }
+
+    pub fn get_custom_instance_names(&self) -> Vec<String> {
+        self.custom_instance_spec
+            .iter()
+            .map(|spec| spec.instance_name.clone())
+            .collect::<Vec<_>>()
     }
 
     // Currently supports only 1 component and hence really only one InstanceType
-    pub fn get_exports(&self) -> Result<FunctionDictionary, RibCompilationError> {
-        FunctionDictionary::from_function_type_registry(&self.function_type_registry)
-            .map_err(|e| RibCompilationError::RibStaticAnalysisError(e.to_string()))
+    pub fn get_component_dependencies(&self) -> ComponentDependencies {
+        self.component_dependency.clone()
     }
 
     pub fn compile(&self, expr: Expr) -> Result<CompilerOutput, RibCompilationError> {
         let inferred_expr = self.infer_types(expr)?;
 
         let function_calls_identified =
-            WorkerFunctionsInRib::from_inferred_expr(&inferred_expr, &self.function_type_registry)?;
+            WorkerFunctionsInRib::from_inferred_expr(&inferred_expr, &self.component_dependency)?;
 
         // The types that are tagged as global input in the script
         let global_input_type_info = RibInputTypeInfo::from_expr(&inferred_expr)?;
@@ -118,7 +98,7 @@ impl RibCompiler {
 
         // allowed_global_variables
         let allowed_global_variables: Vec<String> = self
-            .input_spec
+            .global_variable_type_spec
             .iter()
             .map(|x| x.variable())
             .collect::<Vec<_>>();
@@ -151,11 +131,77 @@ impl RibCompiler {
     }
 
     pub fn get_variants(&self) -> Vec<TypeVariant> {
-        self.function_type_registry.get_variants()
+        self.component_dependency.get_variants()
     }
 
     pub fn get_enums(&self) -> Vec<TypeEnum> {
-        self.function_type_registry.get_enums()
+        self.component_dependency.get_enums()
+    }
+}
+
+/// Compiler configuration options for Rib.
+///
+/// # Fields
+/// - `component_metadata`: Component metadata that describes the worker functions available.
+/// - `global_input_spec`: Defines constraints and types for global input variables.
+///   By default, Rib allows any identifier (e.g., `foo`) to be treated as a global variable.
+///   A global variable is a variable that is not defined in the Rib script but is expected to be provided
+///   by the environment in which the Rib script is executed (e.g., `request`, `env`). Hence it is called `global_input`.
+///   This field can restrict global variables to a predefined set. If the field is empty, any identifier
+///   can be used as a global variable.
+///
+///   You can also associate specific types with known global variables using
+///   `GlobalVariableTypeSpec`. For example, the path `request.path.*` can be enforced to always
+///   be of type `string`. Note that not all global variables require a type specification.
+#[derive(Default)]
+pub struct RibCompilerConfig {
+    component_dependencies: Vec<ComponentDependency>,
+    input_spec: Vec<GlobalVariableTypeSpec>,
+    custom_instance_spec: Vec<CustomInstanceSpec>,
+}
+
+impl RibCompilerConfig {
+    pub fn new(
+        component_dependencies: Vec<ComponentDependency>,
+        input_spec: Vec<GlobalVariableTypeSpec>,
+        custom_instance_spec: Vec<CustomInstanceSpec>,
+    ) -> RibCompilerConfig {
+        RibCompilerConfig {
+            component_dependencies,
+            input_spec,
+            custom_instance_spec,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentDependency {
+    component_dependency_key: ComponentDependencyKey,
+    component_exports: Vec<AnalysedExport>,
+}
+
+impl ComponentDependency {
+    pub fn new(
+        component_dependency_key: ComponentDependencyKey,
+        component_exports: Vec<AnalysedExport>,
+    ) -> Self {
+        Self {
+            component_dependency_key,
+            component_exports,
+        }
+    }
+}
+
+pub trait GenerateWorkerName {
+    fn generate_worker_name(&self) -> String;
+}
+
+pub struct DefaultWorkerNameGenerator;
+
+impl GenerateWorkerName for DefaultWorkerNameGenerator {
+    fn generate_worker_name(&self) -> String {
+        let uuid = uuid::Uuid::new_v4();
+        format!("worker-{uuid}")
     }
 }
 
@@ -164,11 +210,11 @@ pub enum RibCompilationError {
     // Bytecode generation errors should ideally never occur.
     // They are considered programming errors that indicate some part of type checking
     // or inference needs to be fixed.
-    ByteCodeGenerationFail(RibByteCodeGenerationError),
+    ByteCodeGenerationFail(Box<RibByteCodeGenerationError>),
 
     // RibTypeError is a type error that occurs during type inference.
     // This is a typical compilation error, such as: expected u32, found str.
-    RibTypeError(RibTypeError),
+    RibTypeError(Box<RibTypeError>),
 
     // This captures only the syntax parse errors in a Rib script.
     InvalidSyntax(String),
@@ -194,13 +240,13 @@ pub enum RibCompilationError {
 
 impl From<RibByteCodeGenerationError> for RibCompilationError {
     fn from(err: RibByteCodeGenerationError) -> Self {
-        RibCompilationError::RibStaticAnalysisError(err.to_string())
+        RibCompilationError::ByteCodeGenerationFail(Box::new(err))
     }
 }
 
 impl From<RibTypeError> for RibCompilationError {
     fn from(err: RibTypeError) -> Self {
-        RibCompilationError::RibTypeError(err)
+        RibCompilationError::RibTypeError(Box::new(err))
     }
 }
 
@@ -208,10 +254,10 @@ impl Display for RibCompilationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RibCompilationError::RibStaticAnalysisError(msg) => {
-                write!(f, "rib static analysis error: {}", msg)
+                write!(f, "rib static analysis error: {msg}")
             }
-            RibCompilationError::RibTypeError(err) => write!(f, "{}", err),
-            RibCompilationError::InvalidSyntax(msg) => write!(f, "invalid rib syntax: {}", msg),
+            RibCompilationError::RibTypeError(err) => write!(f, "{err}"),
+            RibCompilationError::InvalidSyntax(msg) => write!(f, "invalid rib syntax: {msg}"),
             RibCompilationError::UnsupportedGlobalInput {
                 invalid_global_inputs,
                 valid_global_inputs,
@@ -224,7 +270,7 @@ impl Display for RibCompilationError {
                 )
             }
             RibCompilationError::ByteCodeGenerationFail(e) => {
-                write!(f, "rib byte code generation error: {}", e)
+                write!(f, "{e}")
             }
         }
     }
@@ -255,7 +301,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -282,7 +328,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -309,7 +355,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -337,7 +383,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -368,7 +414,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -394,14 +440,12 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
             error in the following rib found at line 2, column 28
             `1`
-            found within:
-            `foo(1)`
             cause: type mismatch. expected record { a: record { aa: s32, ab: s32, ac: list<s32>, ad: record { ada: s32 }, ae: tuple<s32, string> }, b: u64, c: list<s32>, d: record { da: s32 } }, found s32
             invalid argument to the function `foo`
             "#;
@@ -410,9 +454,10 @@ mod compiler_error_tests {
         }
 
         #[test]
-        fn test_invalid_function_call1() {
+        fn test_invalid_function_call1asdasd() {
             let expr = r#"
-          let result = foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, "foo")}, b: "foo", c: [1, 2, 3], d: {da: 4}});
+          let worker = instance("my-worker");
+          let result = worker.foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, "foo")}, b: "foo", c: [1, 2, 3], d: {da: 4}});
           result
         "#;
 
@@ -420,11 +465,11 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 93
+            error in the following rib found at line 3, column 100
             `"foo"`
             cause: type mismatch. expected u64, found string
             the expression `"foo"` is inferred as `string` by default
@@ -436,7 +481,8 @@ mod compiler_error_tests {
         #[test]
         fn test_invalid_function_call2() {
             let expr = r#"
-          let result = foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, "foo")}, b: 2, c: ["foo", "bar"], d: {da: 4}});
+          let worker = instance("my-worker");
+          let result = worker.foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, "foo")}, b: 2, c: ["foo", "bar"], d: {da: 4}});
           result
         "#;
 
@@ -444,11 +490,11 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 100
+            error in the following rib found at line 3, column 107
             `"foo"`
             cause: type mismatch. expected s32, found string
             the expression `"foo"` is inferred as `string` by default
@@ -460,7 +506,8 @@ mod compiler_error_tests {
         #[test]
         fn test_invalid_function_call3() {
             let expr = r#"
-          let result = foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, "foo")}, b: 2, c: [1, 2], d: {da: "foo"}});
+          let worker = instance();
+          let result = worker.foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, "foo")}, b: 2, c: [1, 2], d: {da: "foo"}});
           result
         "#;
 
@@ -468,11 +515,11 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 115
+            error in the following rib found at line 3, column 122
             `"foo"`
             cause: type mismatch. expected s32, found string
             the expression `"foo"` is inferred as `string` by default
@@ -496,7 +543,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -520,7 +567,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -535,7 +582,8 @@ mod compiler_error_tests {
         #[test]
         fn test_invalid_function_call6() {
             let expr = r#"
-          let result = foo({a: {aa: "foo", ab: 2, ac: [1, 2], ad: {ada: "1"}, ae: (1, "foo")}, b: 3, c: [1, 2, 3], d: {da: 4}});
+          let worker = instance("my-worker");
+          let result = worker.foo({a: {aa: "foo", ab: 2, ac: [1, 2], ad: {ada: "1"}, ae: (1, "foo")}, b: 3, c: [1, 2, 3], d: {da: 4}});
           result
         "#;
 
@@ -543,11 +591,11 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 37
+            error in the following rib found at line 3, column 44
             `"foo"`
             cause: type mismatch. expected s32, found string
             the expression `"foo"` is inferred as `string` by default
@@ -559,7 +607,8 @@ mod compiler_error_tests {
         #[test]
         fn test_invalid_function_call7() {
             let expr = r#"
-          let result = foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: "1"}, ae: (1, "foo")}, b: 3, c: [1, 2, 3], d: {da: 4}});
+          let worker = instance();
+          let result = worker.foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: "1"}, ae: (1, "foo")}, b: 3, c: [1, 2, 3], d: {da: 4}});
           result
         "#;
 
@@ -567,11 +616,11 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 69
+            error in the following rib found at line 3, column 76
             `"1"`
             cause: type mismatch. expected s32, found string
             the expression `"1"` is inferred as `string` by default
@@ -583,19 +632,20 @@ mod compiler_error_tests {
         #[test]
         fn test_invalid_function_call8() {
             let expr = r#"
+            let worker = instance("my-worker");
             let bar = {a: {ac: 1}};
-            foo(bar)
+            worker.foo(bar)
         "#;
 
             let expr = Expr::from_text(expr).unwrap();
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 32
+            error in the following rib found at line 3, column 32
             `1`
             cause: type mismatch. expected list<s32>, found s32
             the expression `1` is inferred as `s32` by default
@@ -607,7 +657,8 @@ mod compiler_error_tests {
         #[test]
         fn test_invalid_function_call9() {
             let expr = r#"
-          let result = foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, 2)}, b: 3, c: [1, 2, 3], d: {da: 4}});
+          let worker = instance("my-worker");
+          let result = worker.foo({a: {aa: 1, ab: 2, ac: [1, 2], ad: {ada: 1}, ae: (1, 2)}, b: 3, c: [1, 2, 3], d: {da: 4}});
           result
         "#;
 
@@ -615,11 +666,11 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
-            error in the following rib found at line 2, column 81
+            error in the following rib found at line 3, column 88
             `2`
             cause: type mismatch. expected string, found s32
             the expression `2` is inferred as `s32` by default
@@ -639,7 +690,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -662,7 +713,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -685,7 +736,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -709,7 +760,7 @@ mod compiler_error_tests {
 
             let metadata = test_utils::get_metadata();
 
-            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![]));
+            let compiler = RibCompiler::new(RibCompilerConfig::new(metadata, vec![], vec![]));
             let error_msg = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
@@ -730,13 +781,13 @@ mod compiler_error_tests {
             let expr = Expr::from_text(expr).unwrap();
             let component_metadata = test_utils::get_metadata();
 
-            let compiler_config = RibCompilerConfig::new(component_metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(component_metadata, vec![], vec![]);
             let compiler = RibCompiler::new(compiler_config);
             let error_message = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
             error in the following rib found at line 3, column 19
-            `cart()`
+            `worker.cart()`
             cause: invalid argument size for function `cart`. expected 1 arguments, found 0
             "#;
 
@@ -752,15 +803,13 @@ mod compiler_error_tests {
             let expr = Expr::from_text(expr).unwrap();
             let component_metadata = test_utils::get_metadata();
 
-            let compiler_config = RibCompilerConfig::new(component_metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(component_metadata, vec![], vec![]);
             let compiler = RibCompiler::new(compiler_config);
             let error_message = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
             error in the following rib found at line 3, column 31
             `1`
-            found within:
-            `cart(1)`
             cause: type mismatch. expected string, found s32
             invalid argument to the function `cart`
             "#;
@@ -778,15 +827,13 @@ mod compiler_error_tests {
             let expr = Expr::from_text(expr).unwrap();
             let component_metadata = test_utils::get_metadata();
 
-            let compiler_config = RibCompilerConfig::new(component_metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(component_metadata, vec![], vec![]);
             let compiler = RibCompiler::new(compiler_config);
             let error_message = compiler.compile(expr).unwrap_err().to_string();
 
             let expected = r#"
             error in the following rib found at line 4, column 22
             `1`
-            found within:
-            `add-item(1)`
             cause: type mismatch. expected record { product-id: string, name: string, price: f32, quantity: u32 }, found s32
             invalid argument to the function `add-item`
             "#;
@@ -804,7 +851,7 @@ mod compiler_error_tests {
             let expr = Expr::from_text(expr).unwrap();
             let component_metadata = test_utils::get_metadata();
 
-            let compiler_config = RibCompilerConfig::new(component_metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(component_metadata, vec![], vec![]);
             let compiler = RibCompiler::new(compiler_config);
             let error_message = compiler.compile(expr).unwrap_err().to_string();
 
@@ -827,7 +874,7 @@ mod compiler_error_tests {
             let expr = Expr::from_text(expr).unwrap();
             let component_metadata = test_utils::get_metadata();
 
-            let compiler_config = RibCompilerConfig::new(component_metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(component_metadata, vec![], vec![]);
             let compiler = RibCompiler::new(compiler_config);
             let error_message = compiler.compile(expr).unwrap_err().to_string();
 
@@ -850,7 +897,7 @@ mod compiler_error_tests {
             let expr = Expr::from_text(expr).unwrap();
             let component_metadata = test_utils::get_metadata();
 
-            let compiler_config = RibCompilerConfig::new(component_metadata, vec![]);
+            let compiler_config = RibCompilerConfig::new(component_metadata, vec![], vec![]);
             let compiler = RibCompiler::new(compiler_config);
             let error_message = compiler.compile(expr).unwrap_err().to_string();
 
@@ -865,13 +912,15 @@ mod compiler_error_tests {
     }
 
     mod test_utils {
-        use golem_wasm_ast::analysis::analysed_type::{
+        use crate::{ComponentDependency, ComponentDependencyKey};
+        use golem_wasm::analysis::analysed_type::{
             case, f32, field, handle, list, record, s32, str, tuple, u32, u64, variant,
         };
-        use golem_wasm_ast::analysis::{
+        use golem_wasm::analysis::{
             AnalysedExport, AnalysedFunction, AnalysedFunctionParameter, AnalysedFunctionResult,
             AnalysedInstance, AnalysedResourceId, AnalysedResourceMode, NameTypePair,
         };
+        use uuid::Uuid;
 
         pub(crate) fn strip_spaces(input: &str) -> String {
             let lines = input.lines();
@@ -896,7 +945,7 @@ mod compiler_error_tests {
             result.strip_prefix("\n").unwrap_or(&result).to_string()
         }
 
-        pub(crate) fn get_metadata() -> Vec<AnalysedExport> {
+        pub(crate) fn get_metadata() -> Vec<ComponentDependency> {
             let function_export = AnalysedExport::Function(AnalysedFunction {
                 name: "foo".to_string(),
                 parameters: vec![AnalysedFunctionParameter {
@@ -947,10 +996,7 @@ mod compiler_error_tests {
                         },
                     ]),
                 }],
-                results: vec![AnalysedFunctionResult {
-                    name: None,
-                    typ: str(),
-                }],
+                result: Some(AnalysedFunctionResult { typ: str() }),
             });
 
             let resource_export = AnalysedExport::Instance(AnalysedInstance {
@@ -962,10 +1008,9 @@ mod compiler_error_tests {
                             name: "cons".to_string(),
                             typ: str(),
                         }],
-                        results: vec![AnalysedFunctionResult {
-                            name: None,
+                        result: Some(AnalysedFunctionResult {
                             typ: handle(AnalysedResourceId(0), AnalysedResourceMode::Owned),
-                        }],
+                        }),
                     },
                     AnalysedFunction {
                         name: "[method]cart.add-item".to_string(),
@@ -984,7 +1029,7 @@ mod compiler_error_tests {
                                 ]),
                             },
                         ],
-                        results: vec![],
+                        result: None,
                     },
                     AnalysedFunction {
                         name: "[method]cart.remove-item".to_string(),
@@ -998,7 +1043,7 @@ mod compiler_error_tests {
                                 typ: str(),
                             },
                         ],
-                        results: vec![],
+                        result: None,
                     },
                     AnalysedFunction {
                         name: "[method]cart.update-item-quantity".to_string(),
@@ -1016,7 +1061,7 @@ mod compiler_error_tests {
                                 typ: u32(),
                             },
                         ],
-                        results: vec![],
+                        result: None,
                     },
                     AnalysedFunction {
                         name: "[method]cart.checkout".to_string(),
@@ -1024,13 +1069,12 @@ mod compiler_error_tests {
                             name: "self".to_string(),
                             typ: handle(AnalysedResourceId(0), AnalysedResourceMode::Borrowed),
                         }],
-                        results: vec![AnalysedFunctionResult {
-                            name: None,
+                        result: Some(AnalysedFunctionResult {
                             typ: variant(vec![
                                 case("error", str()),
                                 case("success", record(vec![field("order-id", str())])),
                             ]),
-                        }],
+                        }),
                     },
                     AnalysedFunction {
                         name: "[method]cart.get-cart-contents".to_string(),
@@ -1038,15 +1082,14 @@ mod compiler_error_tests {
                             name: "self".to_string(),
                             typ: handle(AnalysedResourceId(0), AnalysedResourceMode::Borrowed),
                         }],
-                        results: vec![AnalysedFunctionResult {
-                            name: None,
+                        result: Some(AnalysedFunctionResult {
                             typ: list(record(vec![
                                 field("product-id", str()),
                                 field("name", str()),
                                 field("price", f32()),
                                 field("quantity", u32()),
                             ])),
-                        }],
+                        }),
                     },
                     AnalysedFunction {
                         name: "[method]cart.merge-with".to_string(),
@@ -1060,7 +1103,7 @@ mod compiler_error_tests {
                                 typ: handle(AnalysedResourceId(0), AnalysedResourceMode::Borrowed),
                             },
                         ],
-                        results: vec![],
+                        result: None,
                     },
                     AnalysedFunction {
                         name: "[drop]cart".to_string(),
@@ -1068,12 +1111,23 @@ mod compiler_error_tests {
                             name: "self".to_string(),
                             typ: handle(AnalysedResourceId(0), AnalysedResourceMode::Owned),
                         }],
-                        results: vec![],
+                        result: None,
                     },
                 ],
             });
 
-            vec![function_export, resource_export]
+            let component_dependency = ComponentDependency {
+                component_dependency_key: ComponentDependencyKey {
+                    component_name: "some_name".to_string(),
+                    component_id: Uuid::new_v4(),
+                    component_version: 0,
+                    root_package_name: None,
+                    root_package_version: None,
+                },
+                component_exports: vec![function_export, resource_export],
+            };
+
+            vec![component_dependency]
         }
     }
 }

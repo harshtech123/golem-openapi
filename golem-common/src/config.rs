@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use crate::model::RetryConfig;
+use crate::SafeDisplay;
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::value::Value;
 use figment::Figment;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqliteJournalMode;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
@@ -25,8 +26,8 @@ use url::Url;
 const ENV_VAR_PREFIX: &str = "GOLEM__";
 const ENV_VAR_NESTED_SEPARATOR: &str = "__";
 
-pub trait ConfigLoaderConfig: Default + Serialize + Deserialize<'static> {}
-impl<T: Default + Serialize + Deserialize<'static>> ConfigLoaderConfig for T {}
+pub trait ConfigLoaderConfig: Default + Serialize + Deserialize<'static> + SafeDisplay {}
+impl<T: Default + Serialize + Deserialize<'static> + SafeDisplay> ConfigLoaderConfig for T {}
 
 pub type ConfigExample<T> = (&'static str, T);
 
@@ -86,7 +87,7 @@ impl<T: ConfigLoaderConfig> ConfigLoader<T> {
     }
 
     pub fn load(&self) -> figment::Result<T> {
-        self.figment().extract()
+        self.figment().extract::<T>()
     }
 
     fn default_dump_source(&self) -> dump::Source {
@@ -118,7 +119,7 @@ impl<T: ConfigLoaderConfig> ConfigLoader<T> {
             "--dump-config-toml" => self.dump(self.loaded_dump_source(), &dump::toml()),
             other => {
                 if other.starts_with("--dump-config") {
-                    panic!("Unknown dump config parameter: {}", other);
+                    panic!("Unknown dump config parameter: {other}");
                 } else {
                     match self.load() {
                         Ok(config) => Some(config),
@@ -155,7 +156,7 @@ impl<T: ConfigLoaderConfig> ConfigLoader<T> {
                 dump_figment("Generated from default config", false, &default);
                 for (name, example) in examples {
                     dump_figment(
-                        &format!("Generated from example config: {}", name),
+                        &format!("Generated from example config: {name}"),
                         true,
                         &example,
                     );
@@ -246,17 +247,17 @@ pub(crate) mod dump {
             if is_example {
                 println!();
             }
-            println!(":: {}\n", header)
+            println!(":: {header}\n")
         }
 
         fn value(&self, path: &[&str], name: &str, metadata: Option<&Metadata>, value: &Value) {
             if !path.is_empty() {
                 for elem in path {
-                    print!("{}.", elem);
+                    print!("{elem}.");
                 }
             }
             if !name.is_empty() {
-                print!("{}", name);
+                print!("{name}");
             }
 
             print!(
@@ -269,7 +270,7 @@ pub(crate) mod dump {
                 let source = metadata
                     .and_then(|m| m.source.as_ref())
                     .map_or("unknown".to_owned(), |s| s.to_string());
-                println!(" ({} - {})", name, source);
+                println!(" ({name} - {source})");
             } else {
                 println!()
             }
@@ -283,7 +284,7 @@ pub(crate) mod dump {
             if is_example {
                 println!();
             }
-            println!("### {}\n", header)
+            println!("### {header}\n")
         }
 
         fn value(&self, path: &[&str], name: &str, _metadata: Option<&Metadata>, value: &Value) {
@@ -293,7 +294,7 @@ pub(crate) mod dump {
                 print!("#");
             }
 
-            print!("{}", ENV_VAR_PREFIX);
+            print!("{ENV_VAR_PREFIX}");
 
             if !path.is_empty() {
                 for elem in path {
@@ -322,7 +323,7 @@ pub(crate) mod dump {
             if is_example {
                 println!();
             }
-            println!("## {}", header);
+            println!("## {header}");
 
             let mut config_as_toml_str =
                 toml::to_string(value).expect("Failed to serialize as TOML");
@@ -330,12 +331,12 @@ pub(crate) mod dump {
             if is_example {
                 config_as_toml_str = config_as_toml_str
                     .lines()
-                    .map(|l| format!("# {}", l))
+                    .map(|l| format!("# {l}"))
                     .collect::<Vec<String>>()
                     .join("\n")
             }
 
-            println!("{}", config_as_toml_str);
+            println!("{config_as_toml_str}");
         }
     }
 }
@@ -360,6 +361,27 @@ impl RedisConfig {
             self.host, self.port, self.database
         ))
         .expect("Failed to parse Redis URL")
+    }
+}
+
+impl SafeDisplay for RedisConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "host: {}", self.host);
+        let _ = writeln!(&mut result, "port: {}", self.port);
+        let _ = writeln!(&mut result, "database: {}", self.database);
+        let _ = writeln!(&mut result, "tracing: {}", self.tracing);
+        let _ = writeln!(&mut result, "pool size: {}", self.pool_size);
+        if !self.key_prefix.is_empty() {
+            let _ = writeln!(&mut result, "key prefix: {}", self.key_prefix);
+        }
+        if self.username.is_some() {
+            let _ = writeln!(&mut result, "username: ****");
+        }
+        if self.password.is_some() {
+            let _ = writeln!(&mut result, "password: ****");
+        }
+        result
     }
 }
 
@@ -405,6 +427,16 @@ impl RetryConfig {
             max_jitter_factor: Some(0.15),
         }
     }
+
+    pub fn no_retries() -> RetryConfig {
+        Self {
+            max_attempts: 0,
+            min_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            multiplier: 1.0,
+            max_jitter_factor: None,
+        }
+    }
 }
 
 pub fn env_config_provider() -> Env {
@@ -416,6 +448,23 @@ pub fn env_config_provider() -> Env {
 pub enum DbConfig {
     Postgres(DbPostgresConfig),
     Sqlite(DbSqliteConfig),
+}
+
+impl SafeDisplay for DbConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        match self {
+            DbConfig::Postgres(postgres) => {
+                let _ = writeln!(&mut result, "postgres:");
+                let _ = writeln!(&mut result, "{}", postgres.to_safe_string_indented());
+            }
+            DbConfig::Sqlite(sqlite) => {
+                let _ = writeln!(&mut result, "sqlite:");
+                let _ = writeln!(&mut result, "{}", sqlite.to_safe_string_indented());
+            }
+        }
+        result
+    }
 }
 
 impl Default for DbConfig {
@@ -448,12 +497,20 @@ pub struct DbSqliteConfig {
 }
 
 impl DbSqliteConfig {
-    #[cfg(feature = "sql")]
     pub fn connect_options(&self) -> sqlx::sqlite::SqliteConnectOptions {
         sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&self.database)
-            .journal_mode(SqliteJournalMode::Wal)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .create_if_missing(true)
+    }
+}
+
+impl SafeDisplay for DbSqliteConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "database: {}", self.database);
+        let _ = writeln!(&mut result, "max connections: {}", self.max_connections);
+        result
     }
 }
 
@@ -469,7 +526,6 @@ pub struct DbPostgresConfig {
 }
 
 impl DbPostgresConfig {
-    #[cfg(feature = "sql")]
     pub fn connect_options(&self) -> sqlx::postgres::PgConnectOptions {
         sqlx::postgres::PgConnectOptions::new()
             .host(&self.host)
@@ -477,5 +533,21 @@ impl DbPostgresConfig {
             .database(&self.database)
             .username(&self.username)
             .password(&self.password)
+    }
+}
+
+impl SafeDisplay for DbPostgresConfig {
+    fn to_safe_string(&self) -> String {
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "host: {}", self.host);
+        let _ = writeln!(&mut result, "port: {}", self.port);
+        let _ = writeln!(&mut result, "database: {}", self.database);
+        let _ = writeln!(&mut result, "username: ****");
+        let _ = writeln!(&mut result, "password: ****");
+        let _ = writeln!(&mut result, "max connections: {}", self.max_connections);
+        if let Some(schema) = &self.schema {
+            let _ = writeln!(&mut result, "schema: {schema}");
+        }
+        result
     }
 }

@@ -12,84 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::ProjectId;
 use crate::base_model::{ComponentId, ComponentVersion};
-use crate::model::plugin::{DefaultPluginOwner, PluginOwner};
-use crate::model::{AccountId, PoemTypeRequirements};
+use crate::model::AccountId;
 use bincode::{Decode, Encode};
+use core::fmt;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
-pub trait ComponentOwner:
-    Debug
-    + Display
-    + FromStr<Err = String>
-    + Clone
-    + PartialEq
-    + Serialize
-    + for<'de> Deserialize<'de>
-    + PoemTypeRequirements
-    + Send
-    + Sync
-    + 'static
-{
-    #[cfg(feature = "sql")]
-    type Row: crate::repo::RowMeta<sqlx::Sqlite>
-        + crate::repo::RowMeta<sqlx::Postgres>
-        + for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow>
-        + for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>
-        + From<Self>
-        + TryInto<Self, Error = String>
-        + Into<<Self::PluginOwner as PluginOwner>::Row>
-        + Clone
-        + Display
-        + Send
-        + Sync
-        + Unpin
-        + 'static;
-
-    type PluginOwner: PluginOwner + From<Self>;
-
-    fn account_id(&self) -> AccountId;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
+pub struct ComponentOwner {
+    pub project_id: ProjectId,
+    pub account_id: AccountId,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
-#[serde(rename_all = "camelCase")]
-pub struct DefaultComponentOwner;
-
-impl Display for DefaultComponentOwner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "default")
+impl Display for ComponentOwner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.account_id, self.project_id)
     }
 }
 
-impl FromStr for DefaultComponentOwner {
+impl FromStr for ComponentOwner {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == "default" {
-            Ok(DefaultComponentOwner)
-        } else {
-            Err("Failed to parse empty namespace".to_string())
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid namespace: {s}"));
         }
-    }
-}
 
-impl From<DefaultComponentOwner> for DefaultPluginOwner {
-    fn from(_value: DefaultComponentOwner) -> Self {
-        DefaultPluginOwner
-    }
-}
-
-impl ComponentOwner for DefaultComponentOwner {
-    #[cfg(feature = "sql")]
-    type Row = crate::repo::component::DefaultComponentOwnerRow;
-    type PluginOwner = DefaultPluginOwner;
-
-    fn account_id(&self) -> AccountId {
-        AccountId::placeholder()
+        Ok(Self {
+            project_id: ProjectId::try_from(parts[1])?,
+            account_id: AccountId::from(parts[0]),
+        })
     }
 }
 
@@ -97,9 +56,8 @@ impl ComponentOwner for DefaultComponentOwner {
     Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize, Encode, Decode,
 )]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
-
+#[derive(poem_openapi::Object)]
+#[oai(rename_all = "camelCase")]
 pub struct VersionedComponentId {
     pub component_id: ComponentId,
     pub version: ComponentVersion,
@@ -111,7 +69,6 @@ impl Display for VersionedComponentId {
     }
 }
 
-#[cfg(feature = "protobuf")]
 mod protobuf {
     use crate::model::component::VersionedComponentId;
 

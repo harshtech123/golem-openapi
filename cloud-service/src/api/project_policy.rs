@@ -1,11 +1,26 @@
-use crate::api::{ApiError, ApiResult, ApiTags};
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::api::{ApiError, ApiResult};
 use crate::model::*;
 use crate::service::auth::AuthService;
 use crate::service::project_policy::ProjectPolicyService;
-use cloud_common::auth::GolemSecurityScheme;
-use cloud_common::model::ProjectPolicyId;
 use golem_common::model::error::ErrorBody;
+use golem_common::model::ProjectPolicyId;
 use golem_common::recorded_http_api_request;
+use golem_service_base::api_tags::ApiTags;
+use golem_service_base::model::auth::GolemSecurityScheme;
 use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::*;
@@ -13,8 +28,8 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 pub struct ProjectPolicyApi {
-    pub auth_service: Arc<dyn AuthService + Sync + Send>,
-    pub project_policy_service: Arc<dyn ProjectPolicyService + Sync + Send>,
+    pub auth_service: Arc<dyn AuthService>,
+    pub project_policy_service: Arc<dyn ProjectPolicyService>,
 }
 
 #[OpenApi(prefix_path = "/v1/project-policies", tag = ApiTags::ProjectPolicy)]

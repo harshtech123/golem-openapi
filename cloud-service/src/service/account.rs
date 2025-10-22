@@ -1,17 +1,29 @@
-use crate::auth::AccountAuthorisation;
-use crate::model::{Account, AccountAction, AccountData, GlobalAction, Plan};
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::auth::{AuthServiceError, ViewableAccounts};
+use crate::model::{Account, AccountData, Plan};
 use crate::repo::account::{AccountRecord, AccountRepo};
 use crate::service::plan::{PlanError, PlanService};
 use async_trait::async_trait;
-use cloud_common::model::PlanId;
 use golem_common::model::AccountId;
+use golem_common::model::PlanId;
 use golem_common::SafeDisplay;
 use golem_service_base::repo::RepoError;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::{error, info};
-
-use super::auth::{AuthService, AuthServiceError, ViewableAccounts};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
@@ -50,60 +62,36 @@ impl From<String> for AccountError {
 
 #[async_trait]
 pub trait AccountService: Send + Sync {
-    async fn create(
-        &self,
-        id: &AccountId,
-        account: &AccountData,
-        auth: &AccountAuthorisation,
-    ) -> Result<Account, AccountError>;
+    async fn create(&self, id: &AccountId, account: &AccountData) -> Result<Account, AccountError>;
 
     async fn update(
         &self,
         account_id: &AccountId,
         account: &AccountData,
-        auth: &AccountAuthorisation,
     ) -> Result<Account, AccountError>;
 
-    async fn get(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<Account, AccountError>;
+    async fn get(&self, account_id: &AccountId) -> Result<Account, AccountError>;
 
     /// Get all matching accounts. This will return your account + all accounts that you got access through at least one grant.
     async fn find(
         &self,
         email: Option<&str>,
-        auth: &AccountAuthorisation,
+        viewable_accounts: ViewableAccounts,
     ) -> Result<Vec<Account>, AccountError>;
 
-    async fn get_plan(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<Plan, AccountError>;
+    async fn get_plan(&self, account_id: &AccountId) -> Result<Plan, AccountError>;
 
-    async fn delete(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<(), AccountError>;
+    async fn delete(&self, account_id: &AccountId) -> Result<(), AccountError>;
 }
 
 pub struct AccountServiceDefault {
-    auth_service: Arc<dyn AuthService>,
-    account_repo: Arc<dyn AccountRepo + Sync + Send>,
-    plan_service: Arc<dyn PlanService + Sync + Send>,
+    account_repo: Arc<dyn AccountRepo>,
+    plan_service: Arc<dyn PlanService>,
 }
 
 impl AccountServiceDefault {
-    pub fn new(
-        auth_service: Arc<dyn AuthService>,
-        account_repo: Arc<dyn AccountRepo + Sync + Send>,
-        plan_service: Arc<dyn PlanService + Sync + Send>,
-    ) -> Self {
+    pub fn new(account_repo: Arc<dyn AccountRepo>, plan_service: Arc<dyn PlanService>) -> Self {
         AccountServiceDefault {
-            auth_service,
             account_repo,
             plan_service,
         }
@@ -122,16 +110,7 @@ impl AccountServiceDefault {
 
 #[async_trait]
 impl AccountService for AccountServiceDefault {
-    async fn create(
-        &self,
-        id: &AccountId,
-        account: &AccountData,
-        auth: &AccountAuthorisation,
-    ) -> Result<Account, AccountError> {
-        self.auth_service
-            .authorize_global_action(auth, &GlobalAction::CreateAccount)
-            .await?;
-
+    async fn create(&self, id: &AccountId, account: &AccountData) -> Result<Account, AccountError> {
         let plan_id = self.get_default_plan_id().await?;
         info!("Creating account: {}", id);
         match self
@@ -145,7 +124,7 @@ impl AccountService for AccountServiceDefault {
             .await
         {
             Ok(Some(account_record)) => Ok(account_record.into()),
-            Ok(None) => Err(format!("Duplicated account on fresh id: {}", id).into()),
+            Ok(None) => Err(format!("Duplicated account on fresh id: {id}").into()),
             Err(err) => {
                 error!("DB call failed. {}", err);
                 Err(err.into())
@@ -157,12 +136,7 @@ impl AccountService for AccountServiceDefault {
         &self,
         account_id: &AccountId,
         account: &AccountData,
-        auth: &AccountAuthorisation,
     ) -> Result<Account, AccountError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::UpdateAccount)
-            .await?;
-
         info!("Updating account: {}", account_id);
         let current_account = self.account_repo.get(&account_id.value).await?;
         let plan_id = match current_account {
@@ -187,15 +161,7 @@ impl AccountService for AccountServiceDefault {
         }
     }
 
-    async fn get(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<Account, AccountError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::ViewAccount)
-            .await?;
-
+    async fn get(&self, account_id: &AccountId) -> Result<Account, AccountError> {
         info!("Get account: {}", account_id);
 
         let result = self.account_repo.get(&account_id.value).await;
@@ -213,11 +179,9 @@ impl AccountService for AccountServiceDefault {
     async fn find(
         &self,
         email: Option<&str>,
-        auth: &AccountAuthorisation,
+        viewable_accounts: ViewableAccounts,
     ) -> Result<Vec<Account>, AccountError> {
-        let visible_accounts = self.auth_service.viewable_accounts(auth).await?;
-
-        let results = match visible_accounts {
+        let results = match viewable_accounts {
             ViewableAccounts::All => self.account_repo.find_all(email).await?,
             ViewableAccounts::Limited { account_ids } => {
                 let ids = account_ids
@@ -231,15 +195,7 @@ impl AccountService for AccountServiceDefault {
         Ok(results.into_iter().map(|v| v.into()).collect())
     }
 
-    async fn get_plan(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<Plan, AccountError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::ViewPlan)
-            .await?;
-
+    async fn get_plan(&self, account_id: &AccountId) -> Result<Plan, AccountError> {
         info!("Get plan: {}", account_id);
 
         let result = self.account_repo.get(&account_id.value).await;
@@ -266,20 +222,7 @@ impl AccountService for AccountServiceDefault {
         }
     }
 
-    async fn delete(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<(), AccountError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::DeleteAccount)
-            .await?;
-
-        if auth.token.account_id == *account_id {
-            return Err(AccountError::ArgValidation(vec![
-                "Cannot delete current account.".to_string(),
-            ]));
-        }
+    async fn delete(&self, account_id: &AccountId) -> Result<(), AccountError> {
         let result = self.account_repo.delete(&account_id.value).await;
         match result {
             Ok(_) => Ok(()),

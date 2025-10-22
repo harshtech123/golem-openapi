@@ -12,43 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, RwLock};
-
-use crate::error::GolemError;
+use super::golem_config::GolemConfig;
+use super::{HasConfig, HasOplogService};
 use crate::metrics::workers::record_worker_call;
-use crate::model::ExecutionStatus;
 use crate::services::oplog::OplogService;
 use crate::services::shard::ShardService;
 use crate::storage::keyvalue::{
     KeyValueStorage, KeyValueStorageLabelledApi, KeyValueStorageNamespace,
 };
+use crate::worker::status::calculate_last_known_status_for_existing_worker;
 use async_trait::async_trait;
 use golem_common::model::oplog::{OplogEntry, OplogIndex};
-use golem_common::model::regions::DeletedRegions;
 use golem_common::model::{
-    ComponentType, OwnedWorkerId, ShardId, Timestamp, WorkerId, WorkerMetadata, WorkerStatus,
-    WorkerStatusRecord, WorkerStatusRecordExtensions,
+    ComponentType, OwnedWorkerId, ShardId, WorkerId, WorkerMetadata, WorkerStatus,
+    WorkerStatusRecord,
 };
-use tracing::{debug, warn};
+use std::sync::Arc;
+use tracing::debug;
+
+#[derive(Debug, Clone)]
+pub struct GetWorkerMetadataResult {
+    // Status of the worker at the time of the create oplog entry
+    pub initial_worker_metadata: WorkerMetadata,
+    // Last known cached status of the worker. Might be outdated
+    pub last_known_status: Option<WorkerStatusRecord>,
+}
 
 /// Service for persisting the current set of Golem workers represented by their metadata
 #[async_trait]
 pub trait WorkerService: Send + Sync {
-    async fn add(
-        &self,
-        worker_metadata: &WorkerMetadata,
-        component_type: ComponentType,
-    ) -> Result<Arc<RwLock<ExecutionStatus>>, GolemError>;
+    async fn get(&self, owned_worker_id: &OwnedWorkerId) -> Option<GetWorkerMetadataResult>;
 
-    async fn get(&self, owned_worker_id: &OwnedWorkerId) -> Option<WorkerMetadata>;
-
-    async fn get_running_workers_in_shards(&self) -> Vec<WorkerMetadata>;
+    async fn get_running_workers_in_shards(&self) -> Vec<GetWorkerMetadataResult>;
 
     async fn remove(&self, owned_worker_id: &OwnedWorkerId);
 
     async fn remove_cached_status(&self, owned_worker_id: &OwnedWorkerId);
 
-    async fn update_status(
+    async fn update_cached_status(
         &self,
         owned_worker_id: &OwnedWorkerId,
         status_value: &WorkerStatusRecord,
@@ -61,6 +62,7 @@ pub struct DefaultWorkerService {
     key_value_storage: Arc<dyn KeyValueStorage + Send + Sync>,
     shard_service: Arc<dyn ShardService>,
     oplog_service: Arc<dyn OplogService>,
+    config: Arc<GolemConfig>,
 }
 
 impl DefaultWorkerService {
@@ -68,15 +70,17 @@ impl DefaultWorkerService {
         key_value_storage: Arc<dyn KeyValueStorage + Send + Sync>,
         shard_service: Arc<dyn ShardService>,
         oplog_service: Arc<dyn OplogService>,
+        config: Arc<GolemConfig>,
     ) -> Self {
         Self {
             key_value_storage,
             shard_service,
             oplog_service,
+            config,
         }
     }
 
-    async fn enum_workers_at_key(&self, key: &str) -> Vec<WorkerMetadata> {
+    async fn enum_workers_at_key(&self, key: &str) -> Vec<GetWorkerMetadataResult> {
         record_worker_call("enum");
 
         let value: Vec<OwnedWorkerId> = self
@@ -110,80 +114,7 @@ impl DefaultWorkerService {
 
 #[async_trait]
 impl WorkerService for DefaultWorkerService {
-    async fn add(
-        &self,
-        worker_metadata: &WorkerMetadata,
-        component_type: ComponentType,
-    ) -> Result<Arc<RwLock<ExecutionStatus>>, GolemError> {
-        record_worker_call("add");
-
-        let worker_id = &worker_metadata.worker_id;
-        let owned_worker_id = OwnedWorkerId::new(&worker_metadata.account_id, worker_id);
-
-        let initial_oplog_entry = OplogEntry::create(
-            worker_metadata.worker_id.clone(),
-            worker_metadata.last_known_status.component_version,
-            worker_metadata.args.clone(),
-            worker_metadata.env.clone(),
-            worker_metadata.account_id.clone(),
-            worker_metadata.parent.clone(),
-            worker_metadata.last_known_status.component_size,
-            worker_metadata.last_known_status.total_linear_memory_size,
-            worker_metadata.last_known_status.active_plugins().clone(),
-        );
-
-        let execution_status = Arc::new(RwLock::new(ExecutionStatus::Suspended {
-            last_known_status: worker_metadata.last_known_status.clone(),
-            component_type,
-            timestamp: Timestamp::now_utc(),
-        }));
-
-        self.oplog_service
-            .create(
-                &owned_worker_id,
-                initial_oplog_entry,
-                worker_metadata.clone(),
-                execution_status.clone(),
-            )
-            .await;
-
-        if component_type != ComponentType::Ephemeral {
-            self.key_value_storage
-                .with_entity("worker", "add", "worker_status")
-                .set(
-                    KeyValueStorageNamespace::Worker,
-                    &Self::status_key(worker_id),
-                    &worker_metadata.last_known_status,
-                )
-                .await
-                .unwrap_or_else(|err| panic!("failed to set worker status in KV storage: {err}"));
-
-            if worker_metadata.last_known_status.status == WorkerStatus::Running {
-                let shard_assignment = self.shard_service.current_assignment()?;
-                let shard_id =
-                    ShardId::from_worker_id(worker_id, shard_assignment.number_of_shards);
-
-                debug!(
-                    "Adding worker to the list of running workers for shard {shard_id} in KV storage"
-                );
-
-                self
-                    .key_value_storage
-                    .with_entity("worker", "add", "worker_id")
-                    .add_to_set(KeyValueStorageNamespace::Worker, &Self::running_in_shard_key(&shard_id), &owned_worker_id)
-                    .await
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "failed to add worker to the set of running workers per shard ids in KV storage: {err}"
-                        )
-                    });
-            }
-        }
-
-        Ok(execution_status)
-    }
-
-    async fn get(&self, owned_worker_id: &OwnedWorkerId) -> Option<WorkerMetadata> {
+    async fn get(&self, owned_worker_id: &OwnedWorkerId) -> Option<GetWorkerMetadataResult> {
         record_worker_call("get");
 
         let initial_oplog_entry = self
@@ -197,89 +128,44 @@ impl WorkerService for DefaultWorkerService {
             None => None,
             Some((
                 _,
-                OplogEntry::CreateV1 {
-                    worker_id,
-                    component_version,
-                    args,
-                    env,
-                    account_id,
-                    timestamp,
-                    parent,
-                    component_size,
-                    initial_total_linear_memory_size,
-                },
-            )) => {
-                let mut details = WorkerMetadata {
-                    worker_id,
-                    args,
-                    env,
-                    account_id,
-                    created_at: timestamp,
-                    parent,
-                    last_known_status: WorkerStatusRecord {
-                        component_version,
-                        component_size,
-                        total_linear_memory_size: initial_total_linear_memory_size,
-                        ..WorkerStatusRecord::default()
-                    },
-                };
-
-                let status_value: Option<WorkerStatusRecord> = self
-                    .key_value_storage
-                    .with_entity("worker", "get", "worker_status")
-                    .get(
-                        KeyValueStorageNamespace::Worker,
-                        &Self::status_key(&owned_worker_id.worker_id),
-                    )
-                    .await
-                    .unwrap_or_else(|err| {
-                        panic!("failed to get worker status for {owned_worker_id} from KV storage: {err}")
-                    });
-
-                if let Some(status) = status_value {
-                    details.last_known_status = status;
-                }
-
-                Some(details)
-            }
-            Some((
-                _,
                 OplogEntry::Create {
                     worker_id,
                     component_version,
                     args,
                     env,
-                    account_id,
+                    project_id,
+                    created_by,
                     timestamp,
                     parent,
                     component_size,
                     initial_total_linear_memory_size,
                     initial_active_plugins,
+                    wasi_config_vars,
                 },
             )) => {
-                let mut details = WorkerMetadata {
+                let initial_worker_metadata = WorkerMetadata {
                     worker_id,
                     args,
                     env,
-                    account_id,
+                    wasi_config_vars,
+                    project_id,
+                    created_by,
                     created_at: timestamp,
                     parent,
                     last_known_status: WorkerStatusRecord {
                         component_version,
+                        component_version_for_replay: component_version,
                         component_size,
                         total_linear_memory_size: initial_total_linear_memory_size,
-                        extensions: WorkerStatusRecordExtensions::Extension2 {
-                            active_plugins: initial_active_plugins,
-                            deleted_regions: DeletedRegions::new(),
-                        },
+                        active_plugins: initial_active_plugins,
                         ..WorkerStatusRecord::default()
                     },
                 };
 
-                let status_value: Option<WorkerStatusRecord> = self
+                let status_value: Option<Result<WorkerStatusRecord, String>> = self
                     .key_value_storage
                     .with_entity("worker", "get", "worker_status")
-                    .get(
+                    .get_attempt_deserialize(
                         KeyValueStorageNamespace::Worker,
                         &Self::status_key(&owned_worker_id.worker_id),
                     )
@@ -288,47 +174,41 @@ impl WorkerService for DefaultWorkerService {
                         panic!("failed to get worker status for {owned_worker_id} from KV storage: {err}")
                     });
 
-                if let Some(status) = status_value {
-                    details.last_known_status = status;
-                }
+                let last_known_status = match status_value {
+                    Some(Ok(status)) => Some(status),
+                    // We had a status, but it was written in a previous format and is not longer valid -> recompute
+                    Some(Err(_)) => {
+                        let last_known_status = calculate_last_known_status_for_existing_worker(
+                            self,
+                            owned_worker_id,
+                            None,
+                        )
+                        .await;
 
-                Some(details)
-            }
-            Some((_, entry)) => {
-                // This should never happen, but there were some issues previously causing a corrupt oplog
-                // leading to this state.
-                //
-                // There is no point in panicking and restarting the executor here, as the corrupt oplog
-                // will most likely remain as it is.
-                //
-                // So to save the executor's state we return a "fake" failed worker metadata.
+                        self.update_cached_status(
+                            owned_worker_id,
+                            &last_known_status,
+                            ComponentType::Durable,
+                        )
+                        .await;
 
-                warn!(
-                    worker_id = owned_worker_id.to_string(),
-                    oplog_entry = format!("{entry:?}"),
-                    "Unexpected initial oplog entry found, returning fake failed worker metadata"
-                );
-                let last_oplog_idx = self.oplog_service.get_last_index(owned_worker_id).await;
-                Some(WorkerMetadata {
-                    worker_id: owned_worker_id.worker_id(),
-                    args: vec![],
-                    env: vec![],
-                    account_id: owned_worker_id.account_id(),
-                    created_at: Timestamp::now_utc(),
-                    parent: None,
-                    last_known_status: WorkerStatusRecord {
-                        status: WorkerStatus::Failed,
-                        oplog_idx: last_oplog_idx,
-                        ..WorkerStatusRecord::default()
-                    },
+                        Some(last_known_status)
+                    }
+                    None => None,
+                };
+
+                Some(GetWorkerMetadataResult {
+                    initial_worker_metadata,
+                    last_known_status,
                 })
             }
+            Some(_) => panic!("Encountered malformed oplog without create oplog entry"),
         }
     }
 
-    async fn get_running_workers_in_shards(&self) -> Vec<WorkerMetadata> {
+    async fn get_running_workers_in_shards(&self) -> Vec<GetWorkerMetadataResult> {
         let shard_assignment = self.shard_service.try_get_current_assignment();
-        let mut result: Vec<WorkerMetadata> = vec![];
+        let mut result: Vec<GetWorkerMetadataResult> = vec![];
         if let Some(shard_assignment) = shard_assignment {
             for shard_id in shard_assignment.shard_ids {
                 let key = Self::running_in_shard_key(&shard_id);
@@ -381,7 +261,7 @@ impl WorkerService for DefaultWorkerService {
             });
     }
 
-    async fn update_status(
+    async fn update_cached_status(
         &self,
         owned_worker_id: &OwnedWorkerId,
         status_value: &WorkerStatusRecord,
@@ -390,6 +270,8 @@ impl WorkerService for DefaultWorkerService {
         record_worker_call("update_status");
 
         if component_type != ComponentType::Ephemeral {
+            debug!("Updating cached worker status for {owned_worker_id} to {status_value:?}");
+
             self.key_value_storage
                 .with_entity("worker", "update_status", "worker_status")
                 .set(
@@ -404,6 +286,7 @@ impl WorkerService for DefaultWorkerService {
                 .shard_service
                 .current_assignment()
                 .expect("sharding assignment is not ready");
+
             let shard_id = ShardId::from_worker_id(
                 &owned_worker_id.worker_id,
                 shard_assignment.number_of_shards,
@@ -437,5 +320,17 @@ impl WorkerService for DefaultWorkerService {
                     });
             }
         }
+    }
+}
+
+impl HasOplogService for DefaultWorkerService {
+    fn oplog_service(&self) -> Arc<dyn OplogService> {
+        self.oplog_service.clone()
+    }
+}
+
+impl HasConfig for DefaultWorkerService {
+    fn config(&self) -> Arc<GolemConfig> {
+        self.config.clone()
     }
 }

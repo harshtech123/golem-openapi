@@ -2,13 +2,29 @@
 grpc_address = "0.0.0.0"
 http_address = "0.0.0.0"
 http_port = 8082
-mode = "Oss"
 port = 9000
 tracing_file_name_with_port = true
 
 [active_workers]
 drop_when_full = 0.25
 ttl = "8h"
+
+[agent_types_service]
+type = "Grpc"
+
+[agent_types_service.config]
+access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
+cache_time_to_idle = "1m"
+connect_timeout = "30s"
+host = "localhost"
+port = 9092
+
+[agent_types_service.config.retries]
+max_attempts = 3
+max_delay = "1s"
+max_jitter_factor = 0.15
+min_delay = "100ms"
+multiplier = 3.0
 
 [blob_storage]
 type = "LocalFileSystem"
@@ -25,7 +41,6 @@ type = "Enabled"
 max_capacity = 32
 max_metadata_capacity = 16384
 max_resolved_component_capacity = 1024
-max_resolved_project_capacity = 1024
 time_to_idle = "12h"
 
 [component_service]
@@ -71,7 +86,7 @@ multiplier = 2.0
 [limits]
 epoch_interval = "10ms"
 epoch_ticks = 1
-event_broadcast_capacity = 16
+event_broadcast_capacity = 1024
 event_history_size = 128
 fuel_to_borrow = 10000
 invocation_result_broadcast_capacity = 100000
@@ -116,7 +131,23 @@ max_jitter_factor = 0.15
 min_delay = "100ms"
 multiplier = 3.0
 
-[project_service.Disabled]
+[project_service]
+type = "Grpc"
+
+[project_service.config]
+access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
+cache_time_to_idle = "12h"
+connect_timeout = "30s"
+host = "localhost"
+max_resolved_project_cache_capacity = 1024
+port = 9091
+
+[project_service.config.retries]
+max_attempts = 3
+max_delay = "1s"
+max_jitter_factor = 0.15
+min_delay = "100ms"
+multiplier = 3.0
 
 [public_worker_api]
 access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
@@ -132,6 +163,7 @@ min_delay = "100ms"
 multiplier = 2.0
 
 [rdbms.pool]
+acquire_timeout = "3s"
 eviction_period = "2m"
 eviction_ttl = "10m"
 max_connections = 20
@@ -217,13 +249,29 @@ without_time = false
 # grpc_address = "0.0.0.0"
 # http_address = "0.0.0.0"
 # http_port = 8082
-# mode = "Oss"
 # port = 9000
 # tracing_file_name_with_port = true
 # 
 # [active_workers]
 # drop_when_full = 0.25
 # ttl = "8h"
+# 
+# [agent_types_service]
+# type = "Grpc"
+# 
+# [agent_types_service.config]
+# access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
+# cache_time_to_idle = "1m"
+# connect_timeout = "30s"
+# host = "localhost"
+# port = 9092
+# 
+# [agent_types_service.config.retries]
+# max_attempts = 3
+# max_delay = "1s"
+# max_jitter_factor = 0.15
+# min_delay = "100ms"
+# multiplier = 3.0
 # 
 # [blob_storage]
 # type = "S3"
@@ -256,7 +304,6 @@ without_time = false
 # max_capacity = 32
 # max_metadata_capacity = 16384
 # max_resolved_component_capacity = 1024
-# max_resolved_project_capacity = 1024
 # time_to_idle = "12h"
 # 
 # [component_service]
@@ -302,7 +349,7 @@ without_time = false
 # [limits]
 # epoch_interval = "10ms"
 # epoch_ticks = 1
-# event_broadcast_capacity = 16
+# event_broadcast_capacity = 1024
 # event_history_size = 128
 # fuel_to_borrow = 10000
 # invocation_result_broadcast_capacity = 100000
@@ -347,7 +394,23 @@ without_time = false
 # min_delay = "100ms"
 # multiplier = 3.0
 # 
-# [project_service.Disabled]
+# [project_service]
+# type = "Grpc"
+# 
+# [project_service.config]
+# access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
+# cache_time_to_idle = "12h"
+# connect_timeout = "30s"
+# host = "localhost"
+# max_resolved_project_cache_capacity = 1024
+# port = 9091
+# 
+# [project_service.config.retries]
+# max_attempts = 3
+# max_delay = "1s"
+# max_jitter_factor = 0.15
+# min_delay = "100ms"
+# multiplier = 3.0
 # 
 # [public_worker_api]
 # access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
@@ -363,6 +426,7 @@ without_time = false
 # multiplier = 2.0
 # 
 # [rdbms.pool]
+# acquire_timeout = "3s"
 # eviction_period = "2m"
 # eviction_ttl = "10m"
 # max_connections = 20
@@ -438,13 +502,29 @@ without_time = false
 # grpc_address = "0.0.0.0"
 # http_address = "0.0.0.0"
 # http_port = 8082
-# mode = "Oss"
 # port = 9000
 # tracing_file_name_with_port = true
 # 
 # [active_workers]
 # drop_when_full = 0.25
 # ttl = "8h"
+# 
+# [agent_types_service]
+# type = "Grpc"
+# 
+# [agent_types_service.config]
+# access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
+# cache_time_to_idle = "1m"
+# connect_timeout = "30s"
+# host = "localhost"
+# port = 9092
+# 
+# [agent_types_service.config.retries]
+# max_attempts = 3
+# max_delay = "1s"
+# max_jitter_factor = 0.15
+# min_delay = "100ms"
+# multiplier = 3.0
 # 
 # [blob_storage]
 # type = "InMemory"
@@ -460,7 +540,6 @@ without_time = false
 # max_capacity = 32
 # max_metadata_capacity = 16384
 # max_resolved_component_capacity = 1024
-# max_resolved_project_capacity = 1024
 # time_to_idle = "12h"
 # 
 # [component_service]
@@ -493,7 +572,7 @@ without_time = false
 # [limits]
 # epoch_interval = "10ms"
 # epoch_ticks = 1
-# event_broadcast_capacity = 16
+# event_broadcast_capacity = 1024
 # event_history_size = 128
 # fuel_to_borrow = 10000
 # invocation_result_broadcast_capacity = 100000
@@ -538,7 +617,23 @@ without_time = false
 # min_delay = "100ms"
 # multiplier = 3.0
 # 
-# [project_service.Disabled]
+# [project_service]
+# type = "Grpc"
+# 
+# [project_service.config]
+# access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
+# cache_time_to_idle = "12h"
+# connect_timeout = "30s"
+# host = "localhost"
+# max_resolved_project_cache_capacity = 1024
+# port = 9091
+# 
+# [project_service.config.retries]
+# max_attempts = 3
+# max_delay = "1s"
+# max_jitter_factor = 0.15
+# min_delay = "100ms"
+# multiplier = 3.0
 # 
 # [public_worker_api]
 # access_token = "2a354594-7a63-4091-a46b-cc58d379f677"
@@ -554,6 +649,7 @@ without_time = false
 # multiplier = 2.0
 # 
 # [rdbms.pool]
+# acquire_timeout = "3s"
 # eviction_period = "2m"
 # eviction_ttl = "10m"
 # max_connections = 20

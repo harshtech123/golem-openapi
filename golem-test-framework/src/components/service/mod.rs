@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-
 use tracing::Level;
 
 pub mod spawned;
 
-pub trait Service {
+pub trait Service: Send + Sync {
     fn kill(&self);
 }
 

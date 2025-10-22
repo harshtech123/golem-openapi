@@ -19,9 +19,9 @@ use bincode::de::{BorrowDecoder, Decoder};
 use bincode::enc::Encoder;
 use bincode::error::{DecodeError, EncodeError};
 use bincode::{BorrowDecode, Decode, Encode};
-use golem_wasm_ast::analysis::{analysed_type, AnalysedType};
-use golem_wasm_rpc::{IntoValue, Value};
-use golem_wasm_rpc_derive::IntoValue;
+use golem_wasm::analysis::{analysed_type, AnalysedType};
+use golem_wasm::{IntoValue, Value};
+use golem_wasm_derive::IntoValue;
 use nonempty_collections::NEVec;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -89,7 +89,6 @@ impl<'de> Deserialize<'de> for TraceId {
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::Type for TraceId {
     const IS_REQUIRED: bool = true;
     type RawValueType = Self;
@@ -116,14 +115,12 @@ impl poem_openapi::types::Type for TraceId {
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::ParseFromParameter for TraceId {
     fn parse_from_parameter(value: &str) -> poem_openapi::types::ParseResult<Self> {
         Ok(Self::from_string(value)?)
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::ParseFromJSON for TraceId {
     fn parse_from_json(value: Option<serde_json::Value>) -> poem_openapi::types::ParseResult<Self> {
         match value {
@@ -136,7 +133,6 @@ impl poem_openapi::types::ParseFromJSON for TraceId {
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::ToJSON for TraceId {
     fn to_json(&self) -> Option<serde_json::Value> {
         Some(serde_json::Value::String(self.to_string()))
@@ -205,7 +201,6 @@ impl<'de> Deserialize<'de> for SpanId {
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::Type for SpanId {
     const IS_REQUIRED: bool = true;
     type RawValueType = Self;
@@ -232,14 +227,12 @@ impl poem_openapi::types::Type for SpanId {
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::ParseFromParameter for SpanId {
     fn parse_from_parameter(value: &str) -> poem_openapi::types::ParseResult<Self> {
         Ok(Self::from_string(value)?)
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::ParseFromJSON for SpanId {
     fn parse_from_json(value: Option<serde_json::Value>) -> poem_openapi::types::ParseResult<Self> {
         match value {
@@ -252,7 +245,6 @@ impl poem_openapi::types::ParseFromJSON for SpanId {
     }
 }
 
-#[cfg(feature = "poem")]
 impl poem_openapi::types::ToJSON for SpanId {
     fn to_json(&self) -> Option<serde_json::Value> {
         Some(serde_json::Value::String(self.to_string()))
@@ -267,7 +259,7 @@ pub enum AttributeValue {
 impl Display for AttributeValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::String(value) => write!(f, "{}", value),
+            Self::String(value) => write!(f, "{value}"),
         }
     }
 }
@@ -684,8 +676,8 @@ impl Encode for InvocationContextSpan {
     }
 }
 
-impl Decode for InvocationContextSpan {
-    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<Context> Decode<Context> for InvocationContextSpan {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let tag = u8::decode(decoder)?;
         match tag {
             0 => {
@@ -718,8 +710,10 @@ impl Decode for InvocationContextSpan {
     }
 }
 
-impl<'de> BorrowDecode<'de> for InvocationContextSpan {
-    fn borrow_decode<D: BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<'de, Context> BorrowDecode<'de, Context> for InvocationContextSpan {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         let tag = u8::borrow_decode(decoder)?;
         match tag {
             0 => {
@@ -888,8 +882,8 @@ impl Encode for InvocationContextStack {
     }
 }
 
-impl Decode for InvocationContextStack {
-    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<Context> Decode<Context> for InvocationContextStack {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let trace_id = TraceId::decode(decoder)?;
         let spans = Vec::<Arc<InvocationContextSpan>>::decode(decoder)?;
         let trace_states = Vec::<String>::decode(decoder)?;
@@ -901,8 +895,10 @@ impl Decode for InvocationContextStack {
     }
 }
 
-impl<'de> BorrowDecode<'de> for InvocationContextStack {
-    fn borrow_decode<D: BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<'de, Context> BorrowDecode<'de, Context> for InvocationContextStack {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         let trace_id = TraceId::borrow_decode(decoder)?;
         let spans = Vec::borrow_decode(decoder)?;
         let trace_state = Vec::borrow_decode(decoder)?;
@@ -943,7 +939,6 @@ impl Debug for InvocationContextStack {
     }
 }
 
-#[cfg(feature = "protobuf")]
 mod protobuf {
     use crate::model::invocation_context::{
         AttributeValue, InvocationContextSpan, InvocationContextStack,
@@ -1268,7 +1263,6 @@ mod tests {
         assert_eq!(stack, decoded);
     }
 
-    #[cfg(feature = "protobuf")]
     #[test]
     fn protobuf_serialization() {
         let stack = example_stack_1();

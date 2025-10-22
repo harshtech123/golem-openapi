@@ -1,7 +1,21 @@
-use golem_common::model::AccountId;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::model::Token;
-use cloud_common::model::{CloudPluginOwner, Role};
+use golem_common::model::auth::Role;
+use golem_common::model::plugin::PluginOwner;
+use golem_common::model::AccountId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AccountAuthorisation {
@@ -12,10 +26,6 @@ pub struct AccountAuthorisation {
 impl AccountAuthorisation {
     pub fn new(token: Token, roles: Vec<Role>) -> Self {
         Self { token, roles }
-    }
-
-    pub fn admin() -> Self {
-        AccountAuthorisation::new(Token::admin(), vec![Role::Admin])
     }
 
     pub fn has_account(&self, account_id: &AccountId) -> bool {
@@ -38,15 +48,15 @@ impl AccountAuthorisation {
         self.token.account_id == *account_id || self.roles.contains(role)
     }
 
-    pub fn as_plugin_owner(&self) -> CloudPluginOwner {
-        CloudPluginOwner {
+    pub fn as_plugin_owner(&self) -> PluginOwner {
+        PluginOwner {
             account_id: self.token.account_id.clone(),
         }
     }
 
     #[cfg(test)]
     pub fn new_test(account_id: &AccountId, roles: Vec<Role>) -> AccountAuthorisation {
-        use cloud_common::model::TokenId;
+        use golem_common::model::TokenId;
         AccountAuthorisation {
             token: Token {
                 id: TokenId::new_v4(),

@@ -1,15 +1,15 @@
-use crate::error::GolemError;
 use crate::services::active_workers::ActiveWorkers;
 use crate::services::golem_config::GolemConfig;
 use crate::services::oplog::OplogService;
 use crate::services::worker::WorkerService;
 use crate::services::{HasConfig, HasOplogService, HasWorkerService};
-use crate::worker::status::calculate_last_known_status;
+use crate::worker::status::calculate_last_known_status_for_existing_worker;
 use crate::workerctx::WorkerCtx;
 use async_trait::async_trait;
 use golem_common::model::{
-    AccountId, ComponentId, ScanCursor, WorkerFilter, WorkerMetadata, WorkerStatus,
+    ComponentId, ProjectId, ScanCursor, WorkerFilter, WorkerMetadata, WorkerStatus,
 };
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 use std::sync::Arc;
 use tracing::{info, Instrument};
 
@@ -19,7 +19,7 @@ pub trait RunningWorkerEnumerationService: Send + Sync {
         &self,
         component_id: &ComponentId,
         filter: Option<WorkerFilter>,
-    ) -> Result<Vec<WorkerMetadata>, GolemError>;
+    ) -> Result<Vec<WorkerMetadata>, WorkerExecutorError>;
 }
 
 #[derive(Clone)]
@@ -35,7 +35,7 @@ impl<Ctx: WorkerCtx> RunningWorkerEnumerationService
         &self,
         component_id: &ComponentId,
         filter: Option<WorkerFilter>,
-    ) -> Result<Vec<WorkerMetadata>, GolemError> {
+    ) -> Result<Vec<WorkerMetadata>, WorkerExecutorError> {
         info!(
             "Get workers - filter: {}",
             filter
@@ -44,11 +44,11 @@ impl<Ctx: WorkerCtx> RunningWorkerEnumerationService
                 .unwrap_or("N/A".to_string())
         );
 
-        let active_workers = self.active_workers.snapshot();
+        let active_workers = self.active_workers.snapshot().await;
 
         let mut workers: Vec<WorkerMetadata> = vec![];
         for (worker_id, worker) in active_workers {
-            let metadata = worker.get_metadata()?;
+            let metadata = worker.get_latest_worker_metadata().await;
             if worker_id.component_id == *component_id
                 && (metadata.last_known_status.status == WorkerStatus::Running)
                 && filter.clone().is_none_or(|f| f.matches(&metadata))
@@ -71,13 +71,13 @@ impl<Ctx: WorkerCtx> RunningWorkerEnumerationServiceDefault<Ctx> {
 pub trait WorkerEnumerationService: Send + Sync {
     async fn get(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         component_id: &ComponentId,
         filter: Option<WorkerFilter>,
         cursor: ScanCursor,
         count: u64,
         precise: bool,
-    ) -> Result<(Option<ScanCursor>, Vec<WorkerMetadata>), GolemError>;
+    ) -> Result<(Option<ScanCursor>, Vec<WorkerMetadata>), WorkerExecutorError>;
 }
 
 #[derive(Clone)]
@@ -102,18 +102,18 @@ impl DefaultWorkerEnumerationService {
 
     async fn get_internal(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         component_id: &ComponentId,
         filter: Option<WorkerFilter>,
         cursor: ScanCursor,
         count: u64,
         precise: bool,
-    ) -> Result<(Option<ScanCursor>, Vec<WorkerMetadata>), GolemError> {
+    ) -> Result<(Option<ScanCursor>, Vec<WorkerMetadata>), WorkerExecutorError> {
         let mut workers: Vec<WorkerMetadata> = vec![];
 
         let (new_cursor, keys) = self
             .oplog_service
-            .scan_for_component(account_id, component_id, cursor, count)
+            .scan_for_component(project_id, component_id, cursor, count)
             .instrument(tracing::info_span!("scan_for_component"))
             .await?;
 
@@ -124,21 +124,30 @@ impl DefaultWorkerEnumerationService {
                 .instrument(tracing::info_span!("get_worker_metadata"))
                 .await;
 
-            if let Some(worker_metadata) = worker_metadata {
+            if let Some((initial_worker_metadata, last_known_status)) =
+                worker_metadata.and_then(|wm| {
+                    wm.last_known_status
+                        .map(|lks| (wm.initial_worker_metadata, lks))
+                })
+            {
                 let metadata = if precise {
-                    let last_known_status = calculate_last_known_status(
+                    let last_known_status = calculate_last_known_status_for_existing_worker(
                         self,
                         &owned_worker_id,
-                        &Some(worker_metadata.clone()),
+                        Some(last_known_status),
                     )
                     .instrument(tracing::info_span!("calculate_last_known_status"))
-                    .await?;
+                    .await;
+
                     WorkerMetadata {
                         last_known_status,
-                        ..worker_metadata
+                        ..initial_worker_metadata
                     }
                 } else {
-                    worker_metadata
+                    WorkerMetadata {
+                        last_known_status,
+                        ..initial_worker_metadata
+                    }
                 };
 
                 if filter.clone().is_none_or(|f| f.matches(&metadata)) {
@@ -173,22 +182,24 @@ impl HasConfig for DefaultWorkerEnumerationService {
 impl WorkerEnumerationService for DefaultWorkerEnumerationService {
     async fn get(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         component_id: &ComponentId,
         filter: Option<WorkerFilter>,
         cursor: ScanCursor,
         count: u64,
         precise: bool,
-    ) -> Result<(Option<ScanCursor>, Vec<WorkerMetadata>), GolemError> {
+    ) -> Result<(Option<ScanCursor>, Vec<WorkerMetadata>), WorkerExecutorError> {
         info!(
-            "Get workers - filter: {}, cursor: {}, count: {}, precise: {}",
-            filter
+            project_id = %project_id,
+            component_id = %component_id,
+            filter = filter
                 .clone()
                 .map(|f| f.to_string())
                 .unwrap_or("N/A".to_string()),
-            cursor,
-            count,
-            precise
+            cursor = %cursor,
+            count = %count,
+            precise = %precise,
+            "Enumerating workers"
         );
         let mut new_cursor: Option<ScanCursor> = Some(cursor);
         let mut workers: Vec<WorkerMetadata> = vec![];
@@ -198,7 +209,7 @@ impl WorkerEnumerationService for DefaultWorkerEnumerationService {
 
             let (next_cursor, workers_page) = self
                 .get_internal(
-                    account_id,
+                    project_id,
                     component_id,
                     filter.clone(),
                     new_cursor.unwrap_or_default(),

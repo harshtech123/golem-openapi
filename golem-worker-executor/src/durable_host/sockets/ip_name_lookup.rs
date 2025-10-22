@@ -17,14 +17,14 @@ use wasmtime::component::Resource;
 
 use crate::durable_host::serialized::{SerializableError, SerializableIpAddresses};
 use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx};
-use crate::error::GolemError;
 use crate::workerctx::WorkerCtx;
 use golem_common::model::oplog::DurableFunctionType;
-use wasmtime_wasi::bindings::sockets::ip_name_lookup::{
+use wasmtime_wasi::p2::bindings::sockets::ip_name_lookup::{
     Host, HostResolveAddressStream, IpAddress, Network, ResolveAddressStream,
 };
-use wasmtime_wasi::bindings::sockets::network::ErrorCode;
-use wasmtime_wasi::{DynPollable, Pollable, SocketError};
+use wasmtime_wasi::p2::bindings::sockets::network::ErrorCode;
+use wasmtime_wasi::p2::SocketError;
+use wasmtime_wasi::{DynPollable, Pollable};
 
 #[async_trait]
 impl<Ctx: WorkerCtx> HostResolveAddressStream for DurableWorkerCtx<Ctx> {
@@ -72,6 +72,10 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         let addresses = if durability.is_live() {
             let result = resolve_and_drain_addresses(self, network, name.clone()).await;
+            durability
+                .try_trigger_retry(self, &result)
+                .await
+                .map_err(SocketError::trap)?;
             durability.persist(self, name, result).await
         } else {
             durability.replay(self).await
@@ -109,10 +113,4 @@ async fn drain_resolve_address_stream(
         }
     }
     Ok(addresses)
-}
-
-impl From<GolemError> for SocketError {
-    fn from(value: GolemError) -> Self {
-        Self::trap(value)
-    }
 }

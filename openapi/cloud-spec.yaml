@@ -7,12 +7,22 @@ tags:
 - name: Account
   description: The account API allows users to query and manipulate their own account data.
 - name: AccountSummary
+- name: AgentTypes
+  description: API working on registered agent types
+- name: ApiCertificate
+- name: ApiDefinition
+- name: ApiDeployment
+- name: ApiDomain
+- name: ApiSecurity
+- name: Component
+- name: Debugging
 - name: Grant
 - name: HealthCheck
 - name: Limits
   description: The limits API allows users to query their current resource limits.
 - name: Login
   description: The login endpoints are implementing an OAuth2 flow.
+- name: Plugin
 - name: Project
   description: |-
     Projects are groups of components and their workers, providing both a separate namespace for these entities and allows sharing between accounts.
@@ -24,23 +34,10 @@ tags:
 
     The project grant API allows listing, creating and deleting such grants. What the grants allow exactly are defined by policies, covered by the Project policy API.
 - name: ProjectPolicy
-  description: |-
-    Project policies describe a set of actions one account can perform when it was associated with a grant for a project.
-
-    The following actions can be used in the projectActions fields of this API:
-    - `ViewComponent` grants read access to a component
-    - `CreateComponent` allows creating new components in a project
-    - `UpdateComponent` allows uploading new versions for existing components in a project
-    - `DeleteComponent` allows deleting components from a project
-    - `ViewWorker` allows querying existing workers of a component belonging to the project
-    - `CreateWorker` allows launching new workers of a component in the project
-    - `UpdateWorker` allows manipulating existing workers of a component belonging to the project
-    - `DeleteWorker` allows deleting workers of a component belonging to the project
-    - `ViewProjectGrants` allows listing the existing grants of the project
-    - `CreateProjectGrants` allows creating new grants for the project
-    - `DeleteProjectGrants` allows deleting existing grants of the project
+  description: Project policies describe a set of actions one account can perform when it was associated with a grant for a project.
 - name: Token
   description: The token API allows creating custom access tokens for the Golem Cloud REST API to be used by tools and services.
+- name: Worker
 paths:
   /v1/accounts:
     get:
@@ -75,8 +72,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -121,8 +130,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -170,8 +191,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -228,8 +261,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -276,8 +321,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -324,8 +381,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -447,8 +516,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -501,8 +582,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -554,8 +647,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -607,8 +712,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -760,13 +877,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -794,13 +929,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -832,13 +985,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -872,13 +1043,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -921,13 +1110,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -984,13 +1191,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1031,13 +1256,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Failed to login
+          description: Unauthorized request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: External service call failed during login
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1090,25 +1333,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1151,25 +1400,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1203,25 +1458,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1259,25 +1520,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1314,25 +1581,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1364,7 +1637,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/ProjectPermisison'
+                  $ref: '#/components/schemas/ProjectPermission'
         '400':
           description: Invalid request, returning with a list of issues detected in the request
           content:
@@ -1372,25 +1645,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1429,25 +1708,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1489,25 +1774,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1558,25 +1849,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1621,25 +1918,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1682,25 +1985,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1708,7 +2017,7 @@ paths:
       security:
       - Cookie: []
       - Token: []
-      operationId: bath_update_installed_plugins_of_project
+      operationId: batch_update_installed_plugins_of_project
   /v1/projects/{project_id}/grants:
     get:
       tags:
@@ -1747,25 +2056,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1813,25 +2128,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1877,25 +2198,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -1940,25 +2267,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorsBody'
         '401':
-          description: Unauthorized
+          description: Unauthorized request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '403':
-          description: Maximum number of projects exceeded
+          description: Forbidden Request
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Project not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
-          description: Project already exists
+          description: Internal server error
           content:
             application/json; charset=utf-8:
               schema:
@@ -2001,8 +2334,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -2048,8 +2393,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -2101,8 +2458,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -2157,8 +2526,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -2216,8 +2597,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -2272,8 +2665,20 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Forbidden Request
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '404':
-          description: Account not found
+          description: Entity not found
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: ''
           content:
             application/json; charset=utf-8:
               schema:
@@ -2467,6 +2872,7 @@ components:
       - storageLimit
       - monthlyGasLimit
       - monthlyUploadLimit
+      - maxMemoryPerWorker
       properties:
         projectLimit:
           type: integer
@@ -2486,6 +2892,9 @@ components:
         monthlyUploadLimit:
           type: integer
           format: int32
+        maxMemoryPerWorker:
+          type: integer
+          format: int64
     PluginInstallation:
       type: object
       title: PluginInstallation
@@ -2645,7 +3054,7 @@ components:
         actions:
           type: array
           items:
-            $ref: '#/components/schemas/ProjectPermisison'
+            $ref: '#/components/schemas/ProjectPermission'
     ProjectData:
       type: object
       title: ProjectData
@@ -2724,10 +3133,10 @@ components:
         projectActions:
           type: array
           items:
-            $ref: '#/components/schemas/ProjectPermisison'
+            $ref: '#/components/schemas/ProjectPermission'
         projectPolicyName:
           type: string
-    ProjectPermisison:
+    ProjectPermission:
       type: string
       enum:
       - ViewComponent
@@ -2756,6 +3165,11 @@ components:
       - UpsertApiDomain
       - ViewApiDomain
       - DeleteApiDomain
+      - ViewPluginDefinition
+      - CreatePluginDefinition
+      - UpdatePluginDefinition
+      - DeletePluginDefinition
+      - ExportApiDefinition
     ProjectPolicy:
       type: object
       title: ProjectPolicy

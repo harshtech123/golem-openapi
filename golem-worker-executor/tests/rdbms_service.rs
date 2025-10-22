@@ -15,17 +15,18 @@
 use assert2::check;
 use bigdecimal::BigDecimal;
 use bit_vec::BitVec;
-use golem_common::model::{ComponentId, WorkerId};
+use golem_common::model::{ComponentId, TransactionId, WorkerId};
 use golem_test_framework::components::rdb::docker_mysql::DockerMysqlRdb;
 use golem_test_framework::components::rdb::docker_postgres::DockerPostgresRdb;
 use golem_worker_executor::services::golem_config::{RdbmsConfig, RdbmsPoolConfig};
 use golem_worker_executor::services::rdbms::mysql::{types as mysql_types, MysqlType};
 use golem_worker_executor::services::rdbms::postgres::{types as postgres_types, PostgresType};
-use golem_worker_executor::services::rdbms::{DbResult, DbRow, Error};
+use golem_worker_executor::services::rdbms::{DbResult, DbRow, Error, RdbmsTransactionStatus};
 use golem_worker_executor::services::rdbms::{Rdbms, RdbmsServiceDefault, RdbmsType};
 use golem_worker_executor::services::rdbms::{RdbmsPoolKey, RdbmsService};
 use mac_address::MacAddress;
 use serde_json::json;
+use std::any::{Any, TypeId};
 use std::collections::{Bound, HashMap};
 use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -60,19 +61,19 @@ fn rdbms_service() -> RdbmsServiceDefault {
 }
 
 #[derive(Clone, Debug)]
-enum StatementAction<T: RdbmsType + Clone> {
+enum StatementAction<T: RdbmsType> {
     Execute(ExpectedExecuteResult),
     Query(ExpectedQueryResult<T>),
     QueryStream(ExpectedQueryResult<T>),
 }
 
 #[derive(Clone, Debug)]
-struct ExpectedQueryResult<T: RdbmsType + Clone> {
+struct ExpectedQueryResult<T: RdbmsType> {
     expected_columns: Option<Vec<T::DbColumn>>,
     expected_rows: Option<Vec<DbRow<T::DbValue>>>,
 }
 
-impl<T: RdbmsType + Clone> ExpectedQueryResult<T> {
+impl<T: RdbmsType> ExpectedQueryResult<T> {
     fn new(
         expected_columns: Option<Vec<T::DbColumn>>,
         expected_rows: Option<Vec<DbRow<T::DbValue>>>,
@@ -96,7 +97,7 @@ impl ExpectedExecuteResult {
 }
 
 #[derive(Clone, Debug)]
-enum StatementResult<T: RdbmsType + Clone + 'static> {
+enum StatementResult<T: RdbmsType + 'static> {
     Execute(u64),
     Query(DbResult<T>),
 }
@@ -110,13 +111,13 @@ enum TransactionEnd {
 }
 
 #[derive(Debug, Clone)]
-struct StatementTest<T: RdbmsType + Clone> {
+struct StatementTest<T: RdbmsType> {
     pub action: StatementAction<T>,
     pub statement: &'static str,
     pub params: Vec<T::DbValue>,
 }
 
-impl<T: RdbmsType + Clone> StatementTest<T> {
+impl<T: RdbmsType> StatementTest<T> {
     fn execute_test(
         statement: &'static str,
         params: Vec<T::DbValue>,
@@ -191,12 +192,12 @@ impl<T: RdbmsType + Clone> StatementTest<T> {
 }
 
 #[derive(Debug, Clone)]
-struct RdbmsTest<T: RdbmsType + Clone> {
+struct RdbmsTest<T: RdbmsType> {
     statements: Vec<StatementTest<T>>,
     transaction_end: Option<TransactionEnd>,
 }
 
-impl<T: RdbmsType + Clone> RdbmsTest<T> {
+impl<T: RdbmsType> RdbmsTest<T> {
     fn new(statements: Vec<StatementTest<T>>, transaction_end: Option<TransactionEnd>) -> Self {
         Self {
             statements,
@@ -252,11 +253,11 @@ async fn postgres_transaction_tests(
 
     for i in 0..count {
         let params: Vec<postgres_types::DbValue> = vec![
-            postgres_types::DbValue::Text(format!("{:03}", i)),
-            postgres_types::DbValue::Text(format!("name-{:03}", i)),
+            postgres_types::DbValue::Text(format!("{i:03}")),
+            postgres_types::DbValue::Text(format!("name-{i:03}")),
             postgres_types::DbValue::Array(vec![
-                postgres_types::DbValue::Text(format!("tag-1-{}", i)),
-                postgres_types::DbValue::Text(format!("tag-2-{}", i)),
+                postgres_types::DbValue::Text(format!("tag-1-{i}")),
+                postgres_types::DbValue::Text(format!("tag-2-{i}")),
             ]),
         ];
 
@@ -477,7 +478,7 @@ async fn postgres_create_insert_select_test(
     let mut statements: Vec<StatementTest<PostgresType>> = Vec::with_capacity(count);
     for i in 0..count {
         let mut params: Vec<postgres_types::DbValue> =
-            vec![postgres_types::DbValue::Varchar(format!("{:03}", i))];
+            vec![postgres_types::DbValue::Varchar(format!("{i:03}"))];
 
         if i % 2 == 0 {
             let tstzbounds = postgres_types::ValuesRange::new(
@@ -566,7 +567,7 @@ async fn postgres_create_insert_select_test(
                 postgres_types::DbValue::Macaddr(MacAddress::new([0, 1, 2, 3, 4, i as u8])),
                 postgres_types::DbValue::Bit(BitVec::from_iter(vec![true, false, true])),
                 postgres_types::DbValue::Varbit(BitVec::from_iter(vec![true, false, false])),
-                postgres_types::DbValue::Xml(format!("<foo>{}</foo>", i)),
+                postgres_types::DbValue::Xml(format!("<foo>{i}</foo>")),
                 postgres_types::DbValue::Int4range(postgres_types::ValuesRange::new(
                     Bound::Included(1),
                     Bound::Excluded(4),
@@ -1206,7 +1207,7 @@ async fn postgres_create_insert_select_array_test(
     let mut statements: Vec<StatementTest<PostgresType>> = Vec::with_capacity(count);
     for i in 0..count {
         let mut params: Vec<postgres_types::DbValue> =
-            vec![postgres_types::DbValue::Varchar(format!("{:03}", i))];
+            vec![postgres_types::DbValue::Varchar(format!("{i:03}"))];
 
         if i % 2 == 0 {
             let tstzbounds = postgres_types::ValuesRange::new(
@@ -1332,8 +1333,7 @@ async fn postgres_create_insert_select_array_test(
                     BitVec::from_iter(vec![true, false, false]),
                 )]),
                 postgres_types::DbValue::Array(vec![postgres_types::DbValue::Xml(format!(
-                    "<foo>{}</foo>",
-                    i
+                    "<foo>{i}</foo>"
                 ))]),
                 postgres_types::DbValue::Array(vec![postgres_types::DbValue::Int4range(
                     postgres_types::ValuesRange::new(Bound::Included(1), Bound::Excluded(4)),
@@ -1931,8 +1931,8 @@ async fn mysql_transaction_tests(mysql: &DockerMysqlRdb, rdbms_service: &RdbmsSe
 
     for i in 0..count {
         let params: Vec<mysql_types::DbValue> = vec![
-            mysql_types::DbValue::Varchar(format!("{:03}", i)),
-            mysql_types::DbValue::Varchar(format!("name-{:03}", i)),
+            mysql_types::DbValue::Varchar(format!("{i:03}")),
+            mysql_types::DbValue::Varchar(format!("name-{i:03}")),
         ];
 
         statements.push(StatementTest::execute_test(
@@ -2093,7 +2093,7 @@ async fn mysql_create_insert_select_test(
     let mut statements: Vec<StatementTest<MysqlType>> = Vec::with_capacity(count);
     for i in 0..count {
         let mut params: Vec<mysql_types::DbValue> =
-            vec![mysql_types::DbValue::Varchar(format!("{:03}", i))];
+            vec![mysql_types::DbValue::Varchar(format!("{i:03}"))];
 
         if i % 2 == 0 {
             params.append(&mut vec![
@@ -2436,20 +2436,24 @@ async fn mysql_create_insert_select_test(
     .await;
 }
 
-async fn execute_rdbms_test<T: RdbmsType + Clone + 'static>(
+async fn execute_rdbms_test<T: RdbmsType + 'static>(
     rdbms: Arc<dyn Rdbms<T> + Send + Sync>,
     pool_key: &RdbmsPoolKey,
     worker_id: &WorkerId,
     test: RdbmsTest<T>,
-) -> Vec<Result<StatementResult<T>, Error>> {
+) -> (
+    Option<TransactionId>,
+    Vec<Result<StatementResult<T>, Error>>,
+) {
     let mut results: Vec<Result<StatementResult<T>, Error>> =
         Vec::with_capacity(test.statements.len());
-
+    let mut transaction_id: Option<TransactionId> = None;
     if let Some(te) = test.transaction_end {
         let transaction = rdbms
             .begin_transaction(pool_key, worker_id)
             .await
             .expect("New transaction expected");
+        transaction_id = Some(transaction.transaction_id());
         for st in test.statements {
             match st.action {
                 StatementAction::Execute(_) => {
@@ -2474,8 +2478,20 @@ async fn execute_rdbms_test<T: RdbmsType + Clone + 'static>(
             }
         }
         match te {
-            TransactionEnd::Commit => transaction.commit().await.expect("Transaction commit"),
-            TransactionEnd::Rollback => transaction.rollback().await.expect("Transaction rollback"),
+            TransactionEnd::Commit => {
+                transaction
+                    .pre_commit()
+                    .await
+                    .expect("Transaction pre commit");
+                transaction.commit().await.expect("Transaction commit")
+            }
+            TransactionEnd::Rollback => {
+                transaction
+                    .pre_rollback()
+                    .await
+                    .expect("Transaction pre rollback");
+                transaction.rollback().await.expect("Transaction rollback")
+            }
             TransactionEnd::None => (),
         }
     } else {
@@ -2511,10 +2527,10 @@ async fn execute_rdbms_test<T: RdbmsType + Clone + 'static>(
         }
     }
 
-    results
+    (transaction_id, results)
 }
 
-async fn rdbms_test<T: RdbmsType + Clone + 'static>(
+async fn rdbms_test<T: RdbmsType + 'static>(
     rdbms: Arc<dyn Rdbms<T> + Send + Sync>,
     db_address: &str,
     test: RdbmsTest<T>,
@@ -2523,7 +2539,17 @@ async fn rdbms_test<T: RdbmsType + Clone + 'static>(
     let connection = rdbms.create(db_address, &worker_id).await;
     check!(connection.is_ok(), "connection to {} is ok", db_address);
     let pool_key = connection.unwrap();
-    let results = execute_rdbms_test::<T>(rdbms.clone(), &pool_key, &worker_id, test.clone()).await;
+    let (transaction_id, results) =
+        execute_rdbms_test::<T>(rdbms.clone(), &pool_key, &worker_id, test.clone()).await;
+
+    check_transaction(
+        rdbms.clone(),
+        &pool_key,
+        &worker_id,
+        test.transaction_end.clone(),
+        transaction_id,
+    )
+    .await;
 
     check_test_results::<T>(&worker_id, test, results);
 
@@ -2532,7 +2558,69 @@ async fn rdbms_test<T: RdbmsType + Clone + 'static>(
     check!(!exists);
 }
 
-fn check_test_results<T: RdbmsType + Clone>(
+async fn check_transaction<T: RdbmsType + 'static>(
+    rdbms: Arc<dyn Rdbms<T> + Send + Sync>,
+    pool_key: &RdbmsPoolKey,
+    worker_id: &WorkerId,
+    transaction_end: Option<TransactionEnd>,
+    transaction_id: Option<TransactionId>,
+) {
+    if let Some(te) = transaction_end {
+        check!(
+            transaction_id.is_some(),
+            "transaction id for worker {worker_id} is some"
+        );
+        let transaction_id = transaction_id.unwrap();
+        let transaction_status = rdbms
+            .get_transaction_status(pool_key, worker_id, &transaction_id)
+            .await;
+        check!(
+            transaction_status.is_ok(),
+            "transaction status for worker {worker_id} is ok"
+        );
+        let transaction_status = transaction_status.unwrap();
+        match te {
+            TransactionEnd::Commit => {
+                check!(
+                    transaction_status == RdbmsTransactionStatus::Committed,
+                    "transaction status for worker {worker_id} is committed"
+                );
+            }
+            TransactionEnd::Rollback => {
+                check!(
+                    transaction_status == RdbmsTransactionStatus::RolledBack,
+                    "transaction status for worker {worker_id} is rolled back"
+                );
+            }
+            TransactionEnd::None => (),
+        }
+
+        let result = rdbms
+            .cleanup_transaction(pool_key, worker_id, &transaction_id)
+            .await;
+        check!(
+            result.is_ok(),
+            "transaction cleanup for worker {worker_id} is ok"
+        );
+
+        if PostgresType.type_id() != TypeId::of::<T>() {
+            let transaction_status = rdbms
+                .get_transaction_status(pool_key, worker_id, &transaction_id)
+                .await;
+            check!(
+                transaction_status.is_ok(),
+                "transaction status for worker {worker_id} is ok"
+            );
+            let transaction_status = transaction_status.unwrap();
+            check!(
+                transaction_status == RdbmsTransactionStatus::NotFound,
+                "transaction status for worker {worker_id} is cleaned up"
+            );
+        }
+    }
+}
+
+fn check_test_results<T: RdbmsType>(
     worker_id: &WorkerId,
     test: RdbmsTest<T>,
     results: Vec<Result<StatementResult<T>, Error>>,
@@ -2894,7 +2982,7 @@ async fn postgres_par_test(postgres: &DockerPostgresRdb, rdbms_service: &RdbmsSe
     .await
 }
 
-async fn create_test_databases<T: RdbmsType + Clone + 'static>(
+async fn create_test_databases<T: RdbmsType + 'static>(
     rdbms: Arc<dyn Rdbms<T> + Send + Sync>,
     db_address: &str,
     count: u8,
@@ -2909,13 +2997,13 @@ async fn create_test_databases<T: RdbmsType + Clone + 'static>(
     let mut values: Vec<String> = Vec::with_capacity(count as usize);
 
     for i in 0..count {
-        let db_name = format!("test_db_{}", i);
+        let db_name = format!("test_db_{i}");
 
         let r = rdbms
             .execute(
                 &pool_key,
                 &worker_id,
-                &format!("CREATE DATABASE {}", db_name),
+                &format!("CREATE DATABASE {db_name}"),
                 vec![],
             )
             .await;
@@ -2931,7 +3019,7 @@ async fn create_test_databases<T: RdbmsType + Clone + 'static>(
     values
 }
 
-async fn rdbms_par_test<T: RdbmsType + Clone + 'static>(
+async fn rdbms_par_test<T: RdbmsType + 'static>(
     rdbms: Arc<dyn Rdbms<T> + Send + Sync>,
     db_addresses: Vec<String>,
     count: u8,
@@ -2951,11 +3039,11 @@ async fn rdbms_par_test<T: RdbmsType + Clone + 'static>(
 
                     let pool_key = connection.unwrap();
 
-                    let result =
+                    let (transaction_id, result) =
                         execute_rdbms_test(rdbms_clone.clone(), &pool_key, &worker_id, test_clone)
                             .await;
 
-                    (worker_id, pool_key, result)
+                    (worker_id, pool_key, transaction_id, result)
                 }
                 .in_current_span(),
             );
@@ -2965,11 +3053,27 @@ async fn rdbms_par_test<T: RdbmsType + Clone + 'static>(
     let mut workers_results: HashMap<WorkerId, Vec<Result<StatementResult<T>, Error>>> =
         HashMap::new();
     let mut workers_pools: HashMap<WorkerId, RdbmsPoolKey> = HashMap::new();
+    let mut workers_transactions: HashMap<WorkerId, Option<TransactionId>> = HashMap::new();
 
     while let Some(res) = fibers.join_next().await {
-        let (worker_id, pool_key, result_execute) = res.unwrap();
+        let (worker_id, pool_key, transaction_id, result_execute) = res.unwrap();
         workers_results.insert(worker_id.clone(), result_execute);
         workers_pools.insert(worker_id.clone(), pool_key);
+        workers_transactions.insert(worker_id.clone(), transaction_id);
+    }
+
+    if test.transaction_end.is_some() {
+        for (worker_id, transaction_id) in workers_transactions.clone() {
+            let pool_key = workers_pools.get(&worker_id).unwrap().clone();
+            check_transaction(
+                rdbms.clone(),
+                &pool_key,
+                &worker_id,
+                test.transaction_end.clone(),
+                transaction_id,
+            )
+            .await;
+        }
     }
 
     let rdbms_status = rdbms.status();

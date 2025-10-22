@@ -14,12 +14,11 @@
 
 use crate::WorkerExecutorTestDependencies;
 use async_trait::async_trait;
+use golem_common::base_model::ProjectId;
 use golem_common::config::RedisConfig;
-use golem_common::model::AccountId;
 use golem_common::redis::RedisPool;
 use golem_service_base::db::sqlite::SqlitePool;
 use golem_test_framework::components::redis::Redis;
-use golem_test_framework::config::TestDependencies;
 use golem_worker_executor::storage::keyvalue::memory::InMemoryKeyValueStorage;
 use golem_worker_executor::storage::keyvalue::redis::RedisKeyValueStorage;
 use golem_worker_executor::storage::keyvalue::sqlite::SqliteKeyValueStorage;
@@ -93,8 +92,8 @@ impl GetKeyValueStorage for RedisKeyValueStorageWrapper {
 async fn redis_storage(
     deps: &WorkerExecutorTestDependencies,
 ) -> Arc<dyn GetKeyValueStorage + Send + Sync> {
-    let redis = deps.redis();
-    let redis_monitor = deps.redis_monitor();
+    let redis = deps.redis.clone();
+    let redis_monitor = deps.redis_monitor.clone();
     redis.assert_valid();
     redis_monitor.assert_valid();
     Arc::new(RedisKeyValueStorageWrapper { redis })
@@ -141,7 +140,7 @@ fn ns() -> Namespaces {
     Namespaces {
         ns: KeyValueStorageNamespace::Worker,
         ns2: KeyValueStorageNamespace::UserDefined {
-            account_id: AccountId::generate(),
+            project_id: ProjectId(Uuid::parse_str("296aa41a-ff44-4882-8f34-08b7fe431aa4").unwrap()),
             bucket: "test-bucket".to_string(),
         },
     }
@@ -151,7 +150,7 @@ fn ns() -> Namespaces {
 fn ns2() -> Namespaces {
     Namespaces {
         ns: KeyValueStorageNamespace::UserDefined {
-            account_id: AccountId::generate(),
+            project_id: ProjectId(Uuid::parse_str("296aa41a-ff44-4882-8f34-08b7fe431aa4").unwrap()),
             bucket: "test-bucket".to_string(),
         },
         ns2: KeyValueStorageNamespace::Worker,

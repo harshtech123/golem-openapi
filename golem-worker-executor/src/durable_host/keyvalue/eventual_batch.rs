@@ -31,7 +31,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         bucket: Resource<Bucket>,
         keys: Vec<Key>,
     ) -> anyhow::Result<Result<Vec<Option<Resource<IncomingValue>>>, Resource<Error>>> {
-        let account_id = self.owned_worker_id.account_id();
+        let project_id = self.owned_worker_id.project_id();
         let bucket = self
             .as_wasi_view()
             .table()
@@ -51,8 +51,9 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             let result = self
                 .state
                 .key_value_service
-                .get_many(account_id, bucket, keys)
+                .get_many(project_id, bucket, keys)
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, input, result).await
         } else {
             durability.replay(self).await
@@ -81,7 +82,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 let error = self
                     .as_wasi_view()
                     .table()
-                    .push(ErrorEntry::new(format!("{:?}", e)))?;
+                    .push(ErrorEntry::new(format!("{e:?}")))?;
                 Ok(Err(error))
             }
         }
@@ -91,7 +92,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         &mut self,
         bucket: Resource<Bucket>,
     ) -> anyhow::Result<Result<Vec<Key>, Resource<Error>>> {
-        let account_id = self.owned_worker_id.account_id();
+        let project_id = self.owned_worker_id.project_id();
         let bucket = self
             .as_wasi_view()
             .table()
@@ -110,8 +111,9 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             let result = self
                 .state
                 .key_value_service
-                .get_keys(account_id, bucket.clone())
+                .get_keys(project_id, bucket.clone())
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, bucket, result).await
         } else {
             durability.replay(self).await
@@ -125,7 +127,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         bucket: Resource<Bucket>,
         key_values: Vec<(Key, Resource<OutgoingValue>)>,
     ) -> anyhow::Result<Result<(), Resource<Error>>> {
-        let account_id = self.owned_worker_id.account_id();
+        let project_id = self.owned_worker_id.project_id();
         let bucket = self
             .as_wasi_view()
             .table()
@@ -166,8 +168,9 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             let result = self
                 .state
                 .key_value_service
-                .set_many(account_id, bucket, key_values)
+                .set_many(project_id, bucket, key_values)
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, input, result).await
         } else {
             durability.replay(self).await
@@ -179,7 +182,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 let error = self
                     .as_wasi_view()
                     .table()
-                    .push(ErrorEntry::new(format!("{:?}", e)))?;
+                    .push(ErrorEntry::new(format!("{e:?}")))?;
                 Ok(Err(error))
             }
         }
@@ -190,7 +193,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         bucket: Resource<Bucket>,
         keys: Vec<Key>,
     ) -> anyhow::Result<Result<(), Resource<Error>>> {
-        let account_id = self.owned_worker_id.account_id();
+        let project_id = self.owned_worker_id.project_id();
         let bucket = self
             .as_wasi_view()
             .table()
@@ -211,8 +214,9 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             let result = self
                 .state
                 .key_value_service
-                .delete_many(account_id, bucket, keys)
+                .delete_many(project_id, bucket, keys)
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, input, result).await
         } else {
             durability.replay(self).await
@@ -224,7 +228,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 let error = self
                     .as_wasi_view()
                     .table()
-                    .push(ErrorEntry::new(format!("{:?}", e)))?;
+                    .push(ErrorEntry::new(format!("{e:?}")))?;
                 Ok(Err(error))
             }
         }

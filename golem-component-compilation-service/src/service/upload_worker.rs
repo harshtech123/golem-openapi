@@ -23,12 +23,12 @@ use crate::model::*;
 // Worker that uploads compiled components to the cloud.
 #[derive(Clone)]
 pub struct UploadWorker {
-    compiled_component_service: Arc<dyn CompiledComponentService + Send + Sync>,
+    compiled_component_service: Arc<dyn CompiledComponentService>,
 }
 
 impl UploadWorker {
     pub fn start(
-        compiled_component_service: Arc<dyn CompiledComponentService + Send + Sync>,
+        compiled_component_service: Arc<dyn CompiledComponentService>,
         mut recv: mpsc::Receiver<CompiledComponent>,
     ) {
         let worker = Self {
@@ -52,11 +52,13 @@ impl UploadWorker {
         let CompiledComponent {
             component_and_version,
             component,
+            project_id,
         } = compiled_component;
 
         let upload_result = self
             .compiled_component_service
             .put(
+                &project_id,
                 &component_and_version.id,
                 component_and_version.version,
                 &component,
@@ -65,9 +67,18 @@ impl UploadWorker {
             .map_err(|err| CompilationError::ComponentUploadFailed(err.to_string()));
 
         if let Err(ref err) = upload_result {
-            tracing::warn!("Failed to upload compiled component {component_and_version}: {err:?}");
+            tracing::warn!(
+                component_id = component_and_version.id.to_string(),
+                component_version = component_and_version.version.to_string(),
+                error = err.to_string(),
+                "Failed to upload compiled component"
+            );
         } else {
-            tracing::info!("Successfully uploaded compiled component {component_and_version}");
+            tracing::info!(
+                component_id = component_and_version.id.to_string(),
+                component_version = component_and_version.version.to_string(),
+                "Successfully uploaded compiled component"
+            );
         }
     }
 }

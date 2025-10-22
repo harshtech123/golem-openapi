@@ -14,9 +14,9 @@
 
 use crate::interpreter::interpreter_stack_value::RibInterpreterStackValue;
 use crate::{GetLiteralValue, LiteralValue};
-use golem_wasm_ast::analysis::analysed_type::tuple;
-use golem_wasm_ast::analysis::AnalysedType;
-use golem_wasm_rpc::{Value, ValueAndType};
+use golem_wasm::analysis::analysed_type::tuple;
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::{Value, ValueAndType};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ impl Display for RibResult {
             RibResult::Val(value_and_type) => value_and_type.to_string(),
         };
 
-        write!(f, "{}", wasm_wave)
+        write!(f, "{wasm_wave}")
     }
 }
 

@@ -17,15 +17,17 @@ test_r::enable!();
 
 #[allow(clippy::large_enum_variant)]
 pub mod proto {
+    use self::golem::worker::{WasiConfigVars, WasiConfigVarsEntry};
     use crate::proto::golem::worker::UpdateMode;
     use bincode::de::Decoder;
     use bincode::enc::Encoder;
     use bincode::error::{DecodeError, EncodeError};
     use bincode::{Decode, Encode};
-    use golem_wasm_ast::analysis::{
+    use golem_wasm::analysis::{
         AnalysedExport, AnalysedFunction, AnalysedFunctionParameter, AnalysedFunctionResult,
         AnalysedInstance,
     };
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     tonic::include_proto!("mod");
@@ -57,7 +59,6 @@ pub mod proto {
             value: crate::proto::golem::component::FunctionResult,
         ) -> Result<Self, Self::Error> {
             Ok(Self {
-                name: value.name,
                 typ: (&value.typ.ok_or("Missing typ")?).try_into()?,
             })
         }
@@ -66,7 +67,6 @@ pub mod proto {
     impl From<AnalysedFunctionResult> for crate::proto::golem::component::FunctionResult {
         fn from(value: AnalysedFunctionResult) -> Self {
             Self {
-                name: value.name,
                 typ: Some((&value.typ).into()),
             }
         }
@@ -115,11 +115,7 @@ pub mod proto {
                     .into_iter()
                     .map(|parameter| parameter.try_into())
                     .collect::<Result<_, _>>()?,
-                results: value
-                    .results
-                    .into_iter()
-                    .map(|result| result.try_into())
-                    .collect::<Result<_, _>>()?,
+                result: value.result.map(|result| result.try_into()).transpose()?,
             })
         }
     }
@@ -133,11 +129,7 @@ pub mod proto {
                     .into_iter()
                     .map(|parameter| parameter.into())
                     .collect(),
-                results: value
-                    .results
-                    .into_iter()
-                    .map(|result| result.into())
-                    .collect(),
+                result: value.result.map(|result| result.into()),
             }
         }
     }
@@ -206,8 +198,8 @@ pub mod proto {
         }
     }
 
-    impl Decode for UpdateMode {
-        fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+    impl<Context> Decode<Context> for UpdateMode {
+        fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
             match Decode::decode(decoder)? {
                 0u8 => Ok(UpdateMode::Automatic),
                 1u8 => Ok(UpdateMode::Manual),
@@ -216,32 +208,24 @@ pub mod proto {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use crate::proto::golem;
-        use prost::Message;
-        use test_r::test;
+    impl From<BTreeMap<String, String>> for WasiConfigVars {
+        fn from(value: BTreeMap<String, String>) -> Self {
+            Self {
+                entries: value
+                    .into_iter()
+                    .map(|(key, value)| WasiConfigVarsEntry { key, value })
+                    .collect(),
+            }
+        }
+    }
 
-        #[test]
-        fn target_worker_id_and_worker_id_are_bin_compatible() {
-            let component_id_uuid = uuid::Uuid::new_v4();
-            let component_id_uuid: golem::common::Uuid = component_id_uuid.into();
-            let component_id = golem::component::ComponentId {
-                value: Some(component_id_uuid),
-            };
-            let target_worker_id = golem::worker::TargetWorkerId {
-                component_id: Some(component_id),
-                name: Some("hello".to_string()),
-            };
-            let worker_id = golem::worker::WorkerId {
-                component_id: Some(component_id),
-                name: "hello".to_string(),
-            };
-
-            let target_worker_id_bytes = target_worker_id.encode_to_vec();
-            let worker_id_bytes = worker_id.encode_to_vec();
-
-            assert_eq!(target_worker_id_bytes, worker_id_bytes);
+    impl From<WasiConfigVars> for BTreeMap<String, String> {
+        fn from(value: WasiConfigVars) -> Self {
+            value
+                .entries
+                .into_iter()
+                .map(|e| (e.key, e.value))
+                .collect()
         }
     }
 }

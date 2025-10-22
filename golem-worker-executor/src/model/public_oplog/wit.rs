@@ -15,20 +15,23 @@
 use crate::model::public_oplog::{PublicOplogEntry, PublicUpdateDescription};
 use crate::preview2::golem_api_1_x::oplog;
 use crate::preview2::wasi::clocks::wall_clock::Datetime;
+use golem_common::base_model::ProjectId;
 use golem_common::model::public_oplog::{
-    ActivatePluginParameters, CancelInvocationParameters, ChangePersistenceLevelParameters,
-    ChangeRetryPolicyParameters, CreateParameters, DeactivatePluginParameters,
-    DescribeResourceParameters, EndRegionParameters, ErrorParameters,
+    ActivatePluginParameters, BeginRemoteTransactionParameters, CancelInvocationParameters,
+    ChangePersistenceLevelParameters, ChangeRetryPolicyParameters, CreateParameters,
+    DeactivatePluginParameters, EndRegionParameters, ErrorParameters,
     ExportedFunctionCompletedParameters, ExportedFunctionInvokedParameters,
     ExportedFunctionParameters, FailedUpdateParameters, FinishSpanParameters, GrowMemoryParameters,
     ImportedFunctionInvokedParameters, JumpParameters, LogParameters, ManualUpdateParameters,
     PendingUpdateParameters, PendingWorkerInvocationParameters, PluginInstallationDescription,
     PublicAttributeValue, PublicDurableFunctionType, PublicRetryConfig, PublicSpanData,
-    PublicWorkerInvocation, ResourceParameters, RevertParameters, SetSpanAttributeParameters,
-    SnapshotBasedUpdateParameters, StartSpanParameters, StringAttributeValue,
-    SuccessfulUpdateParameters, TimestampParameter, WriteRemoteBatchedParameters,
+    PublicWorkerInvocation, RemoteTransactionParameters, ResourceParameters, RevertParameters,
+    SetSpanAttributeParameters, SnapshotBasedUpdateParameters, StartSpanParameters,
+    StringAttributeValue, SuccessfulUpdateParameters, TimestampParameter,
+    WriteRemoteBatchedParameters, WriteRemoteTransactionParameters,
 };
 use golem_common::model::Timestamp;
+use golem_wasm::WitValue;
 
 impl From<PublicOplogEntry> for oplog::OplogEntry {
     fn from(value: PublicOplogEntry) -> Self {
@@ -39,20 +42,23 @@ impl From<PublicOplogEntry> for oplog::OplogEntry {
                 component_version,
                 args,
                 env,
-                account_id,
+                created_by,
+                project_id,
                 parent,
                 component_size,
                 initial_total_linear_memory_size,
                 initial_active_plugins,
+                wasi_config_vars: _,
             }) => Self::Create(oplog::CreateParameters {
                 timestamp: timestamp.into(),
-                worker_id: worker_id.into(),
+                agent_id: worker_id.into(),
                 component_version,
                 args,
                 env: env.into_iter().collect(),
-                account_id: oplog::AccountId {
-                    value: account_id.value,
+                created_by: oplog::AccountId {
+                    value: created_by.value,
                 },
+                project_id: project_id.into(),
                 parent: parent.map(|id| id.into()),
                 component_size,
                 initial_total_linear_memory_size,
@@ -66,7 +72,7 @@ impl From<PublicOplogEntry> for oplog::OplogEntry {
                 function_name,
                 request,
                 response,
-                wrapped_function_type,
+                durable_function_type: wrapped_function_type,
             }) => Self::ImportedFunctionInvoked(oplog::ImportedFunctionInvokedParameters {
                 timestamp: timestamp.into(),
                 function_name,
@@ -100,18 +106,20 @@ impl From<PublicOplogEntry> for oplog::OplogEntry {
                 consumed_fuel,
             }) => Self::ExportedFunctionCompleted(oplog::ExportedFunctionCompletedParameters {
                 timestamp: timestamp.into(),
-                response: response.into(),
+                response: response.map(WitValue::from),
                 consumed_fuel,
             }),
             PublicOplogEntry::Suspend(TimestampParameter { timestamp }) => {
                 Self::Suspend(timestamp.into())
             }
-            PublicOplogEntry::Error(ErrorParameters { timestamp, error }) => {
-                Self::Error(oplog::ErrorParameters {
-                    timestamp: timestamp.into(),
-                    error: error.to_string(),
-                })
-            }
+            PublicOplogEntry::Error(ErrorParameters {
+                timestamp,
+                error,
+                retry_from: _,
+            }) => Self::Error(oplog::ErrorParameters {
+                timestamp: timestamp.into(),
+                error: error.to_string(),
+            }),
             PublicOplogEntry::NoOp(TimestampParameter { timestamp }) => {
                 Self::NoOp(timestamp.into())
             }
@@ -158,7 +166,7 @@ impl From<PublicOplogEntry> for oplog::OplogEntry {
             PublicOplogEntry::PendingWorkerInvocation(PendingWorkerInvocationParameters {
                 timestamp,
                 invocation,
-            }) => Self::PendingWorkerInvocation(oplog::PendingWorkerInvocationParameters {
+            }) => Self::PendingAgentInvocation(oplog::PendingAgentInvocationParameters {
                 timestamp: timestamp.into(),
                 invocation: invocation.into(),
             }),
@@ -197,31 +205,27 @@ impl From<PublicOplogEntry> for oplog::OplogEntry {
                     delta,
                 })
             }
-            PublicOplogEntry::CreateResource(ResourceParameters { timestamp, id }) => {
-                Self::CreateResource(oplog::CreateResourceParameters {
-                    timestamp: timestamp.into(),
-                    resource_id: id.0,
-                })
-            }
-            PublicOplogEntry::DropResource(ResourceParameters { timestamp, id }) => {
-                Self::DropResource(oplog::DropResourceParameters {
-                    timestamp: timestamp.into(),
-                    resource_id: id.0,
-                })
-            }
-            PublicOplogEntry::DescribeResource(DescribeResourceParameters {
+            PublicOplogEntry::CreateResource(ResourceParameters {
                 timestamp,
                 id,
-                resource_name,
-                resource_params,
-            }) => Self::DescribeResource(oplog::DescribeResourceParameters {
+                name,
+                owner,
+            }) => Self::CreateResource(oplog::CreateResourceParameters {
                 timestamp: timestamp.into(),
                 resource_id: id.0,
-                resource_name,
-                resource_params: resource_params
-                    .into_iter()
-                    .map(|value| value.into())
-                    .collect(),
+                name,
+                owner,
+            }),
+            PublicOplogEntry::DropResource(ResourceParameters {
+                timestamp,
+                id,
+                name,
+                owner,
+            }) => Self::DropResource(oplog::DropResourceParameters {
+                timestamp: timestamp.into(),
+                resource_id: id.0,
+                name,
+                owner,
             }),
             PublicOplogEntry::Log(LogParameters {
                 timestamp,
@@ -308,6 +312,41 @@ impl From<PublicOplogEntry> for oplog::OplogEntry {
                 timestamp: timestamp.into(),
                 persistence_level: persistence_level.into(),
             }),
+            PublicOplogEntry::BeginRemoteTransaction(BeginRemoteTransactionParameters {
+                timestamp,
+                transaction_id,
+            }) => Self::BeginRemoteTransaction(oplog::BeginRemoteTransactionParameters {
+                timestamp: timestamp.into(),
+                transaction_id: transaction_id.into(),
+            }),
+            PublicOplogEntry::PreCommitRemoteTransaction(RemoteTransactionParameters {
+                timestamp,
+                begin_index,
+            }) => Self::PreCommitRemoteTransaction(oplog::RemoteTransactionParameters {
+                timestamp: timestamp.into(),
+                begin_index: begin_index.into(),
+            }),
+            PublicOplogEntry::PreRollbackRemoteTransaction(RemoteTransactionParameters {
+                timestamp,
+                begin_index,
+            }) => Self::PreRollbackRemoteTransaction(oplog::RemoteTransactionParameters {
+                timestamp: timestamp.into(),
+                begin_index: begin_index.into(),
+            }),
+            PublicOplogEntry::CommittedRemoteTransaction(RemoteTransactionParameters {
+                timestamp,
+                begin_index,
+            }) => Self::CommittedRemoteTransaction(oplog::RemoteTransactionParameters {
+                timestamp: timestamp.into(),
+                begin_index: begin_index.into(),
+            }),
+            PublicOplogEntry::RolledBackRemoteTransaction(RemoteTransactionParameters {
+                timestamp,
+                begin_index,
+            }) => Self::RolledBackRemoteTransaction(oplog::RemoteTransactionParameters {
+                timestamp: timestamp.into(),
+                begin_index: begin_index.into(),
+            }),
         }
     }
 }
@@ -332,6 +371,9 @@ impl From<PublicDurableFunctionType> for oplog::WrappedFunctionType {
             PublicDurableFunctionType::WriteRemoteBatched(WriteRemoteBatchedParameters {
                 index: idx,
             }) => Self::WriteRemoteBatched(idx.map(|idx| idx.into())),
+            PublicDurableFunctionType::WriteRemoteTransaction(
+                WriteRemoteTransactionParameters { index: idx },
+            ) => Self::WriteRemoteTransaction(idx.map(|idx| idx.into())),
         }
     }
 }
@@ -362,7 +404,7 @@ impl From<golem_common::model::oplog::LogLevel> for oplog::LogLevel {
     }
 }
 
-impl From<PublicWorkerInvocation> for oplog::WorkerInvocation {
+impl From<PublicWorkerInvocation> for oplog::AgentInvocation {
     fn from(value: PublicWorkerInvocation) -> Self {
         match value {
             PublicWorkerInvocation::ExportedFunction(ExportedFunctionParameters {
@@ -436,6 +478,14 @@ impl From<PublicAttributeValue> for oplog::AttributeValue {
     fn from(value: PublicAttributeValue) -> Self {
         match value {
             PublicAttributeValue::String(StringAttributeValue { value }) => Self::String(value),
+        }
+    }
+}
+
+impl From<ProjectId> for oplog::ProjectId {
+    fn from(value: ProjectId) -> Self {
+        Self {
+            uuid: value.0.into(),
         }
     }
 }

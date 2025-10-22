@@ -15,21 +15,22 @@
 pub use crate::base_model::OplogIndex;
 use crate::model::invocation_context::{AttributeValue, InvocationContextSpan, SpanId, TraceId};
 use crate::model::regions::OplogRegion;
-use crate::model::RetryConfig;
 use crate::model::{
-    AccountId, ComponentVersion, IdempotencyKey, PluginInstallationId, Timestamp, WorkerId,
-    WorkerInvocation,
+    AccountId, ComponentVersion, IdempotencyKey, PluginInstallationId, Timestamp, TransactionId,
+    WorkerId, WorkerInvocation,
 };
+use crate::model::{ProjectId, RetryConfig};
 use bincode::de::read::Reader;
 use bincode::de::{BorrowDecoder, Decoder};
 use bincode::enc::write::Writer;
 use bincode::enc::Encoder;
 use bincode::error::{DecodeError, EncodeError};
 use bincode::{BorrowDecode, Decode, Encode};
-use golem_wasm_rpc_derive::IntoValue;
+use golem_wasm::wasmtime::ResourceTypeId;
+use golem_wasm_derive::IntoValue;
 use nonempty_collections::NEVec;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -63,7 +64,7 @@ impl OplogIndexRange {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AtomicOplogIndex(Arc<AtomicU64>);
 
 impl AtomicOplogIndex {
@@ -146,16 +147,18 @@ impl Encode for PayloadId {
     }
 }
 
-impl Decode for PayloadId {
-    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<Context> Decode<Context> for PayloadId {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let mut bytes = [0u8; 16];
         decoder.reader().read(&mut bytes)?;
         Ok(Self(Uuid::from_bytes(bytes)))
     }
 }
 
-impl<'de> BorrowDecode<'de> for PayloadId {
-    fn borrow_decode<D: BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl<'de, Context> BorrowDecode<'de, Context> for PayloadId {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         let mut bytes = [0u8; 16];
         decoder.reader().read(&mut bytes)?;
         Ok(Self(Uuid::from_bytes(bytes)))
@@ -176,8 +179,8 @@ impl<'de> BorrowDecode<'de> for PayloadId {
     Serialize,
     Deserialize,
     IntoValue,
+    poem_openapi::NewType,
 )]
-#[cfg_attr(feature = "poem", derive(poem_openapi::NewType))]
 pub struct WorkerResourceId(pub u64);
 
 impl WorkerResourceId {
@@ -194,15 +197,19 @@ impl Display for WorkerResourceId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
-pub struct IndexedResourceKey {
-    pub resource_name: String,
-    pub resource_params: Vec<String>,
-}
-
 /// Worker log levels including the special stdout and stderr channels
-#[derive(Copy, Clone, Debug, PartialEq, Encode, Decode, Serialize, Deserialize, IntoValue)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    IntoValue,
+    poem_openapi::Enum,
+)]
 #[repr(u8)]
 pub enum LogLevel {
     Stdout,
@@ -267,9 +274,18 @@ impl SpanData {
 }
 
 #[derive(
-    Copy, Clone, Debug, PartialOrd, PartialEq, Encode, Decode, Serialize, Deserialize, IntoValue,
+    Copy,
+    Clone,
+    Debug,
+    PartialOrd,
+    PartialEq,
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    IntoValue,
+    poem_openapi::Enum,
 )]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
 pub enum PersistenceLevel {
     PersistNothing,
     PersistRemoteSideEffects,
@@ -278,31 +294,6 @@ pub enum PersistenceLevel {
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum OplogEntry {
-    CreateV1 {
-        timestamp: Timestamp,
-        worker_id: WorkerId,
-        component_version: ComponentVersion,
-        args: Vec<String>,
-        env: Vec<(String, String)>,
-        account_id: AccountId,
-        parent: Option<WorkerId>,
-        component_size: u64,
-        initial_total_linear_memory_size: u64,
-    },
-    /// The worker invoked a host function (original 1.0 version)
-    ImportedFunctionInvokedV1 {
-        timestamp: Timestamp,
-        function_name: String,
-        response: OplogPayload,
-        wrapped_function_type: DurableFunctionType, // TODO: rename in Golem 2.0
-    },
-    /// The worker has been invoked
-    ExportedFunctionInvokedV1 {
-        timestamp: Timestamp,
-        function_name: String,
-        request: OplogPayload,
-        idempotency_key: IdempotencyKey,
-    },
     /// The worker has completed an invocation
     ExportedFunctionCompleted {
         timestamp: Timestamp,
@@ -315,6 +306,11 @@ pub enum OplogEntry {
     Error {
         timestamp: Timestamp,
         error: WorkerError,
+        /// Points to the oplog index where the retry should start from. Normally this can be just the
+        /// current oplog index (after the last persisted side-effect). When failing in an atomic region
+        /// or batched remote writes, this should point to the start of the region.
+        /// When counting the number of retries for a specific error, the error entries are grouped by this index.
+        retry_from: OplogIndex,
     },
     /// Marker entry added when get-oplog-index is called from the worker, to make the jumping behavior
     /// more predictable.
@@ -369,12 +365,6 @@ pub enum OplogEntry {
         timestamp: Timestamp,
         description: UpdateDescription,
     },
-    /// An update was successfully applied
-    SuccessfulUpdateV1 {
-        timestamp: Timestamp,
-        target_version: ComponentVersion,
-        new_component_size: u64,
-    },
     /// An update failed to be applied
     FailedUpdate {
         timestamp: Timestamp,
@@ -387,17 +377,13 @@ pub enum OplogEntry {
     CreateResource {
         timestamp: Timestamp,
         id: WorkerResourceId,
+        resource_type_id: ResourceTypeId,
     },
     /// Dropped a resource instance
     DropResource {
         timestamp: Timestamp,
         id: WorkerResourceId,
-    },
-    /// Adds additional information for a created resource instance
-    DescribeResource {
-        timestamp: Timestamp,
-        id: WorkerResourceId,
-        indexed_resource: IndexedResourceKey,
+        resource_type_id: ResourceTypeId,
     },
     /// The worker emitted a log message
     Log {
@@ -414,20 +400,22 @@ pub enum OplogEntry {
         function_name: String,
         request: OplogPayload,
         response: OplogPayload,
-        wrapped_function_type: DurableFunctionType, // TODO: rename in Golem 2.0
+        durable_function_type: DurableFunctionType,
     },
-    /// The current version of the Create entry (previous is CreateV1)
+    /// The first entry of every oplog
     Create {
         timestamp: Timestamp,
         worker_id: WorkerId,
         component_version: ComponentVersion,
         args: Vec<String>,
         env: Vec<(String, String)>,
-        account_id: AccountId,
+        project_id: ProjectId,
+        created_by: AccountId,
         parent: Option<WorkerId>,
         component_size: u64,
         initial_total_linear_memory_size: u64,
         initial_active_plugins: HashSet<PluginInstallationId>,
+        wasi_config_vars: BTreeMap<String, String>,
     },
     /// Activates a plugin for the worker
     ActivatePlugin {
@@ -491,6 +479,35 @@ pub enum OplogEntry {
         timestamp: Timestamp,
         level: PersistenceLevel,
     },
+    /// Marks the beginning of a remote transaction
+    BeginRemoteTransaction {
+        timestamp: Timestamp,
+        transaction_id: TransactionId,
+        /// BeginRemoteTransaction entries need to be repeated on retries, because they may need a new
+        /// transaction_id. The `begin_index` field always points to the original, first entry. This makes
+        /// error grouping work. When None, this is the original begin entry.
+        original_begin_index: Option<OplogIndex>,
+    },
+    /// Marks the point before a remote transaction is committed
+    PreCommitRemoteTransaction {
+        timestamp: Timestamp,
+        begin_index: OplogIndex,
+    },
+    /// Marks the point before a remote transaction is rolled back
+    PreRollbackRemoteTransaction {
+        timestamp: Timestamp,
+        begin_index: OplogIndex,
+    },
+    /// Marks the point after a remote transaction is committed
+    CommittedRemoteTransaction {
+        timestamp: Timestamp,
+        begin_index: OplogIndex,
+    },
+    /// Marks the point after a remote transaction is rolled back
+    RolledBackRemoteTransaction {
+        timestamp: Timestamp,
+        begin_index: OplogIndex,
+    },
 }
 
 impl OplogEntry {
@@ -499,7 +516,9 @@ impl OplogEntry {
         component_version: ComponentVersion,
         args: Vec<String>,
         env: Vec<(String, String)>,
-        account_id: AccountId,
+        wasi_config_vars: BTreeMap<String, String>,
+        project_id: ProjectId,
+        created_by: AccountId,
         parent: Option<WorkerId>,
         component_size: u64,
         initial_total_linear_memory_size: u64,
@@ -511,11 +530,13 @@ impl OplogEntry {
             component_version,
             args,
             env,
-            account_id,
+            project_id,
+            created_by,
             parent,
             component_size,
             initial_total_linear_memory_size,
             initial_active_plugins,
+            wasi_config_vars,
         }
     }
 
@@ -538,10 +559,11 @@ impl OplogEntry {
         }
     }
 
-    pub fn error(error: WorkerError) -> OplogEntry {
+    pub fn error(error: WorkerError, retry_from: OplogIndex) -> OplogEntry {
         OplogEntry::Error {
             timestamp: Timestamp::now_utc(),
             error,
+            retry_from,
         }
     }
 
@@ -632,28 +654,19 @@ impl OplogEntry {
         }
     }
 
-    pub fn create_resource(id: WorkerResourceId) -> OplogEntry {
+    pub fn create_resource(id: WorkerResourceId, resource_type_id: ResourceTypeId) -> OplogEntry {
         OplogEntry::CreateResource {
             timestamp: Timestamp::now_utc(),
             id,
+            resource_type_id,
         }
     }
 
-    pub fn drop_resource(id: WorkerResourceId) -> OplogEntry {
+    pub fn drop_resource(id: WorkerResourceId, resource_type_id: ResourceTypeId) -> OplogEntry {
         OplogEntry::DropResource {
             timestamp: Timestamp::now_utc(),
             id,
-        }
-    }
-
-    pub fn describe_resource(
-        id: WorkerResourceId,
-        indexed_resource: IndexedResourceKey,
-    ) -> OplogEntry {
-        OplogEntry::DescribeResource {
-            timestamp: Timestamp::now_utc(),
-            id,
-            indexed_resource,
+            resource_type_id,
         }
     }
 
@@ -739,6 +752,45 @@ impl OplogEntry {
         }
     }
 
+    pub fn begin_remote_transaction(
+        transaction_id: TransactionId,
+        original_begin_index: Option<OplogIndex>,
+    ) -> OplogEntry {
+        OplogEntry::BeginRemoteTransaction {
+            timestamp: Timestamp::now_utc(),
+            transaction_id,
+            original_begin_index,
+        }
+    }
+
+    pub fn pre_commit_remote_transaction(begin_index: OplogIndex) -> OplogEntry {
+        OplogEntry::PreCommitRemoteTransaction {
+            timestamp: Timestamp::now_utc(),
+            begin_index,
+        }
+    }
+
+    pub fn pre_rollback_remote_transaction(begin_index: OplogIndex) -> OplogEntry {
+        OplogEntry::PreRollbackRemoteTransaction {
+            timestamp: Timestamp::now_utc(),
+            begin_index,
+        }
+    }
+
+    pub fn committed_remote_transaction(begin_index: OplogIndex) -> OplogEntry {
+        OplogEntry::CommittedRemoteTransaction {
+            timestamp: Timestamp::now_utc(),
+            begin_index,
+        }
+    }
+
+    pub fn rolled_back_remote_transaction(begin_index: OplogIndex) -> OplogEntry {
+        OplogEntry::RolledBackRemoteTransaction {
+            timestamp: Timestamp::now_utc(),
+            begin_index,
+        }
+    }
+
     pub fn is_end_atomic_region(&self, idx: OplogIndex) -> bool {
         matches!(self, OplogEntry::EndAtomicRegion { begin_index, .. } if *begin_index == idx)
     }
@@ -747,26 +799,95 @@ impl OplogEntry {
         matches!(self, OplogEntry::EndRemoteWrite { begin_index, .. } if *begin_index == idx)
     }
 
+    pub fn is_end_remote_write_s<S>(&self, idx: OplogIndex, _: &S) -> bool {
+        matches!(self, OplogEntry::EndRemoteWrite { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_pre_commit_remote_transaction(&self, idx: OplogIndex) -> bool {
+        matches!(self, OplogEntry::PreCommitRemoteTransaction { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_pre_rollback_remote_transaction(&self, idx: OplogIndex) -> bool {
+        matches!(self, OplogEntry::PreRollbackRemoteTransaction { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_pre_remote_transaction(&self, idx: OplogIndex) -> bool {
+        self.is_pre_commit_remote_transaction(idx) || self.is_pre_rollback_remote_transaction(idx)
+    }
+
+    pub fn is_pre_remote_transaction_s<S>(&self, idx: OplogIndex, _: &S) -> bool {
+        self.is_pre_commit_remote_transaction(idx) || self.is_pre_rollback_remote_transaction(idx)
+    }
+
+    pub fn is_committed_remote_transaction(&self, idx: OplogIndex) -> bool {
+        matches!(self, OplogEntry::CommittedRemoteTransaction { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_committed_remote_transaction_s<S>(&self, idx: OplogIndex, _: &S) -> bool {
+        matches!(self, OplogEntry::CommittedRemoteTransaction { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_rolled_back_remote_transaction(&self, idx: OplogIndex) -> bool {
+        matches!(self, OplogEntry::RolledBackRemoteTransaction { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_rolled_back_remote_transaction_s<S>(&self, idx: OplogIndex, _: &S) -> bool {
+        matches!(self, OplogEntry::RolledBackRemoteTransaction { begin_index, .. } if *begin_index == idx)
+    }
+
+    pub fn is_end_remote_transaction(&self, idx: OplogIndex) -> bool {
+        self.is_committed_remote_transaction(idx) || self.is_rolled_back_remote_transaction(idx)
+    }
+
+    pub fn is_end_remote_transaction_s<S>(&self, idx: OplogIndex, s: &S) -> bool {
+        self.is_committed_remote_transaction_s(idx, s)
+            || self.is_rolled_back_remote_transaction_s(idx, s)
+    }
+
     /// Checks that an "intermediate oplog entry" between a `BeginRemoteWrite` and an `EndRemoteWrite`
     /// is not a RemoteWrite entry which does not belong to the batched remote write started at `idx`.
-    pub fn no_concurrent_side_effect(&self, idx: OplogIndex) -> bool {
-        match self {
-            OplogEntry::ImportedFunctionInvoked {
-                wrapped_function_type,
-                ..
-            } => match wrapped_function_type {
-                DurableFunctionType::WriteRemoteBatched(Some(begin_index))
-                    if *begin_index == idx =>
-                {
-                    true
-                }
-                DurableFunctionType::ReadLocal => true,
-                DurableFunctionType::WriteLocal => true,
-                DurableFunctionType::ReadRemote => true,
-                _ => false,
-            },
-            OplogEntry::ExportedFunctionCompleted { .. } => false,
-            _ => true,
+    /// Side effects in a PersistenceLevel::PersistNothing region are ignored.
+    pub fn no_concurrent_side_effect(
+        &self,
+        idx: OplogIndex,
+        persistence_level: &PersistenceLevel,
+    ) -> bool {
+        if persistence_level == &PersistenceLevel::PersistNothing {
+            true
+        } else {
+            match self {
+                OplogEntry::ImportedFunctionInvoked {
+                    durable_function_type,
+                    ..
+                } => match durable_function_type {
+                    DurableFunctionType::WriteRemoteBatched(Some(begin_index))
+                        if *begin_index == idx =>
+                    {
+                        true
+                    }
+                    DurableFunctionType::WriteRemoteTransaction(Some(begin_index))
+                        if *begin_index == idx =>
+                    {
+                        true
+                    }
+                    DurableFunctionType::ReadLocal => true,
+                    DurableFunctionType::WriteLocal => true,
+                    DurableFunctionType::ReadRemote => true,
+                    _ => false,
+                },
+                OplogEntry::ExportedFunctionCompleted { .. } => false,
+                _ => true,
+            }
+        }
+    }
+
+    pub fn track_persistence_level(
+        &self,
+        _idx: OplogIndex,
+        persistence_level: &mut PersistenceLevel,
+    ) {
+        if let OplogEntry::ChangePersistenceLevel { level, .. } = self {
+            *persistence_level = *level
         }
     }
 
@@ -781,12 +902,10 @@ impl OplogEntry {
                 | OplogEntry::PendingWorkerInvocation { .. }
                 | OplogEntry::PendingUpdate { .. }
                 | OplogEntry::SuccessfulUpdate { .. }
-                | OplogEntry::SuccessfulUpdateV1 { .. }
                 | OplogEntry::FailedUpdate { .. }
                 | OplogEntry::GrowMemory { .. }
                 | OplogEntry::CreateResource { .. }
                 | OplogEntry::DropResource { .. }
-                | OplogEntry::DescribeResource { .. }
                 | OplogEntry::Log { .. }
                 | OplogEntry::Restart { .. }
                 | OplogEntry::ActivatePlugin { .. }
@@ -799,8 +918,6 @@ impl OplogEntry {
     pub fn timestamp(&self) -> Timestamp {
         match self {
             OplogEntry::Create { timestamp, .. }
-            | OplogEntry::ImportedFunctionInvokedV1 { timestamp, .. }
-            | OplogEntry::ExportedFunctionInvokedV1 { timestamp, .. }
             | OplogEntry::ExportedFunctionCompleted { timestamp, .. }
             | OplogEntry::Suspend { timestamp }
             | OplogEntry::Error { timestamp, .. }
@@ -820,12 +937,9 @@ impl OplogEntry {
             | OplogEntry::GrowMemory { timestamp, .. }
             | OplogEntry::CreateResource { timestamp, .. }
             | OplogEntry::DropResource { timestamp, .. }
-            | OplogEntry::DescribeResource { timestamp, .. }
             | OplogEntry::Log { timestamp, .. }
             | OplogEntry::Restart { timestamp }
             | OplogEntry::ImportedFunctionInvoked { timestamp, .. }
-            | OplogEntry::CreateV1 { timestamp, .. }
-            | OplogEntry::SuccessfulUpdateV1 { timestamp, .. }
             | OplogEntry::ActivatePlugin { timestamp, .. }
             | OplogEntry::DeactivatePlugin { timestamp, .. }
             | OplogEntry::Revert { timestamp, .. }
@@ -834,7 +948,12 @@ impl OplogEntry {
             | OplogEntry::StartSpan { timestamp, .. }
             | OplogEntry::FinishSpan { timestamp, .. }
             | OplogEntry::SetSpanAttribute { timestamp, .. }
-            | OplogEntry::ChangePersistenceLevel { timestamp, .. } => *timestamp,
+            | OplogEntry::ChangePersistenceLevel { timestamp, .. }
+            | OplogEntry::BeginRemoteTransaction { timestamp, .. }
+            | OplogEntry::PreCommitRemoteTransaction { timestamp, .. }
+            | OplogEntry::PreRollbackRemoteTransaction { timestamp, .. }
+            | OplogEntry::CommittedRemoteTransaction { timestamp, .. }
+            | OplogEntry::RolledBackRemoteTransaction { timestamp, .. } => *timestamp,
         }
     }
 
@@ -843,48 +962,25 @@ impl OplogEntry {
             OplogEntry::Create {
                 component_version, ..
             } => Some(*component_version),
-            OplogEntry::CreateV1 {
-                component_version, ..
-            } => Some(*component_version),
             OplogEntry::SuccessfulUpdate { target_version, .. } => Some(*target_version),
-            OplogEntry::SuccessfulUpdateV1 { target_version, .. } => Some(*target_version),
             _ => None,
         }
     }
 
     pub fn update_worker_id(&self, worker_id: &WorkerId) -> Option<OplogEntry> {
         match self {
-            OplogEntry::CreateV1 {
-                timestamp,
-                component_version,
-                args,
-                env,
-                account_id,
-                parent,
-                component_size,
-                initial_total_linear_memory_size,
-                worker_id: _,
-            } => Some(OplogEntry::CreateV1 {
-                timestamp: *timestamp,
-                worker_id: worker_id.clone(),
-                component_version: *component_version,
-                args: args.clone(),
-                env: env.clone(),
-                account_id: account_id.clone(),
-                parent: parent.clone(),
-                component_size: *component_size,
-                initial_total_linear_memory_size: *initial_total_linear_memory_size,
-            }),
             OplogEntry::Create {
                 timestamp,
                 component_version,
                 args,
                 env,
-                account_id,
+                project_id,
+                created_by,
                 parent,
                 component_size,
                 initial_total_linear_memory_size,
                 initial_active_plugins,
+                wasi_config_vars,
                 worker_id: _,
             } => Some(OplogEntry::Create {
                 timestamp: *timestamp,
@@ -892,11 +988,13 @@ impl OplogEntry {
                 component_version: *component_version,
                 args: args.clone(),
                 env: env.clone(),
-                account_id: account_id.clone(),
+                project_id: project_id.clone(),
+                created_by: created_by.clone(),
                 parent: parent.clone(),
                 component_size: *component_size,
                 initial_total_linear_memory_size: *initial_total_linear_memory_size,
                 initial_active_plugins: initial_active_plugins.clone(),
+                wasi_config_vars: wasi_config_vars.clone(),
             }),
             _ => None,
         }
@@ -963,54 +1061,46 @@ pub enum DurableFunctionType {
     /// this entry's index as the parameter. In batched remote writes it is the caller's responsibility
     /// to manually write an `EndRemoteWrite` entry (using `end_function`) when the operation is completed.
     WriteRemoteBatched(Option<OplogIndex>),
+
+    WriteRemoteTransaction(Option<OplogIndex>),
 }
 
 /// Describes the error that occurred in the worker
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum WorkerError {
     Unknown(String),
     InvalidRequest(String),
     StackOverflow,
     OutOfMemory,
+    // The worker tried to grow its memory beyond the limits of the plan
+    ExceededMemoryLimit,
 }
 
 impl WorkerError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unknown(message) => message,
+            Self::InvalidRequest(message) => message,
+            Self::StackOverflow => "Stack overflow",
+            Self::OutOfMemory => "Out of memory",
+            Self::ExceededMemoryLimit => "Exceeded plan memory limit",
+        }
+    }
+
     pub fn to_string(&self, error_logs: &str) -> String {
+        let message = self.message();
         let error_logs = if !error_logs.is_empty() {
-            format!("\n\n{}", error_logs)
+            format!("\n\n{error_logs}")
         } else {
             "".to_string()
         };
-        match self {
-            WorkerError::Unknown(message) => format!("{message}{error_logs}"),
-            WorkerError::InvalidRequest(message) => format!("{message}{error_logs}"),
-            WorkerError::StackOverflow => format!("Stack overflow{error_logs}"),
-            WorkerError::OutOfMemory => format!("Out of memory{error_logs}"),
-        }
+        format!("{message}{error_logs}")
     }
 }
 
-#[cfg(feature = "protobuf")]
 mod protobuf {
-    use crate::model::oplog::{IndexedResourceKey, PersistenceLevel};
-
-    impl From<IndexedResourceKey> for golem_api_grpc::proto::golem::worker::IndexedResourceMetadata {
-        fn from(value: IndexedResourceKey) -> Self {
-            golem_api_grpc::proto::golem::worker::IndexedResourceMetadata {
-                resource_name: value.resource_name,
-                resource_params: value.resource_params,
-            }
-        }
-    }
-
-    impl From<golem_api_grpc::proto::golem::worker::IndexedResourceMetadata> for IndexedResourceKey {
-        fn from(value: golem_api_grpc::proto::golem::worker::IndexedResourceMetadata) -> Self {
-            IndexedResourceKey {
-                resource_name: value.resource_name,
-                resource_params: value.resource_params,
-            }
-        }
-    }
+    use super::WorkerError;
+    use crate::model::oplog::PersistenceLevel;
 
     impl From<PersistenceLevel> for golem_api_grpc::proto::golem::worker::PersistenceLevel {
         fn from(value: PersistenceLevel) -> Self {
@@ -1035,6 +1125,44 @@ mod protobuf {
                 golem_api_grpc::proto::golem::worker::PersistenceLevel::PersistRemoteSideEffects => PersistenceLevel::PersistRemoteSideEffects,
                 golem_api_grpc::proto::golem::worker::PersistenceLevel::Smart => PersistenceLevel::Smart,
             }
+        }
+    }
+
+    impl TryFrom<golem_api_grpc::proto::golem::worker::WorkerError> for WorkerError {
+        type Error = String;
+
+        fn try_from(
+            value: golem_api_grpc::proto::golem::worker::WorkerError,
+        ) -> Result<Self, Self::Error> {
+            use golem_api_grpc::proto::golem::worker::worker_error::Error;
+            match value.error.ok_or("no error field")? {
+                Error::StackOverflow(_) => Ok(Self::StackOverflow),
+                Error::OutOfMemory(_) => Ok(Self::OutOfMemory),
+                Error::InvalidRequest(inner) => Ok(Self::InvalidRequest(inner.details)),
+                Error::UnknownError(inner) => Ok(Self::Unknown(inner.details)),
+                Error::ExceededMemoryLimit(_) => Ok(Self::ExceededMemoryLimit),
+            }
+        }
+    }
+
+    impl From<WorkerError> for golem_api_grpc::proto::golem::worker::WorkerError {
+        fn from(value: WorkerError) -> Self {
+            use golem_api_grpc::proto::golem::worker as grpc_worker;
+            use golem_api_grpc::proto::golem::worker::worker_error::Error;
+            let error = match value {
+                WorkerError::StackOverflow => Error::StackOverflow(grpc_worker::StackOverflow {}),
+                WorkerError::OutOfMemory => Error::OutOfMemory(grpc_worker::OutOfMemory {}),
+                WorkerError::InvalidRequest(details) => {
+                    Error::InvalidRequest(grpc_worker::InvalidRequest { details })
+                }
+                WorkerError::Unknown(details) => {
+                    Error::UnknownError(grpc_worker::UnknownError { details })
+                }
+                WorkerError::ExceededMemoryLimit => {
+                    Error::ExceededMemoryLimit(grpc_worker::ExceededMemoryLimit {})
+                }
+            };
+            Self { error: Some(error) }
         }
     }
 }

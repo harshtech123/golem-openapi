@@ -9,75 +9,16 @@ description = "Shared code between Golem services"
 
 license-file = "../LICENSE"
 
-[features]
-default = [
-    "base-model",
-    "config",
-    "model",
-    "observability",
-    "poem",
-    "protobuf",
-    "redis",
-    "serialization",
-    "sql",
-    "tokio",
-]
-
-base-model = []
-config = ["dep:figment"]
-model = [
-    "base-model",
-    "dep:golem-wasm-rpc",
-    "dep:golem-wasm-ast",
-    "dep:golem-rib",
-]
-observability = [
-    "dep:console-subscriber",
-    "dep:prometheus",
-    "dep:tracing",
-    "dep:tracing-subscriber",
-    "dep:tracing-serde",
-]
-poem = [
-    "dep:poem",
-    "dep:poem-derive",
-    "dep:poem-openapi",
-    "dep:poem-openapi-derive",
-    "golem-wasm-ast/poem_openapi",
-    "golem-wasm-ast/poem_openapi",
-    "golem-rib/poem",
-]
-protobuf = [
-    "dep:prost",
-    "dep:prost-types",
-    "dep:tonic",
-    "dep:golem-api-grpc",
-    "golem-rib/protobuf",
-    "golem-wasm-ast/protobuf",
-    "golem-wasm-rpc/protobuf",
-]
-redis = ["dep:fred"]
-serialization = []
-sql = ["dep:sqlx"]
-tokio = ["dep:tokio"]
+build = "build.rs"
 
 [lib]
 harness = false
 
 [dependencies]
-golem-api-grpc = { path = "../golem-api-grpc", version = "=0.0.0", optional = true }
-golem-rib = { path = "../golem-rib", version = "=0.0.0", default-features = false, features = [
-    "protobuf",
-    "poem",
-    "json_in_errors",
-], optional = true } # TODO: make these optionals
-golem-wasm-ast = { path = "../wasm-ast", version = "=0.0.0", default-features = false, features = [
-    "metadata",
-], optional = true }
-golem-wasm-rpc = { path = "../wasm-rpc", version = "=0.0.0", default-features = false, features = [
-    "host",
-], optional = true }
-golem-wasm-rpc-derive = { path = "../wasm-rpc-derive", version = "=0.0.0" }
+golem-api-grpc = { workspace = true }
+golem-rib = { workspace = true }
+golem-wasm = { workspace = true }
+golem-wasm-derive = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -86,45 +27,56 @@ bincode = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 combine = { workspace = true }
-console-subscriber = { workspace = true, optional = true }
-darling = { workspace = true }
+console-subscriber = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
-figment = { workspace = true, optional = true }
-fred = { workspace = true, optional = true }
-git-version = { workspace = true }
+figment = { workspace = true }
+fred = { workspace = true }
+heck = { workspace = true }
 http = { workspace = true }
 humantime-serde = { workspace = true }
 iso8601-timestamp = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 nonempty-collections = { workspace = true }
-poem = { workspace = true, optional = true }
-poem-derive = { workspace = true, optional = true }
-poem-openapi = { workspace = true, optional = true }
-poem-openapi-derive = { workspace = true, optional = true }
-prometheus = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
-prost-types = { workspace = true, optional = true }
+poem = { workspace = true }
+poem-openapi = { workspace = true }
+prometheus = { workspace = true }
+prost-types = { workspace = true }
 rand = { workspace = true }
-range-set-blaze = "0.1.16"
+range-set-blaze = { workspace = true }
 regex = { workspace = true }
+scc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sqlx = { workspace = true, optional = true }
+shadow-rs = { workspace = true }
+sqlx = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
-tracing-serde = { workspace = true, optional = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-serde = { workspace = true }
 typed-path = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+wasmparser = { workspace = true }
+wit-parser = { workspace = true }
+wasm-wave = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+assert2 = { workspace = true }
+pretty_assertions = { workspace = true }
 test-r = { workspace = true }
 tracing-test = { workspace = true }
+
+[build-dependencies]
+shadow-rs = { workspace = true }
+lenient_bool = { workspace = true }

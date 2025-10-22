@@ -14,8 +14,8 @@
 
 use crate::{GetTypeHint, InferredType, InstanceType, TypeInternal};
 use bincode::{Decode, Encode};
-use golem_wasm_ast::analysis::analysed_type::{bool, field, option, record, str, tuple};
-use golem_wasm_ast::analysis::{
+use golem_wasm::analysis::analysed_type::{bool, field, record, str, tuple};
+use golem_wasm::analysis::{
     AnalysedResourceId, AnalysedResourceMode, AnalysedType, NameOptionTypePair, NameTypePair,
     TypeBool, TypeChr, TypeEnum, TypeF32, TypeF64, TypeFlags, TypeHandle, TypeList, TypeOption,
     TypeRecord, TypeResult, TypeS16, TypeS32, TypeS64, TypeS8, TypeStr, TypeTuple, TypeU16,
@@ -23,6 +23,9 @@ use golem_wasm_ast::analysis::{
 };
 use serde::{Deserialize, Serialize};
 
+// An absence of analysed type is really `Unit`, however, we avoid
+// Option<AnalysedType> in favor of `AnalysedTypeWithUnit` for clarity.
+// and conversions such as what to print if its `unit` becomes more precise
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum AnalysedTypeWithUnit {
     Unit,
@@ -65,29 +68,30 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
     fn try_from(inferred_type: &InferredType) -> Result<Self, Self::Error> {
         match inferred_type.internal_type() {
             TypeInternal::Instance { instance_type } => match instance_type.as_ref() {
-                InstanceType::Resource { resource_args, .. } => {
-                    Ok(AnalysedTypeWithUnit::analysed_type(record(vec![
-                        NameTypePair {
-                            name: "resource".to_string(),
-                            typ: str(),
+                InstanceType::Resource {
+                    analysed_resource_id,
+                    analysed_resource_mode,
+                    ..
+                } => {
+                    let analysed_resource_id = AnalysedResourceId(*analysed_resource_id);
+
+                    let analysed_resource_mode = if *analysed_resource_mode == 0 {
+                        AnalysedResourceMode::Owned
+                    } else {
+                        AnalysedResourceMode::Borrowed
+                    };
+
+                    Ok(AnalysedTypeWithUnit::analysed_type(AnalysedType::Handle(
+                        TypeHandle {
+                            resource_id: analysed_resource_id,
+                            mode: analysed_resource_mode,
+                            name: None,
+                            owner: None,
                         },
-                        NameTypePair {
-                            name: "worker".to_string(),
-                            typ: str(),
-                        },
-                        NameTypePair {
-                            name: "args".to_string(),
-                            typ: tuple(vec![str(); resource_args.len()]),
-                        },
-                    ])))
+                    )))
                 }
 
-                _ => Ok(AnalysedTypeWithUnit::analysed_type(record(vec![
-                    NameTypePair {
-                        name: "worker".to_string(),
-                        typ: str(),
-                    },
-                ]))),
+                _ => Ok(AnalysedTypeWithUnit::analysed_type(str())),
             },
             TypeInternal::Range { from, to } => {
                 let from: AnalysedType = AnalysedType::try_from(from)?;
@@ -95,15 +99,14 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
                     to.as_ref().map(AnalysedType::try_from).transpose()?;
                 let analysed_type = match (from, to) {
                     (from_type, Some(to_type)) => record(vec![
-                        field("from", option(from_type)),
-                        field("to", option(to_type)),
+                        field("from", from_type),
+                        field("to", to_type),
                         field("inclusive", bool()),
                     ]),
 
-                    (from_type, None) => record(vec![
-                        field("from", option(from_type)),
-                        field("inclusive", bool()),
-                    ]),
+                    (from_type, None) => {
+                        record(vec![field("from", from_type), field("inclusive", bool())])
+                    }
                 };
                 Ok(AnalysedTypeWithUnit::analysed_type(analysed_type))
             }
@@ -149,6 +152,8 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
             TypeInternal::List(inferred_type) => Ok(AnalysedTypeWithUnit::analysed_type(
                 AnalysedType::List(TypeList {
                     inner: Box::new(inferred_type.try_into()?),
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Tuple(tuple) => Ok(AnalysedTypeWithUnit::analysed_type(
@@ -157,6 +162,8 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
                         .iter()
                         .map(|t| t.try_into())
                         .collect::<Result<Vec<AnalysedType>, String>>()?,
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Record(record) => Ok(AnalysedTypeWithUnit::analysed_type(
@@ -170,21 +177,29 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
                             })
                         })
                         .collect::<Result<Vec<NameTypePair>, String>>()?,
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Flags(flags) => Ok(AnalysedTypeWithUnit::analysed_type(
                 AnalysedType::Flags(TypeFlags {
                     names: flags.clone(),
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Enum(enums) => Ok(AnalysedTypeWithUnit::analysed_type(
                 AnalysedType::Enum(TypeEnum {
                     cases: enums.clone(),
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Option(option) => Ok(AnalysedTypeWithUnit::analysed_type(
                 AnalysedType::Option(TypeOption {
                     inner: Box::new(option.try_into()?),
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Result { ok, error } => Ok(AnalysedTypeWithUnit::analysed_type(
@@ -192,6 +207,8 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
                 AnalysedType::Result(TypeResult {
                     ok: ok.as_ref().and_then(|t| t.try_into().ok().map(Box::new)),
                     err: error.as_ref().and_then(|t| t.try_into().ok().map(Box::new)),
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Variant(variant) => Ok(AnalysedTypeWithUnit::analysed_type(
@@ -205,11 +222,15 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
                             })
                         })
                         .collect::<Result<Vec<NameOptionTypePair>, String>>()?,
+                    name: None,
+                    owner: None,
                 }),
             )),
             TypeInternal::Resource {
                 resource_id,
                 resource_mode,
+                name: _,
+                owner: _,
             } => Ok(AnalysedTypeWithUnit::analysed_type(AnalysedType::Handle(
                 TypeHandle {
                     resource_id: AnalysedResourceId(*resource_id),
@@ -218,6 +239,8 @@ impl TryFrom<&InferredType> for AnalysedTypeWithUnit {
                     } else {
                         AnalysedResourceMode::Borrowed
                     },
+                    name: None,
+                    owner: None,
                 },
             ))),
 

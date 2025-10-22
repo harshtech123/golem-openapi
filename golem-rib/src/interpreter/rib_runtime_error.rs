@@ -1,6 +1,20 @@
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::interpreter::interpreter_stack_value::RibInterpreterStackValue;
 use crate::{InstructionId, TypeHint};
-use golem_wasm_rpc::{Value, ValueAndType};
+use golem_wasm::{Value, ValueAndType};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
@@ -54,9 +68,9 @@ pub enum CastFrom {
 impl Display for CastFrom {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            CastFrom::FromValue(value) => write!(f, "{:?}", value),
-            CastFrom::FromType(typ) => write!(f, "{}", typ),
-            CastFrom::FromCustom(custom) => write!(f, "{}", custom),
+            CastFrom::FromValue(value) => write!(f, "{value:?}"),
+            CastFrom::FromType(typ) => write!(f, "{typ}"),
+            CastFrom::FromCustom(custom) => write!(f, "{custom}"),
         }
     }
 }
@@ -189,32 +203,31 @@ impl Display for RibRuntimeError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             RibRuntimeError::InputNotFound(input_name) => {
-                write!(f, "input not found: {}", input_name)
+                write!(f, "input not found: {input_name}")
             }
             RibRuntimeError::ExhaustedIterator => write!(f, "no more values in iterator"),
             RibRuntimeError::FieldNotFound { field } => {
-                write!(f, "field not found: {}", field)
+                write!(f, "field not found: {field}")
             }
             RibRuntimeError::InvariantViolation(violation) => {
-                write!(f, "internal error: {:?}", violation)
+                write!(f, "internal error: {violation:?}")
             }
-            RibRuntimeError::ThrownError(message) => write!(f, "Thrown error: {}", message),
+            RibRuntimeError::ThrownError(message) => write!(f, "error: {message}"),
             RibRuntimeError::CastError { from, to } => {
-                write!(f, "cast error from {} to {}", from, to)
+                write!(f, "cast error from {from} to {to}")
             }
             RibRuntimeError::TypeMismatch { expected, found } => {
                 write!(
                     f,
-                    "runtime type mismatch: expected {:?}, found {:?}",
-                    expected, found
+                    "runtime type mismatch: expected {expected:?}, found {found:?}"
                 )
             }
             RibRuntimeError::NoResult => write!(f, "No result"),
             RibRuntimeError::InfiniteComputation { message } => {
-                write!(f, "infinite computation detected: {}", message)
+                write!(f, "infinite computation detected: {message}")
             }
             RibRuntimeError::IndexOutOfBound { index, size } => {
-                write!(f, "index out of bound: {} (size: {})", index, size)
+                write!(f, "index out of bound: {index} (size: {size})")
             }
             RibRuntimeError::InvalidComparison {
                 message,
@@ -224,22 +237,21 @@ impl Display for RibRuntimeError {
                 (Some(left), Some(right)) => {
                     write!(
                         f,
-                        "Invalid comparison: {} (left: {}, right: {})",
-                        message, left, right
+                        "Invalid comparison: {message} (left: {left}, right: {right})"
                     )
                 }
                 _ => {
-                    write!(f, "Invalid comparison: {} ", message)
+                    write!(f, "Invalid comparison: {message} ")
                 }
             },
             RibRuntimeError::ArithmeticError { message } => {
-                write!(f, "arithmetic error: {}", message)
+                write!(f, "arithmetic error: {message}")
             }
             RibRuntimeError::FunctionInvokeError {
                 function_name,
                 error,
             } => {
-                write!(f, "failed to invoke function {}: {}", function_name, error)
+                write!(f, "failed to invoke function {function_name}: {error}")
             }
         }
     }

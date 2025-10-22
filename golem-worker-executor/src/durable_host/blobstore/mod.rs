@@ -15,7 +15,7 @@
 pub mod container;
 pub mod types;
 
-use futures_util::TryFutureExt;
+use futures::TryFutureExt;
 use golem_common::model::oplog::DurableFunctionType;
 use wasmtime::component::Resource;
 use wasmtime_wasi::IoView;
@@ -33,7 +33,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         &mut self,
         name: ContainerName,
     ) -> anyhow::Result<Result<Resource<Container>, Error>> {
-        let account_id = self.state.owned_worker_id.account_id();
+        let account_id = self.state.owned_worker_id.project_id();
         let durability = Durability::<u64, SerializableError>::new(
             self,
             "golem blobstore::blobstore",
@@ -48,6 +48,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 .and_then(|_| svc.get_container(account_id, name.clone()))
                 .await
                 .map(|r| r.unwrap());
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, name.clone(), result).await
         } else {
             durability.replay(self).await
@@ -61,7 +62,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     .push(ContainerEntry::new(name, created_at))?;
                 Ok(Ok(container))
             }
-            Err(e) => Ok(Err(format!("{:?}", e))),
+            Err(e) => Ok(Err(format!("{e:?}"))),
         }
     }
 
@@ -69,7 +70,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         &mut self,
         name: ContainerName,
     ) -> anyhow::Result<Result<Resource<Container>, Error>> {
-        let account_id = self.state.owned_worker_id.account_id();
+        let account_id = self.state.owned_worker_id.project_id();
         let durability = Durability::<Option<u64>, SerializableError>::new(
             self,
             "golem blobstore::blobstore",
@@ -83,6 +84,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 .blob_store_service
                 .get_container(account_id, name.clone())
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, name.clone(), result).await
         } else {
             durability.replay(self).await
@@ -97,12 +99,12 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 Ok(Ok(container))
             }
             Ok(None) => Ok(Err("Container not found".to_string())),
-            Err(e) => Ok(Err(format!("{:?}", e))),
+            Err(e) => Ok(Err(format!("{e:?}"))),
         }
     }
 
     async fn delete_container(&mut self, name: ContainerName) -> anyhow::Result<Result<(), Error>> {
-        let account_id = self.state.owned_worker_id.account_id();
+        let account_id = self.state.owned_worker_id.project_id();
         let durability = Durability::<(), SerializableError>::new(
             self,
             "golem blobstore::blobstore",
@@ -116,6 +118,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 .blob_store_service
                 .delete_container(account_id, name.clone())
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, name.clone(), result).await
         } else {
             durability.replay(self).await
@@ -123,7 +126,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         match result {
             Ok(_) => Ok(Ok(())),
-            Err(e) => Ok(Err(format!("{:?}", e))),
+            Err(e) => Ok(Err(format!("{e:?}"))),
         }
     }
 
@@ -131,7 +134,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         &mut self,
         name: ContainerName,
     ) -> anyhow::Result<Result<bool, Error>> {
-        let account_id = self.state.owned_worker_id.account_id();
+        let account_id = self.state.owned_worker_id.project_id();
         let durability = Durability::<bool, SerializableError>::new(
             self,
             "golem blobstore::blobstore",
@@ -145,6 +148,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 .blob_store_service
                 .container_exists(account_id, name.clone())
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, name, result).await
         } else {
             durability.replay(self).await
@@ -152,7 +156,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         match result {
             Ok(exists) => Ok(Ok(exists)),
-            Err(e) => Ok(Err(format!("{:?}", e))),
+            Err(e) => Ok(Err(format!("{e:?}"))),
         }
     }
 
@@ -161,7 +165,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         src: ObjectId,
         dest: ObjectId,
     ) -> anyhow::Result<Result<(), Error>> {
-        let account_id = self.state.owned_worker_id.account_id();
+        let account_id = self.state.owned_worker_id.project_id();
         let durability = Durability::<(), SerializableError>::new(
             self,
             "golem blobstore::blobstore",
@@ -187,6 +191,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     dest.object,
                 )
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, input, result).await
         } else {
             durability.replay(self).await
@@ -194,7 +199,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         match result {
             Ok(_) => Ok(Ok(())),
-            Err(e) => Ok(Err(format!("{:?}", e))),
+            Err(e) => Ok(Err(format!("{e:?}"))),
         }
     }
 
@@ -203,7 +208,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         src: ObjectId,
         dest: ObjectId,
     ) -> anyhow::Result<Result<(), Error>> {
-        let account_id = self.state.owned_worker_id.account_id();
+        let account_id = self.state.owned_worker_id.project_id();
         let durability = Durability::<(), SerializableError>::new(
             self,
             "golem blobstore::blobstore",
@@ -229,6 +234,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     dest.object,
                 )
                 .await;
+            durability.try_trigger_retry(self, &result).await?;
             durability.persist(self, input, result).await
         } else {
             durability.replay(self).await
@@ -236,7 +242,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         match result {
             Ok(_) => Ok(Ok(())),
-            Err(e) => Ok(Err(format!("{:?}", e))),
+            Err(e) => Ok(Err(format!("{e:?}"))),
         }
     }
 }

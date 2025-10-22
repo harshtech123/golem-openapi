@@ -12,55 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod cloud;
-pub mod oss;
+pub mod default;
 
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock, Weak};
-
-use crate::error::GolemError;
 use crate::model::{
-    CurrentResourceLimits, ExecutionStatus, InterruptKind, LastError, ListDirectoryResult,
-    ReadFileResult, TrapType, WorkerConfig,
+    CurrentResourceLimits, ExecutionStatus, LastError, ReadFileResult, TrapType, WorkerConfig,
 };
 use crate::services::active_workers::ActiveWorkers;
+use crate::services::agent_types::AgentTypesService;
 use crate::services::blob_store::BlobStoreService;
-use crate::services::component::{ComponentMetadata, ComponentService};
+use crate::services::component::ComponentService;
 use crate::services::file_loader::FileLoader;
 use crate::services::golem_config::GolemConfig;
 use crate::services::key_value::KeyValueService;
 use crate::services::oplog::{Oplog, OplogService};
 use crate::services::plugins::Plugins;
+use crate::services::projects::ProjectService;
 use crate::services::promise::PromiseService;
 use crate::services::rdbms::RdbmsService;
 use crate::services::resource_limits::ResourceLimits;
 use crate::services::rpc::Rpc;
 use crate::services::scheduler::SchedulerService;
+use crate::services::shard::ShardService;
 use crate::services::worker::WorkerService;
 use crate::services::worker_event::WorkerEventService;
 use crate::services::worker_fork::WorkerForkService;
 use crate::services::worker_proxy::WorkerProxy;
-use crate::services::{
-    worker_enumeration, HasAll, HasConfig, HasOplog, HasOplogService, HasWorker,
-};
+use crate::services::{worker_enumeration, HasAll, HasOplog, HasWorker};
 use crate::worker::{RetryDecision, Worker};
-use crate::GolemTypes;
 use async_trait::async_trait;
+use golem_common::model::agent::AgentId;
 use golem_common::model::invocation_context::{
     AttributeValue, InvocationContextSpan, InvocationContextStack, SpanId,
 };
-use golem_common::model::oplog::WorkerResourceId;
+use golem_common::model::oplog::{TimestampedUpdateDescription, UpdateDescription};
 use golem_common::model::{
-    AccountId, ComponentFilePath, ComponentVersion, IdempotencyKey, OwnedWorkerId,
-    PluginInstallationId, TargetWorkerId, WorkerId, WorkerMetadata, WorkerStatus,
-    WorkerStatusRecord,
+    AccountId, ComponentFilePath, ComponentVersion, GetFileSystemNodeResult, IdempotencyKey,
+    OplogIndex, OwnedWorkerId, PluginInstallationId, ProjectId, WorkerId, WorkerStatusRecord,
 };
-use golem_wasm_rpc::protobuf::type_annotated_value::TypeAnnotatedValue;
-use golem_wasm_rpc::wasmtime::ResourceStore;
-use golem_wasm_rpc::Value;
+use golem_service_base::error::worker_executor::{InterruptKind, WorkerExecutorError};
+use golem_wasm::wasmtime::ResourceStore;
+use golem_wasm::{Value, ValueAndType};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Weak};
 use wasmtime::component::{Component, Instance, Linker};
 use wasmtime::{AsContextMut, Engine, ResourceLimiterAsync};
-use wasmtime_wasi::WasiView;
+use wasmtime_wasi::p2::WasiView;
 use wasmtime_wasi_http::WasiHttpView;
 
 /// WorkerCtx is the primary customization and extension point of worker executor. It is the context
@@ -74,32 +70,30 @@ pub trait WorkerCtx:
     + InvocationHooks
     + ExternalOperations<Self>
     + ResourceStore
-    + IndexedResourceStore
     + UpdateManagement
     + FileSystemReading
     + DynamicLinking<Self>
     + InvocationContextManagement
+    + HasWasiConfigVars
     + Send
     + Sync
     + Sized
     + 'static
 {
-    /// Types that this particular WorkerCtx can work with
-    ///
-    /// Note: Both Types and Self are used below when defining types. The rule here is that Types should be used where possible.
-    /// Only use Self in nested types when it really needs to refer to the whole, wired WorkerCtx instance.
-    type Types: GolemTypes;
-
-    /// PublicState is a subset of the worker context which is accessible outside the worker
+    /// PublicState is a subset of the worker context that is accessible outside the worker
     /// execution. This is useful to publish queues and similar objects to communicate with the
     /// executing worker from things like a request handler.
     type PublicState: PublicWorkerIo + HasWorker<Self> + HasOplog + Clone + Send + Sync;
+
+    /// Static log event behaviour configuration for workers
+    const LOG_EVENT_EMIT_BEHAVIOUR: LogEventEmitBehaviour;
 
     /// Creates a new worker context
     ///
     /// Arguments:
     /// - `owned_worker_id`: The worker ID (consists of the component id and worker name as well as the worker's owner account)
     /// - `component_metadata`: Metadata associated with the worker's component
+    /// - `initial_component_metadata`: Metadata associated with the worker's component at the start of replay. Might be same or earlier than component_metadata
     /// - `promise_service`: The service for managing promises
     /// - `worker_service`: The service for managing workers
     /// - `key_value_service`: The service for storing key-value pairs
@@ -110,7 +104,7 @@ pub trait WorkerCtx:
     /// - `scheduler_service`: The scheduler implementation responsible for waking up suspended workers
     /// - `recovery_management`: The service for deciding if a worker should be recovered
     /// - `rpc`: The RPC implementation used for worker to worker communication
-    /// - `worker_proyx`: Access to the worker proxy above the worker executor cluster
+    /// - `worker_proxy`: Access to the worker proxy above the worker executor cluster
     /// - `extra_deps`: Extra dependencies that are required by this specific worker context
     /// - `config`: The shared worker configuration
     /// - `worker_config`: Configuration for this specific worker
@@ -118,15 +112,16 @@ pub trait WorkerCtx:
     /// - `file_loader`: The service for loading files and making them available to workers
     #[allow(clippy::too_many_arguments)]
     async fn create(
+        account_id: AccountId,
         owned_worker_id: OwnedWorkerId,
-        component_metadata: ComponentMetadata<Self::Types>,
+        agent_id: Option<AgentId>,
         promise_service: Arc<dyn PromiseService>,
         worker_service: Arc<dyn WorkerService>,
         worker_enumeration_service: Arc<dyn worker_enumeration::WorkerEnumerationService>,
         key_value_service: Arc<dyn KeyValueService>,
         blob_store_service: Arc<dyn BlobStoreService>,
         rdbms_service: Arc<dyn RdbmsService>,
-        event_service: Arc<dyn WorkerEventService + Send + Sync>,
+        event_service: Arc<dyn WorkerEventService>,
         active_workers: Arc<ActiveWorkers<Self>>,
         oplog_service: Arc<dyn OplogService>,
         oplog: Arc<dyn Oplog>,
@@ -134,16 +129,20 @@ pub trait WorkerCtx:
         scheduler_service: Arc<dyn SchedulerService>,
         rpc: Arc<dyn Rpc>,
         worker_proxy: Arc<dyn WorkerProxy>,
-        component_service: Arc<dyn ComponentService<Self::Types>>,
+        component_service: Arc<dyn ComponentService>,
         extra_deps: Self::ExtraDeps,
         config: Arc<GolemConfig>,
         worker_config: WorkerConfig,
-        execution_status: Arc<RwLock<ExecutionStatus>>,
+        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
         file_loader: Arc<FileLoader>,
-        plugins: Arc<dyn Plugins<Self::Types>>,
+        plugins: Arc<dyn Plugins>,
         worker_fork: Arc<dyn WorkerForkService>,
         resource_limits: Arc<dyn ResourceLimits>,
-    ) -> Result<Self, GolemError>;
+        project_service: Arc<dyn ProjectService>,
+        agent_types_service: Arc<dyn AgentTypesService>,
+        shard_service: Arc<dyn ShardService>,
+        pending_update: Option<TimestampedUpdateDescription>,
+    ) -> Result<Self, WorkerExecutorError>;
 
     fn as_wasi_view(&mut self) -> impl WasiView;
     fn as_wasi_http_view(&mut self) -> impl WasiHttpView;
@@ -163,7 +162,13 @@ pub trait WorkerCtx:
     /// Get the owned worker ID associated with this worker context
     fn owned_worker_id(&self) -> &OwnedWorkerId;
 
-    fn component_metadata(&self) -> &ComponentMetadata<Self::Types>;
+    /// Get the agent-id resolved from the worker name
+    fn agent_id(&self) -> Option<AgentId>;
+
+    /// Gets the account created this worker
+    fn created_by(&self) -> &AccountId;
+
+    fn component_metadata(&self) -> &golem_service_base::model::Component;
 
     /// The WASI exit API can use a special error to exit from the WASM execution. As this depends
     /// on the actual WASI implementation installed by the worker context, this function is used to
@@ -177,14 +182,9 @@ pub trait WorkerCtx:
     /// in the cluster
     fn worker_proxy(&self) -> Arc<dyn WorkerProxy>;
 
-    fn component_service(&self) -> Arc<dyn ComponentService<Self::Types> + Send + Sync>;
+    fn component_service(&self) -> Arc<dyn ComponentService>;
 
     fn worker_fork(&self) -> Arc<dyn WorkerForkService>;
-
-    async fn generate_unique_local_worker_id(
-        &mut self,
-        remote_worker_id: TargetWorkerId,
-    ) -> Result<WorkerId, GolemError>;
 }
 
 /// The fuel management interface of a worker context is responsible for borrowing and returning
@@ -208,7 +208,7 @@ pub trait FuelManagement {
     /// Borrows some fuel for the execution. The amount borrowed is not used by the execution engine,
     /// but the worker context can store it and use it in `is_out_of_fuel` to check if the worker is
     /// within the limits.
-    async fn borrow_fuel(&mut self) -> Result<(), GolemError>;
+    async fn borrow_fuel(&mut self) -> Result<(), WorkerExecutorError>;
 
     /// Same as `borrow_fuel` but synchronous as it is called from the epoch_deadline_callback.
     /// This assumes that there is a cached available resource limits that can be used to calculate
@@ -217,7 +217,7 @@ pub trait FuelManagement {
 
     /// Returns the remaining fuel that was previously borrowed. The remaining amount can be calculated
     /// by the current fuel level and some internal state of the worker context.
-    async fn return_fuel(&mut self, current_level: i64) -> Result<i64, GolemError>;
+    async fn return_fuel(&mut self, current_level: i64) -> Result<i64, WorkerExecutorError>;
 }
 
 /// The invocation management interface of a worker context is responsible for connecting
@@ -241,7 +241,7 @@ pub trait InvocationManagement {
     async fn set_current_invocation_context(
         &mut self,
         invocation_context: InvocationContextStack,
-    ) -> Result<(), GolemError>;
+    ) -> Result<(), WorkerExecutorError>;
 
     /// Gets the current invocation context stack
     async fn get_current_invocation_context(&self) -> InvocationContextStack;
@@ -264,22 +264,10 @@ pub trait StatusManagement {
     fn check_interrupt(&self) -> Option<InterruptKind>;
 
     /// Sets the worker status to suspended
-    async fn set_suspended(&self) -> Result<(), GolemError>;
+    fn set_suspended(&self);
 
     /// Sets the worker status to running
     fn set_running(&self);
-
-    /// Gets the current worker status
-    async fn get_worker_status(&self) -> WorkerStatus;
-
-    /// Stores the current worker status
-    async fn store_worker_status(&self, status: WorkerStatus);
-
-    /// Update the pending invocations of the worker
-    async fn update_pending_invocations(&self);
-
-    /// Update the pending updates of the worker
-    async fn update_pending_updates(&self);
 }
 
 /// The invocation hooks interface of a worker context has some functions called around
@@ -296,7 +284,7 @@ pub trait InvocationHooks {
         &mut self,
         full_function_name: &str,
         function_input: &Vec<Value>,
-    ) -> Result<(), GolemError>;
+    ) -> Result<(), WorkerExecutorError>;
 
     /// Called when a worker invocation fails
     async fn on_invocation_failure(&mut self, trap_type: &TrapType) -> RetryDecision;
@@ -313,8 +301,12 @@ pub trait InvocationHooks {
         full_function_name: &str,
         function_input: &Vec<Value>,
         consumed_fuel: i64,
-        output: TypeAnnotatedValue,
-    ) -> Result<(), GolemError>;
+        output: Option<ValueAndType>,
+    ) -> Result<(), WorkerExecutorError>;
+
+    /// Gets the retry point that should be associated with a current error. Errors are grouped
+    /// by this information. The current oplog index is a good default.
+    async fn get_current_retry_point(&self) -> OplogIndex;
 }
 
 #[async_trait]
@@ -335,34 +327,10 @@ pub trait UpdateManagement {
     /// Called when an update attempt succeeded
     async fn on_worker_update_succeeded(
         &self,
-        target_version: ComponentVersion,
+        update: &UpdateDescription,
         new_component_size: u64,
         new_active_plugins: HashSet<PluginInstallationId>,
     );
-}
-
-/// Stores resources created within the worker indexed by their constructor parameters
-///
-/// This is a secondary mapping on top of `ResourceStore`, which handles the mapping between
-/// resource identifiers to actual wasmtime `ResourceAny` instances.
-///
-/// Note that the parameters are passed as unparsed WAVE strings instead of their parsed `Value`
-/// representation - the string representation is easier to hash and allows us to reduce the number
-/// of times we need to parse the parameters.
-#[async_trait]
-pub trait IndexedResourceStore {
-    fn get_indexed_resource(
-        &self,
-        resource_name: &str,
-        resource_params: &[String],
-    ) -> Option<WorkerResourceId>;
-    async fn store_indexed_resource(
-        &mut self,
-        resource_name: &str,
-        resource_params: &[String],
-        resource: WorkerResourceId,
-    );
-    fn drop_indexed_resource(&mut self, resource_name: &str, resource_params: &[String]);
 }
 
 /// Operations not requiring an active worker context, but still depending on the
@@ -381,20 +349,14 @@ pub trait ExternalOperations<Ctx: WorkerCtx> {
         latest_worker_status: &WorkerStatusRecord,
     ) -> Option<LastError>;
 
-    /// Gets a best-effort current worker status without activating the worker
-    async fn compute_latest_worker_status<T: HasOplogService + HasConfig + Send + Sync>(
-        this: &T,
-        owned_worker_id: &OwnedWorkerId,
-        metadata: &Option<WorkerMetadata>,
-    ) -> Result<WorkerStatusRecord, GolemError>;
-
     /// Resume the replay of a worker instance. Note that if the previous replay
     /// hasn't reached the end of the replay (which is usually last index in oplog)
     /// resume_replay will ensure to start replay from the last replayed index.
     async fn resume_replay(
         store: &mut (impl AsContextMut<Data = Ctx> + Send),
         instance: &Instance,
-    ) -> Result<RetryDecision, GolemError>;
+        refresh_replay_target: bool,
+    ) -> Result<RetryDecision, WorkerExecutorError>;
 
     /// Prepares a wasmtime instance after it has been created, but before it can be invoked.
     /// This can be used to restore the previous state of the worker but by general it can be no-op.
@@ -402,22 +364,16 @@ pub trait ExternalOperations<Ctx: WorkerCtx> {
     /// If the result is true, the instance
     async fn prepare_instance(
         worker_id: &WorkerId,
-        instance: &wasmtime::component::Instance,
+        instance: &Instance,
         store: &mut (impl AsContextMut<Data = Ctx> + Send),
-    ) -> Result<RetryDecision, GolemError>;
+    ) -> Result<RetryDecision, WorkerExecutorError>;
 
     /// Records the last known resource limits of a worker without activating it
     async fn record_last_known_limits<T: HasAll<Ctx> + Send + Sync>(
         this: &T,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         last_known_limits: &CurrentResourceLimits,
-    ) -> Result<(), GolemError>;
-
-    /// Callback called when a worker is deleted
-    async fn on_worker_deleted<T: HasAll<Ctx> + Send + Sync>(
-        this: &T,
-        worker_id: &WorkerId,
-    ) -> Result<(), GolemError>;
+    ) -> Result<(), WorkerExecutorError>;
 
     /// Callback called when the executor's shard assignment has been changed
     async fn on_shard_assignment_changed<T: HasAll<Ctx> + Send + Sync + 'static>(
@@ -439,12 +395,14 @@ pub trait PublicWorkerIo {
 /// so not locking is needed in the implementation.
 #[async_trait]
 pub trait FileSystemReading {
-    // List the contents of a directory. Will return an error if the path is not a directory.
-    async fn list_directory(
+    async fn get_file_system_node(
         &self,
         path: &ComponentFilePath,
-    ) -> Result<ListDirectoryResult, GolemError>;
-    async fn read_file(&self, path: &ComponentFilePath) -> Result<ReadFileResult, GolemError>;
+    ) -> Result<GetFileSystemNodeResult, WorkerExecutorError>;
+    async fn read_file(
+        &self,
+        path: &ComponentFilePath,
+    ) -> Result<ReadFileResult, WorkerExecutorError>;
 }
 
 /// Functions to manipulate and query the current invocation context
@@ -453,25 +411,31 @@ pub trait InvocationContextManagement {
     async fn start_span(
         &mut self,
         initial_attributes: &[(String, AttributeValue)],
-    ) -> Result<Arc<InvocationContextSpan>, GolemError>;
+        activate: bool,
+    ) -> Result<Arc<InvocationContextSpan>, WorkerExecutorError>;
+
     async fn start_child_span(
         &mut self,
         parent: &SpanId,
         initial_attributes: &[(String, AttributeValue)],
-    ) -> Result<Arc<InvocationContextSpan>, GolemError>;
+    ) -> Result<Arc<InvocationContextSpan>, WorkerExecutorError>;
 
     /// Removes an inherited span without finishing it
-    fn remove_span(&mut self, span_id: &SpanId) -> Result<(), GolemError>;
+    fn remove_span(&mut self, span_id: &SpanId) -> Result<(), WorkerExecutorError>;
 
     /// Removes and finishes a local span
-    async fn finish_span(&mut self, span_id: &SpanId) -> Result<(), GolemError>;
+    async fn finish_span(&mut self, span_id: &SpanId) -> Result<(), WorkerExecutorError>;
 
     async fn set_span_attribute(
         &mut self,
         span_id: &SpanId,
         key: &str,
         value: AttributeValue,
-    ) -> Result<(), GolemError>;
+    ) -> Result<(), WorkerExecutorError>;
+
+    /// Clones every element of the stack belonging to the given current span id, and sets
+    /// the inherited flag to true on them, without changing the spans in this invocation context.
+    fn clone_as_inherited_stack(&self, current_span_id: &SpanId) -> InvocationContextStack;
 }
 
 #[async_trait]
@@ -481,6 +445,17 @@ pub trait DynamicLinking<Ctx: WorkerCtx> {
         engine: &Engine,
         linker: &mut Linker<Ctx>,
         component: &Component,
-        component_metadata: &ComponentMetadata<Ctx::Types>,
+        component_metadata: &golem_service_base::model::Component,
     ) -> anyhow::Result<()>;
+}
+
+pub trait HasWasiConfigVars {
+    fn wasi_config_vars(&self) -> BTreeMap<String, String>;
+}
+
+pub enum LogEventEmitBehaviour {
+    /// Always emit all log event
+    Always,
+    /// Emit log events only during live mode
+    LiveOnly,
 }

@@ -20,7 +20,10 @@ use crate::repl_printer::{DefaultReplResultPrinter, ReplPrinter};
 use crate::repl_state::ReplState;
 use crate::rib_context::ReplContext;
 use crate::rib_edit::RibEdit;
-use crate::{CommandRegistry, ReplBootstrapError, RibExecutionError, UntypedCommand};
+use crate::{
+    CommandRegistry, ReplBootstrapError, ReplComponentDependencies, RibExecutionError,
+    UntypedCommand,
+};
 use colored::Colorize;
 use rib::{RibCompiler, RibCompilerConfig, RibResult};
 use rustyline::error::ReadlineError;
@@ -85,36 +88,37 @@ impl RibRepl {
         if history_file_path.exists() {
             if let Err(err) = rl.load_history(&history_file_path) {
                 return Err(ReplBootstrapError::ReplHistoryFileError(format!(
-                    "Failed to load history: {}. Starting with an empty history.",
-                    err
+                    "Failed to load history: {err}. Starting with an empty history."
                 )));
             }
         }
 
-        let component_dependency = match config.component_source {
-            Some(ref details) => config
-                .dependency_manager
-                .add_component(&details.source_path, details.component_name.clone())
-                .await
-                .map_err(|err| ReplBootstrapError::ComponentLoadError(err.to_string())),
+        let component_dependencies = match config.component_source {
+            Some(ref details) => {
+                let component_dependency = config
+                    .dependency_manager
+                    .add_component(&details.source_path, details.component_name.clone())
+                    .await
+                    .map_err(|err| ReplBootstrapError::ComponentLoadError(err.to_string()))?;
+
+                Ok(ReplComponentDependencies {
+                    component_dependencies: vec![component_dependency],
+                    custom_instance_spec: vec![],
+                })
+            }
             None => {
                 let dependencies = config.dependency_manager.get_dependencies().await;
 
                 match dependencies {
                     Ok(dependencies) => {
-                        let mut component_dependencies = dependencies.component_dependencies;
-
-                        match &component_dependencies.len() {
-                            0 => Err(ReplBootstrapError::NoComponentsFound),
-                            1 => Ok(component_dependencies.pop().unwrap()),
-                            _ => Err(ReplBootstrapError::MultipleComponentsFound(
-                                "multiple components detected. rib repl currently support only a single component".to_string(),
-                            )),
+                        if dependencies.component_dependencies.is_empty() {
+                            return Err(ReplBootstrapError::NoComponentsFound);
                         }
+
+                        Ok(dependencies)
                     }
                     Err(err) => Err(ReplBootstrapError::ComponentLoadError(format!(
-                        "failed to register components: {}",
-                        err
+                        "failed to register components: {err}"
                     ))),
                 }
             }
@@ -123,14 +127,18 @@ impl RibRepl {
         // Once https://github.com/golemcloud/golem/issues/1608 is resolved,
         // component dependency will not be required in the REPL state
         let repl_state = ReplState::new(
-            component_dependency.clone(),
             config.worker_function_invoke,
             RibCompiler::new(RibCompilerConfig::new(
-                component_dependency.metadata,
+                component_dependencies.component_dependencies,
                 vec![],
+                component_dependencies.custom_instance_spec.clone(),
             )),
             history_file_path.clone(),
         );
+
+        rl.helper_mut()
+            .unwrap()
+            .update_custom_instances(component_dependencies.custom_instance_spec);
 
         Ok(RibRepl {
             printer: config
@@ -189,7 +197,7 @@ impl RibRepl {
                         .editor
                         .save_history(self.repl_state.history_file_path());
 
-                    match compile_rib_script(&self.current_rib_program(), &self.repl_state) {
+                    match compile_rib_script(&self.current_rib_program(), self.repl_state.clone()) {
                         Ok(compiler_output) => {
                             let rib_edit = self.editor.helper_mut().unwrap();
 
@@ -231,30 +239,33 @@ impl RibRepl {
             match readline {
                 Ok(rib) => {
                     let result = self.execute(rib.as_str()).await;
-
-                    match result {
-                        Ok(Some(result)) => {
-                            self.printer.print_rib_result(&result);
-                        }
-
-                        Ok(None) => {}
-
-                        Err(err) => match err {
-                            RibExecutionError::RibRuntimeError(runtime_error) => {
-                                self.printer.print_rib_runtime_error(&runtime_error);
-                            }
-                            RibExecutionError::RibCompilationError(runtime_error) => {
-                                self.printer.print_rib_compilation_error(&runtime_error);
-                            }
-                            RibExecutionError::Custom(custom_error) => {
-                                self.printer.print_custom_error(&custom_error);
-                            }
-                        },
-                    }
+                    self.print_execute_result(&result);
                 }
                 Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
                 Err(_) => continue,
             }
+        }
+    }
+
+    pub fn print_execute_result(&mut self, result: &Result<Option<RibResult>, RibExecutionError>) {
+        match result {
+            Ok(Some(result)) => {
+                self.printer.print_rib_result(result);
+            }
+
+            Ok(None) => {}
+
+            Err(err) => match err {
+                RibExecutionError::RibRuntimeError(runtime_error) => {
+                    self.printer.print_rib_runtime_error(runtime_error);
+                }
+                RibExecutionError::RibCompilationError(runtime_error) => {
+                    self.printer.print_rib_compilation_error(runtime_error);
+                }
+                RibExecutionError::Custom(custom_error) => {
+                    self.printer.print_custom_error(custom_error);
+                }
+            },
         }
     }
 
@@ -289,7 +300,7 @@ impl CommandOrExpr {
                     args: input_args,
                     executor: command,
                 })
-                .ok_or_else(|| format!("Command '{}' not found", command_name))?;
+                .ok_or_else(|| format!("Command '{command_name}' not found"))?;
 
             Ok(command)
         } else {

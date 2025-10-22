@@ -1,24 +1,21 @@
 use test_r::test;
 
-use cloud_common::model::Role;
-use cloud_common::model::{
-    PlanId, ProjectActions, ProjectAuthorisedActions, ProjectGrantId, ProjectPolicyId, TokenId,
-};
 use cloud_service::auth::AccountAuthorisation;
+use cloud_service::bootstrap::Services;
 use cloud_service::config::{make_config_loader, CloudServiceConfig};
 use cloud_service::model::{
-    Account, AccountData, OAuth2Provider, OAuth2Token, Project, ProjectData, ProjectGrant,
-    ProjectGrantData, ProjectPolicy, ProjectType, Token,
+    Account, AccountData, Project, ProjectData, ProjectGrant, ProjectGrantData, ProjectPolicy,
+    ProjectType, Token,
 };
 use cloud_service::service::account::AccountService;
-use cloud_service::service::oauth2_token::OAuth2TokenService;
 use cloud_service::service::project::ProjectService;
 use cloud_service::service::project_grant::ProjectGrantService;
 use cloud_service::service::project_policy::ProjectPolicyService;
-use cloud_service::service::Services;
 use golem_common::config::DbConfig;
+use golem_common::model::auth::{ProjectActions, ProjectAuthorisedActions, Role};
 use golem_common::model::AccountId;
 use golem_common::model::ProjectId;
+use golem_common::model::{PlanId, ProjectGrantId, ProjectPolicyId, TokenId};
 use golem_service_base::db;
 use golem_service_base::migration::{Migrations, MigrationsDir};
 use std::collections::HashSet;
@@ -109,41 +106,14 @@ async fn create_account(
         email: format!("{}@golem.cloud", account_id.value),
     };
 
-    let auth = create_auth(account_id, vec![Role::Admin]);
-
-    let create_result = account_service
-        .create(account_id, &account_data, &auth)
-        .await;
+    let create_result = account_service.create(account_id, &account_data).await;
 
     assert!(
         create_result.is_ok(),
-        "Failed to create account: {:?}",
-        account_data
+        "Failed to create account: {account_data:?}"
     );
 
     create_result.unwrap()
-}
-
-async fn create_oauth2_token(
-    account_id: &AccountId,
-    oauth2_token_service: Arc<dyn OAuth2TokenService + Sync + Send>,
-) -> OAuth2Token {
-    let token = OAuth2Token {
-        provider: OAuth2Provider::Github,
-        external_id: account_id.value.clone(),
-        account_id: account_id.clone(),
-        token_id: None,
-    };
-
-    let create_result = oauth2_token_service.upsert(&token).await;
-
-    assert!(
-        create_result.is_ok(),
-        "Failed to create oauth2 token: {:?}",
-        token
-    );
-
-    token
 }
 
 async fn create_project(
@@ -161,13 +131,11 @@ async fn create_project(
             project_type: ProjectType::NonDefault,
         },
     };
-    let auth = create_auth(account_id, vec![]);
-    let create_result = project_service.create(&project, &auth).await;
+    let create_result = project_service.create(&project).await;
 
     assert!(
         create_result.is_ok(),
-        "Failed to create project: {:?}",
-        project
+        "Failed to create project: {project:?}"
     );
     project
 }
@@ -175,7 +143,7 @@ async fn create_project(
 async fn delete_project(
     project_id: &ProjectId,
     account_id: &AccountId,
-    project_service: Arc<dyn ProjectService + Sync + Send>,
+    project_service: Arc<dyn ProjectService>,
 ) -> Project {
     let project = Project {
         project_id: project_id.clone(),
@@ -187,20 +155,18 @@ async fn delete_project(
             project_type: ProjectType::NonDefault,
         },
     };
-    let auth = create_auth(account_id, vec![]);
-    let create_result = project_service.create(&project, &auth).await;
-    let delete_result = project_service.delete(project_id, &auth).await;
+
+    let create_result = project_service.create(&project).await;
+    let delete_result = project_service.delete(project_id).await;
 
     assert!(
         create_result.is_ok(),
-        "Failed to create project: {:?}",
-        project
+        "Failed to create project: {project:?}"
     );
 
     assert!(
         delete_result.is_ok(),
-        "Failed to delete project: {:?}",
-        project
+        "Failed to delete project: {project:?}"
     );
     project
 }
@@ -220,8 +186,7 @@ async fn create_project_policy(
 
     assert!(
         create_result.is_ok(),
-        "Failed to create project policy: {:?}",
-        policy
+        "Failed to create project policy: {policy:?}"
     );
     policy
 }
@@ -229,7 +194,6 @@ async fn create_project_policy(
 async fn create_project_grant(
     id: &ProjectGrantId,
     data: &ProjectGrantData,
-    auth: &AccountAuthorisation,
     project_grant_service: Arc<dyn ProjectGrantService + Sync + Send>,
 ) -> ProjectGrant {
     let grant = ProjectGrant {
@@ -237,7 +201,7 @@ async fn create_project_grant(
         data: data.clone(),
     };
 
-    project_grant_service.create(&grant, auth).await.unwrap();
+    project_grant_service.create(&grant).await.unwrap();
 
     grant
 }
@@ -278,11 +242,7 @@ async fn test_services(config: &CloudServiceConfig) {
 
     // check user can get their own account
     {
-        let account_by_id = services
-            .account_service
-            .get(&account.id, &auth)
-            .await
-            .unwrap();
+        let account_by_id = services.account_service.get(&account.id).await.unwrap();
 
         assert_eq!(account_by_id, account);
     }
@@ -294,16 +254,12 @@ async fn test_services(config: &CloudServiceConfig) {
             .create(
                 &account.id,
                 &(chrono::Utc::now() + chrono::Duration::minutes(2)),
-                &auth,
             )
             .await
             .unwrap();
 
-        let token_by_id = services
-            .token_service
-            .get(&token.data.id, &auth)
-            .await
-            .unwrap();
+        let token_by_id = services.token_service.get(&token.data.id).await.unwrap();
+
         // assert!(token_by_id == token.data); // FIXME failing in CI - probably related to timestamps
         assert_eq!(token_by_id.account_id, token.data.account_id);
 
@@ -312,14 +268,16 @@ async fn test_services(config: &CloudServiceConfig) {
             .get_by_secret(&token.secret)
             .await
             .unwrap();
+
         // assert!(token_by_secret.is_some_and(|t| t == token_by_id));  // FIXME failing in CI - probably related to timestamps
         assert!(token_by_secret.is_some_and(|t| t.account_id == token_by_id.account_id));
 
         let tokens_by_account = services
             .token_service
-            .find(&token.data.account_id, &auth)
+            .find(&token.data.account_id)
             .await
             .unwrap();
+
         // assert!(tokens_by_account == vec![token.data]); // FIXME failing in CI - probably related to timestamps
 
         assert_eq!(tokens_by_account.len(), 1);
@@ -333,32 +291,33 @@ async fn test_services(config: &CloudServiceConfig) {
         assert!(auth.token.account_id == token.data.account_id && auth.token.id == token.data.id);
     }
 
-    // check that we can get oauth tokens
-    {
-        let oauth2_token =
-            create_oauth2_token(&account.id, services.oauth2_token_service.clone()).await;
-
-        let oauth2_token_by_id = services
-            .oauth2_token_service
-            .get(&oauth2_token.provider, oauth2_token.external_id.as_str())
-            .await
-            .unwrap();
-
-        assert!(oauth2_token_by_id.is_some_and(|p| p == oauth2_token));
-    }
-
     // Check that we can only search for our own account
     {
-        let mut accounts = services.account_service.find(None, &auth).await.unwrap();
+        let viewable_accounts = services
+            .auth_service
+            .viewable_accounts(&auth)
+            .await
+            .unwrap();
+        let mut accounts = services
+            .account_service
+            .find(None, viewable_accounts)
+            .await
+            .unwrap();
         accounts.sort();
         assert_eq!(accounts, vec![account.clone()]);
     }
 
     // Check that admins can see all accounts
     {
+        let viewable_accounts = services
+            .auth_service
+            .viewable_accounts(&admin_auth)
+            .await
+            .unwrap();
+
         let mut accounts = services
             .account_service
-            .find(None, &admin_auth)
+            .find(None, viewable_accounts)
             .await
             .unwrap();
         accounts.sort();
@@ -379,11 +338,25 @@ async fn test_services(config: &CloudServiceConfig) {
         services.project_service.clone(),
     )
     .await;
-    let project_default = services.project_service.get_default(&auth).await.unwrap();
+
+    let project_default = services
+        .project_service
+        .get_default(&account_id)
+        .await
+        .unwrap();
 
     // Check that we can create and get projects
     {
-        let projects = services.project_service.get_all(&auth).await.unwrap();
+        let viewable_projects = services
+            .auth_service
+            .viewable_projects(&auth)
+            .await
+            .unwrap();
+        let projects = services
+            .project_service
+            .get_all(viewable_projects)
+            .await
+            .unwrap();
 
         assert_eq!(
             HashSet::from_iter(projects),
@@ -392,7 +365,7 @@ async fn test_services(config: &CloudServiceConfig) {
 
         let project_by_id = services
             .project_service
-            .get(&project.project_id, &auth)
+            .get(&project.project_id)
             .await
             .unwrap();
 
@@ -423,14 +396,13 @@ async fn test_services(config: &CloudServiceConfig) {
                 grantee_account_id: account2.id.clone(),
                 project_policy_id: project_policy.id.clone(),
             },
-            &auth,
             services.project_grant_service.clone(),
         )
         .await;
 
         let project_grant_by_id = services
             .project_grant_service
-            .get(&project.project_id, &project_grant.id, &auth2)
+            .get(&project.project_id, &project_grant.id)
             .await
             .unwrap();
 
@@ -438,7 +410,7 @@ async fn test_services(config: &CloudServiceConfig) {
 
         let project_grant_by_project = services
             .project_grant_service
-            .get_by_project(&project.project_id, &auth2)
+            .get_by_project(&project.project_id)
             .await
             .unwrap();
 
@@ -469,14 +441,32 @@ async fn test_services(config: &CloudServiceConfig) {
 
     // check that we can list the shared project after getting a grant
     {
-        let projects = services.project_service.get_all(&auth2).await.unwrap();
+        let viewable_projects = services
+            .auth_service
+            .viewable_projects(&auth2)
+            .await
+            .unwrap();
+        let projects = services
+            .project_service
+            .get_all(viewable_projects)
+            .await
+            .unwrap();
 
         assert_eq!(projects, vec![project.clone()]);
     }
 
     // check that admin can see all projects
     {
-        let projects = services.project_service.get_all(&admin_auth).await.unwrap();
+        let viewable_projects = services
+            .auth_service
+            .viewable_projects(&admin_auth)
+            .await
+            .unwrap();
+        let projects = services
+            .project_service
+            .get_all(viewable_projects)
+            .await
+            .unwrap();
 
         assert_eq!(
             HashSet::from_iter(projects),
@@ -486,7 +476,16 @@ async fn test_services(config: &CloudServiceConfig) {
 
     // check that an unrelated user cannot see the projects
     {
-        let projects = services.project_service.get_all(&auth3).await.unwrap();
+        let viewable_projects = services
+            .auth_service
+            .viewable_projects(&auth3)
+            .await
+            .unwrap();
+        let projects = services
+            .project_service
+            .get_all(viewable_projects)
+            .await
+            .unwrap();
 
         assert_eq!(projects, vec![]);
     }
@@ -503,30 +502,38 @@ async fn test_services(config: &CloudServiceConfig) {
         .await;
     }
 
-    // check that admin can get account summaries
+    // get account summaries
     {
-        let account_summaries = services
-            .account_summary_service
-            .get(0, 10, &admin_auth)
-            .await
-            .unwrap();
+        let account_summaries = services.account_summary_service.get(0, 10).await.unwrap();
         assert_eq!(account_summaries.len(), 1);
     }
 
     // Check that we can list accounts we have a grant from
     {
-        let auth = create_auth(&account2.id, vec![]);
-        let mut accounts = services.account_service.find(None, &auth).await.unwrap();
+        let viewable_accounts = services
+            .auth_service
+            .viewable_accounts(&auth2)
+            .await
+            .unwrap();
+        let mut accounts = services
+            .account_service
+            .find(None, viewable_accounts)
+            .await
+            .unwrap();
         accounts.sort();
         assert_eq!(accounts, vec![account.clone(), account2.clone()]);
     }
 
     // Check that we can filter accounts by email
     {
-        let auth = create_auth(&account2.id, vec![]);
+        let viewable_accounts = services
+            .auth_service
+            .viewable_accounts(&auth2)
+            .await
+            .unwrap();
         let mut accounts = services
             .account_service
-            .find(Some(&account.email), &auth)
+            .find(Some(&account.email), viewable_accounts)
             .await
             .unwrap();
         accounts.sort();

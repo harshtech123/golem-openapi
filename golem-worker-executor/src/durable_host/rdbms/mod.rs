@@ -14,13 +14,16 @@
 
 use crate::durable_host::rdbms::serialized::RdbmsRequest;
 use crate::durable_host::serialized::SerializableError;
-use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx};
-use crate::services::rdbms::{Error as RdbmsError, RdbmsService, RdbmsTypeService};
+use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, RemoteTransactionHandler};
+use crate::services::rdbms::{
+    Error as RdbmsError, RdbmsService, RdbmsTransactionStatus, RdbmsTypeService,
+};
 use crate::services::rdbms::{RdbmsPoolKey, RdbmsType};
 use crate::workerctx::WorkerCtx;
 use anyhow::anyhow;
-use golem_common::base_model::OplogIndex;
+use async_trait::async_trait;
 use golem_common::model::oplog::DurableFunctionType;
+use golem_common::model::{OplogIndex, TransactionId, WorkerId};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -50,7 +53,7 @@ async fn open_db_connection<Ctx, T, E>(
 ) -> anyhow::Result<Result<Resource<RdbmsConnection<T>>, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     E: From<RdbmsError>,
 {
@@ -81,15 +84,12 @@ async fn begin_db_transaction<Ctx, T, E>(
 ) -> anyhow::Result<Result<Resource<RdbmsTransactionEntry<T>>, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + Send + Sync + 'static,
+    dyn RdbmsService: RdbmsTypeService<T>,
     E: From<RdbmsError>,
 {
     let interface = get_db_connection_interface::<T>();
     ctx.observe_function_call(interface.as_str(), "begin-transaction");
-
-    let begin_oplog_index = ctx
-        .begin_durable_function(&DurableFunctionType::WriteRemoteBatched(None))
-        .await?;
 
     let pool_key = ctx
         .as_wasi_view()
@@ -98,13 +98,22 @@ where
         .pool_key
         .clone();
 
-    let entry = RdbmsTransactionEntry::new(pool_key, RdbmsTransactionState::New);
-    let resource = ctx.as_wasi_view().table().push(entry)?;
-    let handle = resource.rep();
-    ctx.state
-        .open_function_table
-        .insert(handle, begin_oplog_index);
-    Ok(Ok(resource))
+    let result = ctx
+        .begin_transaction_function(RdbmsRemoteTransactionHandler::<T>::new(
+            pool_key.clone(),
+            ctx.state.owned_worker_id.worker_id.clone(),
+            ctx.state.rdbms_service.clone(),
+        ))
+        .await;
+
+    match result {
+        Ok((begin_oplog_idx, transaction_state)) => {
+            let entry = RdbmsTransactionEntry::new(pool_key, transaction_state, begin_oplog_idx);
+            let resource = ctx.as_wasi_view().table().push(entry)?;
+            Ok(Ok(resource))
+        }
+        Err(error) => Ok(Err(error.into())),
+    }
 }
 
 async fn db_connection_durable_execute<Ctx, T, P, E>(
@@ -115,7 +124,7 @@ async fn db_connection_durable_execute<Ctx, T, P, E>(
 ) -> anyhow::Result<Result<u64, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
     E: From<RdbmsError>,
@@ -131,6 +140,7 @@ where
 
     let result = if durability.is_live() {
         let (input, result) = db_connection_execute(statement, params, ctx, entry).await;
+        durability.try_trigger_retry(ctx, &result).await?;
         durability.persist(ctx, input, result).await
     } else {
         durability.replay(ctx).await
@@ -147,7 +157,7 @@ async fn db_connection_durable_query<Ctx, T, P, R, E>(
 ) -> anyhow::Result<Result<R, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
     R: FromRdbmsValue<crate::services::rdbms::DbResult<T>>,
@@ -164,6 +174,7 @@ where
 
     let result = if durability.is_live() {
         let (input, result) = db_connection_query(statement, params, ctx, entry).await;
+        durability.try_trigger_retry(ctx, &result).await?;
         durability.persist(ctx, input, result).await
     } else {
         durability.replay(ctx).await
@@ -187,24 +198,25 @@ async fn db_connection_durable_query_stream<Ctx, T, P, E>(
 ) -> anyhow::Result<Result<Resource<RdbmsResultStreamEntry<T>>, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     T::DbValue: FromRdbmsValue<P>,
     E: From<RdbmsError>,
 {
     let interface = get_db_connection_interface::<T>();
-    let begin_oplog_idx = ctx
+    let begin_index = ctx
         .begin_durable_function(&DurableFunctionType::WriteRemoteBatched(None))
         .await?;
     let durability = Durability::<RdbmsRequest<T>, SerializableError>::new(
         ctx,
         interface.leak(),
         "query-stream",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
+        DurableFunctionType::WriteRemoteBatched(Some(begin_index)),
     )
     .await?;
 
     let result = if durability.is_live() {
         let result = db_connection_query_stream(statement, params, ctx, entry);
+        durability.try_trigger_retry(ctx, &result).await?;
         let input = result.clone().ok();
         durability.persist(ctx, input, result).await
     } else {
@@ -212,18 +224,19 @@ where
     };
     match result {
         Ok(request) => {
-            let entry = RdbmsResultStreamEntry::new(request, RdbmsResultStreamState::New, None);
+            let entry = RdbmsResultStreamEntry::new(
+                request,
+                RdbmsResultStreamState::New,
+                None,
+                begin_index,
+            );
             let resource = ctx.as_wasi_view().table().push(entry)?;
-            let handle = resource.rep();
-            ctx.state
-                .open_function_table
-                .insert(handle, begin_oplog_idx);
             Ok(Ok(resource))
         }
         Err(error) => {
             ctx.end_durable_function(
                 &DurableFunctionType::WriteRemoteBatched(None),
-                begin_oplog_idx,
+                begin_index,
                 false,
             )
             .await?;
@@ -239,7 +252,7 @@ async fn db_connection_drop<Ctx, T>(
 ) -> anyhow::Result<()>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
 {
     let interface = get_db_connection_interface::<T>();
@@ -270,18 +283,24 @@ async fn db_result_stream_durable_get_columns<Ctx, T, R>(
 ) -> anyhow::Result<Vec<R>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     R: FromRdbmsValue<T::DbColumn>,
 {
     let interface = get_db_result_stream_interface::<T>();
-    let handle = entry.rep();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
+
+    let durable_function_type = if is_db_query_stream_in_transaction(ctx, entry)? {
+        DurableFunctionType::WriteRemoteTransaction(Some(begin_oplog_idx))
+    } else {
+        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx))
+    };
+
     let durability = Durability::<Vec<T::DbColumn>, SerializableError>::new(
         ctx,
         interface.leak(),
         "get-columns",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
+        durable_function_type,
     )
     .await?;
 
@@ -291,6 +310,7 @@ where
             Ok(query_stream) => query_stream.deref().get_columns().await,
             Err(error) => Err(error),
         };
+        durability.try_trigger_retry(ctx, &result).await?;
         durability.persist(ctx, (), result).await
     } else {
         durability.replay(ctx).await
@@ -315,22 +335,23 @@ async fn db_result_stream_durable_get_next<Ctx, T, R>(
 ) -> anyhow::Result<Option<Vec<R>>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     R: FromRdbmsValue<crate::services::rdbms::DbRow<T::DbValue>>,
 {
     let interface = get_db_result_stream_interface::<T>();
-    let handle = entry.rep();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
+
+    let durable_function_type = if is_db_query_stream_in_transaction(ctx, entry)? {
+        DurableFunctionType::WriteRemoteTransaction(Some(begin_oplog_idx))
+    } else {
+        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx))
+    };
+
     let durability = Durability::<
         Option<Vec<crate::services::rdbms::DbRow<T::DbValue>>>,
         SerializableError,
-    >::new(
-        ctx,
-        interface.leak(),
-        "get-next",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
-    )
+    >::new(ctx, interface.leak(), "get-next", durable_function_type)
     .await?;
 
     let result = if durability.is_live() {
@@ -339,6 +360,7 @@ where
             Ok(query_stream) => query_stream.deref().get_next().await,
             Err(error) => Err(error),
         };
+        durability.try_trigger_retry(ctx, &result).await?;
         durability.persist(ctx, (), result).await
     } else {
         durability.replay(ctx).await
@@ -369,21 +391,23 @@ async fn db_result_stream_drop<Ctx, T>(
 ) -> anyhow::Result<()>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
 {
     let interface = get_db_result_stream_interface::<T>();
     ctx.observe_function_call(interface.as_str(), "drop");
 
-    let handle = entry.rep();
     let entry = ctx
         .as_wasi_view()
         .table()
         .delete::<RdbmsResultStreamEntry<T>>(entry)?;
 
     if entry.transaction_handle.is_none() {
-        end_durable_function_if_open(ctx, handle).await?;
-    } else {
-        ctx.state.open_function_table.remove(&handle);
+        ctx.end_durable_function(
+            &DurableFunctionType::WriteRemoteBatched(None),
+            entry.begin_index,
+            false,
+        )
+        .await?;
     }
 
     Ok(())
@@ -397,25 +421,25 @@ async fn db_transaction_durable_query<Ctx, T, P, R, E>(
 ) -> anyhow::Result<Result<R, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
     R: FromRdbmsValue<crate::services::rdbms::DbResult<T>>,
     E: From<RdbmsError>,
 {
     let interface = get_db_transaction_interface::<T>();
-    let handle = entry.rep();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
     let durability = Durability::<crate::services::rdbms::DbResult<T>, SerializableError>::new(
         ctx,
         interface.leak(),
         "query",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
+        DurableFunctionType::WriteRemoteTransaction(Some(begin_oplog_idx)),
     )
     .await?;
 
     let result = if durability.is_live() {
         let (input, result) = db_transaction_query(statement, params, ctx, entry).await;
+        durability.try_trigger_retry(ctx, &result).await?;
         durability.persist(ctx, input, result).await
     } else {
         durability.replay(ctx).await
@@ -439,24 +463,26 @@ async fn db_transaction_durable_execute<Ctx, T, P, E>(
 ) -> anyhow::Result<Result<u64, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
     E: From<RdbmsError>,
 {
     let interface = get_db_transaction_interface::<T>();
-    let handle = entry.rep();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
     let durability = Durability::<u64, SerializableError>::new(
         ctx,
         interface.leak(),
         "execute",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
+        DurableFunctionType::WriteRemoteTransaction(Some(begin_oplog_idx)),
     )
     .await?;
 
     let result = if durability.is_live() {
         let (input, result) = db_transaction_execute(statement, params, ctx, entry).await;
+        tracing::warn!("result: {result:?}");
+        durability.try_trigger_retry(ctx, &result).await?;
+        tracing::warn!("after try trigger retry");
         durability.persist(ctx, input, result).await
     } else {
         durability.replay(ctx).await
@@ -473,23 +499,24 @@ async fn db_transaction_durable_query_stream<Ctx, T, P, E>(
 ) -> anyhow::Result<Result<Resource<RdbmsResultStreamEntry<T>>, E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     T::DbValue: FromRdbmsValue<P>,
     E: From<RdbmsError>,
 {
     let handle = entry.rep();
     let interface = get_db_transaction_interface::<T>();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
     let durability = Durability::<RdbmsRequest<T>, SerializableError>::new(
         ctx,
         interface.leak(),
         "query-stream",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
+        DurableFunctionType::WriteRemoteTransaction(Some(begin_oplog_idx)),
     )
     .await?;
 
     let result = if durability.is_live() {
         let result = db_transaction_query_stream(statement, params, ctx, entry);
+        durability.try_trigger_retry(ctx, &result).await?;
         let input = result.clone().ok();
         durability.persist(ctx, input, result).await
     } else {
@@ -497,13 +524,13 @@ where
     };
     match result {
         Ok(request) => {
-            let entry =
-                RdbmsResultStreamEntry::new(request, RdbmsResultStreamState::New, Some(handle));
+            let entry = RdbmsResultStreamEntry::new(
+                request,
+                RdbmsResultStreamState::New,
+                Some(handle),
+                begin_oplog_idx,
+            );
             let resource = ctx.as_wasi_view().table().push(entry)?;
-            let handle = resource.rep();
-            ctx.state
-                .open_function_table
-                .insert(handle, begin_oplog_idx);
             Ok(Ok(resource))
         }
         Err(error) => Ok(Err(error.into())),
@@ -516,30 +543,47 @@ async fn db_transaction_durable_rollback<Ctx, T, E>(
 ) -> anyhow::Result<Result<(), E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     E: From<RdbmsError>,
+    dyn RdbmsService: RdbmsTypeService<T>,
 {
     let interface = get_db_transaction_interface::<T>();
-    let handle = entry.rep();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
-    let durability = Durability::<(), SerializableError>::new(
-        ctx,
-        interface.leak(),
-        "rollback",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
-    )
-    .await?;
+    ctx.observe_function_call(interface.as_str(), "rollback");
 
-    let result = if durability.is_live() {
-        let result = db_transaction_rollback(ctx, entry).await;
-        durability.persist(ctx, (), result).await
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
+
+    let pre_result = if ctx.durable_execution_state().is_live {
+        db_transaction_pre_rollback(ctx, entry).await
     } else {
-        durability.replay(ctx).await
+        Ok(())
     };
 
-    end_durable_function_if_open(ctx, handle).await?;
+    if pre_result.is_ok() {
+        ctx.pre_rollback_transaction_function(begin_oplog_idx)
+            .await?;
+    }
 
-    Ok(result.map_err(|e| e.into()))
+    match pre_result {
+        Ok(_) => {
+            let result = if ctx.durable_execution_state().is_live {
+                db_transaction_rollback(ctx, entry).await
+            } else {
+                Ok(())
+            };
+
+            if result.is_ok() {
+                ctx.rolled_back_transaction_function(begin_oplog_idx)
+                    .await?;
+            }
+
+            if ctx.durable_execution_state().is_live {
+                let _ = db_transaction_cleanup(ctx, entry).await;
+            }
+
+            Ok(result.map_err(|e| e.into()))
+        }
+        Err(error) => Ok(Err(error.into())),
+    }
 }
 
 async fn db_transaction_durable_commit<Ctx, T, E>(
@@ -548,30 +592,45 @@ async fn db_transaction_durable_commit<Ctx, T, E>(
 ) -> anyhow::Result<Result<(), E>>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + bincode::Encode + bincode::Decode + 'static,
+    T: RdbmsType + 'static,
     E: From<RdbmsError>,
+    dyn RdbmsService: RdbmsTypeService<T>,
 {
     let interface = get_db_transaction_interface::<T>();
-    let handle = entry.rep();
-    let begin_oplog_idx = get_begin_oplog_index(ctx, handle)?;
-    let durability = Durability::<(), SerializableError>::new(
-        ctx,
-        interface.leak(),
-        "commit",
-        DurableFunctionType::WriteRemoteBatched(Some(begin_oplog_idx)),
-    )
-    .await?;
+    ctx.observe_function_call(interface.as_str(), "commit");
 
-    let result = if durability.is_live() {
-        let result = db_transaction_commit(ctx, entry).await;
-        durability.persist(ctx, (), result).await
+    let begin_oplog_idx = ctx.table().get(entry)?.begin_index;
+
+    let pre_result = if ctx.durable_execution_state().is_live {
+        db_transaction_pre_commit(ctx, entry).await
     } else {
-        durability.replay(ctx).await
+        Ok(())
     };
 
-    end_durable_function_if_open(ctx, handle).await?;
+    if pre_result.is_ok() {
+        ctx.pre_commit_transaction_function(begin_oplog_idx).await?;
+    }
 
-    Ok(result.map_err(|e| e.into()))
+    match pre_result {
+        Ok(_) => {
+            let result = if ctx.durable_execution_state().is_live {
+                db_transaction_commit(ctx, entry).await
+            } else {
+                Ok(())
+            };
+
+            if result.is_ok() {
+                ctx.committed_transaction_function(begin_oplog_idx).await?;
+            }
+
+            if ctx.durable_execution_state().is_live {
+                let _ = db_transaction_cleanup(ctx, entry).await;
+            }
+
+            Ok(result.map_err(|e| e.into()))
+        }
+        Err(error) => Ok(Err(error.into())),
+    }
 }
 
 async fn db_transaction_drop<Ctx, T>(
@@ -580,23 +639,53 @@ async fn db_transaction_drop<Ctx, T>(
 ) -> anyhow::Result<()>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
+    dyn RdbmsService: RdbmsTypeService<T>,
 {
     let interface = get_db_transaction_interface::<T>();
 
     ctx.observe_function_call(interface.as_str(), "drop");
 
-    let handle = entry.rep();
     let entry = ctx
         .as_wasi_view()
         .table()
         .delete::<RdbmsTransactionEntry<T>>(entry)?;
 
-    if let RdbmsTransactionState::Open(transaction) = entry.state {
-        let _ = transaction.rollback_if_open().await;
-    }
+    if ctx.durable_execution_state().is_live {
+        if let RdbmsTransactionState::Open(transaction) = entry.state {
+            ctx.pre_rollback_transaction_function(entry.begin_index)
+                .await?;
 
-    end_durable_function_if_open(ctx, handle).await?;
+            let _ = transaction.rollback_if_open().await;
+
+            ctx.rolled_back_transaction_function(entry.begin_index)
+                .await?;
+
+            let _ = ctx
+                .state
+                .rdbms_service
+                .deref()
+                .rdbms_type_service()
+                .cleanup_transaction(
+                    &entry.pool_key,
+                    &ctx.owned_worker_id.worker_id,
+                    &transaction.transaction_id(),
+                )
+                .await;
+        }
+    } else {
+        let _ = ctx
+            .state
+            .replay_state
+            .try_get_oplog_entry(|e| e.is_pre_rollback_remote_transaction(entry.begin_index))
+            .await;
+
+        let _ = ctx
+            .state
+            .replay_state
+            .try_get_oplog_entry(|e| e.is_rolled_back_remote_transaction(entry.begin_index))
+            .await;
+    }
 
     Ok(())
 }
@@ -616,22 +705,25 @@ impl<T: RdbmsType> RdbmsConnection<T> {
 }
 
 #[derive(Clone)]
-pub struct RdbmsResultStreamEntry<T: RdbmsType + Clone + 'static> {
+pub struct RdbmsResultStreamEntry<T: RdbmsType + 'static> {
     request: RdbmsRequest<T>,
     state: RdbmsResultStreamState<T>,
     transaction_handle: Option<u32>,
+    begin_index: OplogIndex,
 }
 
-impl<T: RdbmsType + Clone + 'static> RdbmsResultStreamEntry<T> {
+impl<T: RdbmsType + 'static> RdbmsResultStreamEntry<T> {
     fn new(
         request: RdbmsRequest<T>,
         state: RdbmsResultStreamState<T>,
         transaction_handle: Option<u32>,
+        begin_index: OplogIndex,
     ) -> Self {
         Self {
             request,
             state,
             transaction_handle,
+            begin_index,
         }
     }
 
@@ -644,9 +736,25 @@ impl<T: RdbmsType + Clone + 'static> RdbmsResultStreamEntry<T> {
 }
 
 #[derive(Clone)]
-pub enum RdbmsResultStreamState<T: RdbmsType + Clone + 'static> {
+pub enum RdbmsResultStreamState<T: RdbmsType + 'static> {
     New,
     Open(Arc<dyn crate::services::rdbms::DbResultStream<T> + Send + Sync>),
+}
+
+fn is_db_query_stream_in_transaction<Ctx, T>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    entry: &Resource<RdbmsResultStreamEntry<T>>,
+) -> anyhow::Result<bool>
+where
+    Ctx: WorkerCtx,
+    T: RdbmsType + 'static,
+{
+    let transaction_handle = ctx
+        .as_wasi_view()
+        .table()
+        .get::<RdbmsResultStreamEntry<T>>(entry)?
+        .transaction_handle;
+    Ok(transaction_handle.is_some())
 }
 
 async fn get_db_query_stream<Ctx, T>(
@@ -655,7 +763,7 @@ async fn get_db_query_stream<Ctx, T>(
 ) -> Result<Arc<dyn crate::services::rdbms::DbResultStream<T> + Send + Sync>, RdbmsError>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
 {
     let query_stream_entry = ctx
@@ -670,7 +778,7 @@ where
             let query_stream = match query_stream_entry.transaction_handle {
                 Some(transaction_handle) => {
                     let (_, transaction) =
-                        get_db_transaction(ctx, &Resource::new_own(transaction_handle)).await?;
+                        get_db_transaction(ctx, &Resource::new_own(transaction_handle))?;
                     transaction
                         .query_stream(
                             &query_stream_entry.request.statement,
@@ -710,33 +818,49 @@ where
 }
 
 #[derive(Clone)]
-pub struct RdbmsTransactionEntry<T: RdbmsType + Clone + 'static> {
+pub struct RdbmsTransactionEntry<T: RdbmsType + 'static> {
     pool_key: RdbmsPoolKey,
     state: RdbmsTransactionState<T>,
+    begin_index: OplogIndex,
 }
 
-impl<T: RdbmsType + Clone + 'static> RdbmsTransactionEntry<T> {
-    fn new(pool_key: RdbmsPoolKey, state: RdbmsTransactionState<T>) -> Self {
-        Self { pool_key, state }
-    }
-
-    fn set_open(&mut self, value: Arc<dyn crate::services::rdbms::DbTransaction<T> + Send + Sync>) {
-        self.state = RdbmsTransactionState::Open(value);
+impl<T: RdbmsType + 'static> RdbmsTransactionEntry<T> {
+    fn new(
+        pool_key: RdbmsPoolKey,
+        state: RdbmsTransactionState<T>,
+        begin_index: OplogIndex,
+    ) -> Self {
+        Self {
+            pool_key,
+            state,
+            begin_index,
+        }
     }
 
     fn set_closed(&mut self) {
-        self.state = RdbmsTransactionState::Closed;
+        match &self.state {
+            RdbmsTransactionState::Open(transaction) => {
+                self.state = RdbmsTransactionState::Closed(transaction.deref().transaction_id())
+            }
+            RdbmsTransactionState::Closed(_) => (),
+        }
+    }
+
+    fn transaction_id(&self) -> TransactionId {
+        match &self.state {
+            RdbmsTransactionState::Open(transaction) => transaction.deref().transaction_id(),
+            RdbmsTransactionState::Closed(id) => id.clone(),
+        }
     }
 }
 
 #[derive(Clone)]
-pub enum RdbmsTransactionState<T: RdbmsType + Clone + 'static> {
-    New,
+pub enum RdbmsTransactionState<T: RdbmsType + 'static> {
     Open(Arc<dyn crate::services::rdbms::DbTransaction<T> + Send + Sync>),
-    Closed,
+    Closed(TransactionId),
 }
 
-async fn get_db_transaction<Ctx, T>(
+fn get_db_transaction<Ctx, T>(
     ctx: &mut DurableWorkerCtx<Ctx>,
     entry: &Resource<RdbmsTransactionEntry<T>>,
 ) -> Result<
@@ -748,8 +872,7 @@ async fn get_db_transaction<Ctx, T>(
 >
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
-    dyn RdbmsService: RdbmsTypeService<T>,
+    T: RdbmsType + 'static,
 {
     let transaction_entry = ctx
         .as_wasi_view()
@@ -759,32 +882,8 @@ where
         .clone();
 
     match transaction_entry.state {
-        RdbmsTransactionState::New => {
-            let transaction = ctx
-                .state
-                .rdbms_service
-                .deref()
-                .rdbms_type_service()
-                .begin_transaction(
-                    &transaction_entry.pool_key,
-                    &ctx.state.owned_worker_id.worker_id,
-                )
-                .await;
-            match transaction {
-                Ok(transaction) => {
-                    ctx.as_wasi_view()
-                        .table()
-                        .get_mut::<RdbmsTransactionEntry<T>>(entry)
-                        .map_err(RdbmsError::other_response_failure)?
-                        .set_open(transaction.clone());
-
-                    Ok((transaction_entry.pool_key, transaction))
-                }
-                Err(error) => Err(error),
-            }
-        }
         RdbmsTransactionState::Open(transaction) => Ok((transaction_entry.pool_key, transaction)),
-        RdbmsTransactionState::Closed => {
+        RdbmsTransactionState::Closed(_) => {
             Err(RdbmsError::other_response_failure("Transaction is closed"))
         }
     }
@@ -801,7 +900,7 @@ async fn db_connection_query<Ctx, T, P>(
 )
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
 {
@@ -823,7 +922,7 @@ where
                     .query(&pool_key, &worker_id, &statement, params.clone())
                     .await;
                 (
-                    Some(RdbmsRequest::<T>::new(pool_key, statement, params)),
+                    Some(RdbmsRequest::<T>::new(pool_key, statement, params, None)),
                     result,
                 )
             }
@@ -841,7 +940,7 @@ async fn db_connection_execute<Ctx, T, P>(
 ) -> (Option<RdbmsRequest<T>>, Result<u64, RdbmsError>)
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
 {
@@ -864,7 +963,7 @@ where
                     .execute(&pool_key, &worker_id, &statement, params.clone())
                     .await;
                 (
-                    Some(RdbmsRequest::<T>::new(pool_key, statement, params)),
+                    Some(RdbmsRequest::<T>::new(pool_key, statement, params, None)),
                     result,
                 )
             }
@@ -882,7 +981,7 @@ fn db_connection_query_stream<Ctx, T, P>(
 ) -> Result<RdbmsRequest<T>, RdbmsError>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     T::DbValue: FromRdbmsValue<P>,
 {
     let pool_key = ctx
@@ -894,7 +993,7 @@ where
         .clone();
 
     match to_db_values::<T, P>(params, ctx.as_wasi_view().table()) {
-        Ok(params) => Ok(RdbmsRequest::<T>::new(pool_key, statement, params)),
+        Ok(params) => Ok(RdbmsRequest::<T>::new(pool_key, statement, params, None)),
         Err(error) => Err(RdbmsError::QueryParameterFailure(error)),
     }
 }
@@ -910,18 +1009,23 @@ async fn db_transaction_query<Ctx, T, P>(
 )
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
 {
     match to_db_values::<T, P>(params, ctx.as_wasi_view().table()) {
         Ok(params) => {
-            let transaction = get_db_transaction(ctx, entry).await;
+            let transaction = get_db_transaction(ctx, entry);
             match transaction {
                 Ok((pool_key, transaction)) => {
                     let result = transaction.query(&statement, params.clone()).await;
                     (
-                        Some(RdbmsRequest::<T>::new(pool_key, statement, params)),
+                        Some(RdbmsRequest::<T>::new(
+                            pool_key,
+                            statement,
+                            params,
+                            Some(transaction.transaction_id()),
+                        )),
                         result,
                     )
                 }
@@ -940,18 +1044,23 @@ async fn db_transaction_execute<Ctx, T, P>(
 ) -> (Option<RdbmsRequest<T>>, Result<u64, RdbmsError>)
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     dyn RdbmsService: RdbmsTypeService<T>,
     T::DbValue: FromRdbmsValue<P>,
 {
     match to_db_values::<T, P>(params, ctx.as_wasi_view().table()) {
         Ok(params) => {
-            let transaction = get_db_transaction(ctx, entry).await;
+            let transaction = get_db_transaction(ctx, entry);
             match transaction {
                 Ok((pool_key, transaction)) => {
                     let result = transaction.execute(&statement, params.clone()).await;
                     (
-                        Some(RdbmsRequest::<T>::new(pool_key, statement, params)),
+                        Some(RdbmsRequest::<T>::new(
+                            pool_key,
+                            statement,
+                            params,
+                            Some(transaction.transaction_id()),
+                        )),
                         result,
                     )
                 }
@@ -970,20 +1079,50 @@ fn db_transaction_query_stream<Ctx, T, P>(
 ) -> Result<RdbmsRequest<T>, RdbmsError>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
     T::DbValue: FromRdbmsValue<P>,
 {
-    let pool_key = ctx
-        .as_wasi_view()
+    match to_db_values::<T, P>(params, ctx.as_wasi_view().table()) {
+        Ok(params) => {
+            let (pool_key, transaction) = get_db_transaction(ctx, entry)?;
+            Ok(RdbmsRequest::<T>::new(
+                pool_key,
+                statement,
+                params,
+                Some(transaction.transaction_id()),
+            ))
+        }
+        Err(error) => Err(RdbmsError::QueryParameterFailure(error)),
+    }
+}
+
+fn get_db_transaction_state<Ctx, T>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    entry: &Resource<RdbmsTransactionEntry<T>>,
+) -> Result<RdbmsTransactionState<T>, RdbmsError>
+where
+    Ctx: WorkerCtx,
+    T: RdbmsType + 'static,
+{
+    ctx.as_wasi_view()
         .table()
         .get::<RdbmsTransactionEntry<T>>(entry)
-        .map_err(RdbmsError::other_response_failure)?
-        .pool_key
-        .clone();
+        .map(|e| e.state.clone())
+        .map_err(RdbmsError::other_response_failure)
+}
 
-    match to_db_values::<T, P>(params, ctx.as_wasi_view().table()) {
-        Ok(params) => Ok(RdbmsRequest::<T>::new(pool_key, statement, params)),
-        Err(error) => Err(RdbmsError::QueryParameterFailure(error)),
+async fn db_transaction_pre_commit<Ctx, T>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    entry: &Resource<RdbmsTransactionEntry<T>>,
+) -> Result<(), RdbmsError>
+where
+    Ctx: WorkerCtx,
+    T: RdbmsType + 'static,
+{
+    let state = get_db_transaction_state(ctx, entry)?;
+    match state {
+        RdbmsTransactionState::Open(transaction) => transaction.pre_commit().await,
+        _ => Ok(()),
     }
 }
 
@@ -993,26 +1132,35 @@ async fn db_transaction_commit<Ctx, T>(
 ) -> Result<(), RdbmsError>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
 {
-    let state = ctx
-        .as_wasi_view()
-        .table()
-        .get::<RdbmsTransactionEntry<T>>(entry)
-        .map(|e| e.state.clone());
-
+    let state = get_db_transaction_state(ctx, entry)?;
     match state {
-        Ok(RdbmsTransactionState::Open(transaction)) => {
-            transaction.commit().await?;
+        RdbmsTransactionState::Open(transaction) => {
+            let result = transaction.commit().await;
             ctx.as_wasi_view()
                 .table()
                 .get_mut::<RdbmsTransactionEntry<T>>(entry)
                 .map_err(RdbmsError::other_response_failure)?
                 .set_closed();
-            Ok(())
+            result
         }
-        Ok(_) => Ok(()),
-        Err(error) => Err(RdbmsError::other_response_failure(error)),
+        _ => Ok(()),
+    }
+}
+
+async fn db_transaction_pre_rollback<Ctx, T>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    entry: &Resource<RdbmsTransactionEntry<T>>,
+) -> Result<(), RdbmsError>
+where
+    Ctx: WorkerCtx,
+    T: RdbmsType + 'static,
+{
+    let state = get_db_transaction_state(ctx, entry)?;
+    match state {
+        RdbmsTransactionState::Open(transaction) => transaction.pre_rollback().await,
+        _ => Ok(()),
     }
 }
 
@@ -1022,25 +1170,47 @@ async fn db_transaction_rollback<Ctx, T>(
 ) -> Result<(), RdbmsError>
 where
     Ctx: WorkerCtx,
-    T: RdbmsType + Clone + 'static,
+    T: RdbmsType + 'static,
 {
-    let state = ctx
-        .as_wasi_view()
-        .table()
-        .get::<RdbmsTransactionEntry<T>>(entry)
-        .map(|e| e.state.clone());
-
+    let state = get_db_transaction_state(ctx, entry)?;
     match state {
-        Ok(RdbmsTransactionState::Open(transaction)) => {
-            transaction.rollback().await?;
+        RdbmsTransactionState::Open(transaction) => {
+            let result = transaction.rollback().await;
             ctx.as_wasi_view()
                 .table()
                 .get_mut::<RdbmsTransactionEntry<T>>(entry)
                 .map_err(RdbmsError::other_response_failure)?
                 .set_closed();
-            Ok(())
+            result
         }
-        Ok(_) => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+async fn db_transaction_cleanup<Ctx, T>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    entry: &Resource<RdbmsTransactionEntry<T>>,
+) -> Result<(), RdbmsError>
+where
+    Ctx: WorkerCtx,
+    T: RdbmsType + 'static,
+    dyn RdbmsService: RdbmsTypeService<T>,
+{
+    let result = ctx
+        .as_wasi_view()
+        .table()
+        .get::<RdbmsTransactionEntry<T>>(entry)
+        .map(|e| (e.pool_key.clone(), e.transaction_id()));
+
+    match result {
+        Ok((pool_key, transaction_id)) => {
+            let worker_id = ctx.state.owned_worker_id.worker_id.clone();
+            ctx.state
+                .rdbms_service
+                .rdbms_type_service()
+                .cleanup_transaction(&pool_key, &worker_id, &transaction_id)
+                .await
+        }
         Err(error) => Err(RdbmsError::other_response_failure(error)),
     }
 }
@@ -1065,35 +1235,81 @@ where
     Ok(result)
 }
 
-async fn end_durable_function_if_open<Ctx>(
-    ctx: &mut DurableWorkerCtx<Ctx>,
-    handle: u32,
-) -> anyhow::Result<Option<OplogIndex>>
-where
-    Ctx: WorkerCtx,
-{
-    let begin_oplog_idx = ctx.state.open_function_table.get(&handle).cloned();
-    if let Some(begin_oplog_idx) = begin_oplog_idx {
-        ctx.end_durable_function(
-            &DurableFunctionType::WriteRemoteBatched(None),
-            begin_oplog_idx,
-            false,
-        )
-        .await?;
-        ctx.state.open_function_table.remove(&handle);
+struct RdbmsRemoteTransactionHandler<T: RdbmsType> {
+    pool_key: RdbmsPoolKey,
+    worker_id: WorkerId,
+    rdbms_service: Arc<dyn RdbmsService>,
+    _owner: PhantomData<T>,
+}
 
-        Ok(Some(begin_oplog_idx))
-    } else {
-        Ok(None)
+impl<T> RdbmsRemoteTransactionHandler<T>
+where
+    T: RdbmsType + Send + Sync + 'static,
+    dyn RdbmsService: RdbmsTypeService<T>,
+{
+    fn new(
+        pool_key: RdbmsPoolKey,
+        worker_id: WorkerId,
+        rdbms_service: Arc<dyn RdbmsService>,
+    ) -> Self {
+        Self {
+            pool_key,
+            worker_id,
+            rdbms_service,
+            _owner: PhantomData,
+        }
+    }
+
+    async fn get_transaction_status(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<RdbmsTransactionStatus, RdbmsError> {
+        self.rdbms_service
+            .rdbms_type_service()
+            .get_transaction_status(&self.pool_key, &self.worker_id, transaction_id)
+            .await
     }
 }
 
-fn get_begin_oplog_index<Ctx: WorkerCtx>(
-    ctx: &mut DurableWorkerCtx<Ctx>,
-    handle: u32,
-) -> anyhow::Result<OplogIndex> {
-    let begin_oplog_idx = *ctx.state.open_function_table.get(&handle).ok_or_else(|| {
-        anyhow!("No matching BeginRemoteWrite index was found for the open Rdbms request")
-    })?;
-    Ok(begin_oplog_idx)
+#[async_trait]
+impl<T> RemoteTransactionHandler<RdbmsTransactionState<T>, RdbmsError>
+    for RdbmsRemoteTransactionHandler<T>
+where
+    T: RdbmsType + Send + Sync + 'static,
+    dyn RdbmsService: RdbmsTypeService<T>,
+{
+    async fn create_new(&self) -> Result<(TransactionId, RdbmsTransactionState<T>), RdbmsError> {
+        let transaction = self
+            .rdbms_service
+            .deref()
+            .rdbms_type_service()
+            .begin_transaction(&self.pool_key, &self.worker_id)
+            .await?;
+
+        let transaction_id = transaction.transaction_id();
+
+        Ok((transaction_id, RdbmsTransactionState::Open(transaction)))
+    }
+
+    async fn create_replay(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<(TransactionId, RdbmsTransactionState<T>), RdbmsError> {
+        Ok((
+            transaction_id.clone(),
+            RdbmsTransactionState::Closed(transaction_id.clone()),
+        ))
+    }
+
+    async fn is_committed(&self, transaction_id: &TransactionId) -> Result<bool, RdbmsError> {
+        let transaction_status = self.get_transaction_status(transaction_id).await?;
+        Ok(transaction_status == RdbmsTransactionStatus::Committed)
+    }
+
+    async fn is_rolled_back(&self, transaction_id: &TransactionId) -> Result<bool, RdbmsError> {
+        let transaction_status = self.get_transaction_status(transaction_id).await?;
+        // if transaction is not found, it is considered as rolled back
+        Ok(transaction_status == RdbmsTransactionStatus::RolledBack
+            || transaction_status == RdbmsTransactionStatus::NotFound)
+    }
 }

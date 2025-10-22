@@ -28,7 +28,7 @@ use crate::rib_source_span::SourceSpan;
 use crate::type_inference::GetTypeHint;
 use crate::TypeName;
 use bigdecimal::BigDecimal;
-use golem_wasm_ast::analysis::*;
+use golem_wasm::analysis::*;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -126,8 +126,7 @@ impl InferredType {
                                 Some(previous) => {
                                     if previous != current {
                                         return Err(format!(
-                                            "expected the same type of number. But found {}, {}",
-                                            current, previous
+                                            "expected the same type of number. But found {current}, {previous}"
                                         ));
                                     }
 
@@ -267,6 +266,10 @@ impl InferredType {
         self.inner.as_ref()
     }
 
+    pub fn internal_type_mut(&mut self) -> &mut TypeInternal {
+        self.inner.as_mut()
+    }
+
     pub fn list(inner: InferredType) -> InferredType {
         InferredType {
             inner: Box::new(TypeInternal::List(inner)),
@@ -316,11 +319,18 @@ impl InferredType {
         }
     }
 
-    pub fn resource(resource_id: u64, resource_mode: u8) -> InferredType {
+    pub fn resource(
+        resource_id: u64,
+        resource_mode: u8,
+        owner: Option<String>,
+        name: Option<String>,
+    ) -> InferredType {
         InferredType {
             inner: Box::new(TypeInternal::Resource {
                 resource_id,
                 resource_mode,
+                owner,
+                name,
             }),
             origin: TypeOrigin::NoOrigin,
         }
@@ -647,7 +657,7 @@ pub struct RangeType {
 impl Display for InferredNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let type_name = TypeName::from(self);
-        write!(f, "{}", type_name)
+        write!(f, "{type_name}")
     }
 }
 
@@ -680,22 +690,27 @@ impl From<&AnalysedType> for InferredType {
             AnalysedType::Flags(vs) => InferredType::flags(vs.names.clone()),
             AnalysedType::Enum(vs) => InferredType::from_enum_cases(vs),
             AnalysedType::Option(t) => InferredType::option(t.inner.as_ref().into()),
-            AnalysedType::Result(golem_wasm_ast::analysis::TypeResult { ok, err, .. }) => {
+            AnalysedType::Result(golem_wasm::analysis::TypeResult { ok, err, .. }) => {
                 InferredType::result(
                     ok.as_ref().map(|t| t.as_ref().into()),
                     err.as_ref().map(|t| t.as_ref().into()),
                 )
             }
             AnalysedType::Variant(vs) => InferredType::from_type_variant(vs),
-            AnalysedType::Handle(golem_wasm_ast::analysis::TypeHandle { resource_id, mode }) => {
-                InferredType::resource(
-                    resource_id.0,
-                    match mode {
-                        AnalysedResourceMode::Owned => 0,
-                        AnalysedResourceMode::Borrowed => 1,
-                    },
-                )
-            }
+            AnalysedType::Handle(TypeHandle {
+                resource_id,
+                mode,
+                name,
+                owner,
+            }) => InferredType::resource(
+                resource_id.0,
+                match mode {
+                    AnalysedResourceMode::Owned => 0,
+                    AnalysedResourceMode::Borrowed => 1,
+                },
+                owner.clone(),
+                name.clone(),
+            ),
         }
     }
 }

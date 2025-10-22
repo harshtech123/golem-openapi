@@ -1,10 +1,10 @@
 // Copyright 2024-2025 Golem Cloud
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Licensed under the Golem Source License v1.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     http://license.golem.cloud/LICENSE
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -255,7 +255,7 @@ impl<'a> MergeTaskStack<'a> {
         }
     }
 
-    pub fn get(&self, task_index: TaskIndex) -> Option<&MergeTask> {
+    pub fn get(&self, task_index: TaskIndex) -> Option<&MergeTask<'_>> {
         self.tasks.get(task_index)
     }
 
@@ -462,7 +462,7 @@ impl MergeTask<'_> {
         task_index: TaskIndex,
         inferred_type: &InferredType,
         init: bool,
-    ) -> MergeTask {
+    ) -> MergeTask<'_> {
         MergeTask::Inspect(Inspect {
             path,
             task_index,
@@ -1526,7 +1526,7 @@ mod internal {
 
         // We need to discriminate tuples that differ in size
         // and keep them separate
-        let path_field = PathElem::Field(format!("tuple-size::{}", path_size));
+        let path_field = PathElem::Field(format!("tuple-size::{path_size}"));
         path.push_back(path_field);
 
         let mut field_task_index = field_task_index;
@@ -1539,7 +1539,7 @@ mod internal {
             indices.push(field_task_index);
 
             let mut path = path.clone();
-            path.push_back(PathElem::Field(format!("tuple-index::{}", i)));
+            path.push_back(PathElem::Field(format!("tuple-index::{i}")));
 
             tasks_for_final_stack.push(MergeTask::inspect(
                 path.clone(),

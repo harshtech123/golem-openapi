@@ -14,15 +14,15 @@
 
 use crate::config::{CompileWorkerConfig, StaticComponentServiceConfig};
 use crate::model::*;
-use futures_util::TryStreamExt;
+use futures::TryStreamExt;
 use golem_api_grpc::proto::golem::component::v1::component_service_client::ComponentServiceClient;
 use golem_api_grpc::proto::golem::component::v1::download_component_response;
 use golem_api_grpc::proto::golem::component::v1::ComponentError;
 use golem_api_grpc::proto::golem::component::v1::DownloadComponentRequest;
 use golem_common::client::{GrpcClient, GrpcClientConfig};
 use golem_common::metrics::external_calls::record_external_call_response_size_bytes;
-use golem_common::model::ComponentId;
 use golem_common::model::RetryConfig;
+use golem_common::model::{ComponentId, ProjectId};
 use golem_common::retries::with_retries;
 use golem_worker_executor::grpc::authorised_grpc_request;
 use golem_worker_executor::grpc::is_grpc_retriable;
@@ -48,7 +48,7 @@ pub struct CompileWorker {
 
     // Resources
     engine: Engine,
-    compiled_component_service: Arc<dyn CompiledComponentService + Send + Sync>,
+    compiled_component_service: Arc<dyn CompiledComponentService>,
     client: Arc<Mutex<Option<ClientWithToken>>>,
 }
 
@@ -58,7 +58,7 @@ impl CompileWorker {
         config: CompileWorkerConfig,
 
         engine: Engine,
-        compiled_component_service: Arc<dyn CompiledComponentService + Send + Sync>,
+        compiled_component_service: Arc<dyn CompiledComponentService>,
 
         sender: mpsc::Sender<CompiledComponent>,
         mut recv: mpsc::Receiver<CompilationRequest>,
@@ -85,20 +85,24 @@ impl CompileWorker {
                         }
                     }
 
-                    let result = worker.compile_component(&request.component).await;
+                    let result = worker
+                        .compile_component(&request.component, &request.project_id)
+                        .await;
                     match result {
                         Err(error) => {
                             warn!(
-                                "Failed to compile component {}: {}",
-                                request.component, error
+                                component_id = request.component.id.to_string(),
+                                component_version = request.component.version.to_string(),
+                                error = error.to_string(),
+                                "Failed to compile component"
                             );
                         }
                         Ok(component) => {
-                            info!("Compiled component {}", request.component);
                             let send_result = sender
                                 .send(CompiledComponent {
                                     component_and_version: request.component,
                                     component,
+                                    project_id: request.project_id,
                                 })
                                 .await;
 
@@ -145,6 +149,7 @@ impl CompileWorker {
     async fn compile_component(
         &self,
         component_with_version: &ComponentWithVersion,
+        project_id: &ProjectId,
     ) -> Result<Component, CompilationError> {
         let engine = self.engine.clone();
 
@@ -152,6 +157,7 @@ impl CompileWorker {
         let result = self
             .compiled_component_service
             .get(
+                project_id,
                 &component_with_version.id,
                 component_with_version.version,
                 &engine,
@@ -185,8 +191,7 @@ impl CompileWorker {
                 move || {
                     Component::from_binary(&engine, &bytes).map_err(|e| {
                         CompilationError::CompileFailure(format!(
-                            "Failed to compile component {:?}: {}",
-                            component_with_version, e
+                            "Failed to compile component {component_with_version:?}: {e}"
                         ))
                     })
                 }
@@ -200,9 +205,11 @@ impl CompileWorker {
 
             record_compilation_time(compilation_time);
 
-            tracing::debug!(
-                "Compiled {component_with_version:?} in {}ms",
-                compilation_time.as_millis(),
+            tracing::info!(
+                component_id = component_with_version.id.to_string(),
+                component_version = component_with_version.version.to_string(),
+                compilation_time_ms = compilation_time.as_millis(),
+                "Compiled component"
             );
 
             Ok(component)

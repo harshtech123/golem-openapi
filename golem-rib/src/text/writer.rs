@@ -94,6 +94,8 @@ impl<W: Write> Writer<W> {
                 }
             }
 
+            Expr::GenerateWorkerName { .. } => Ok(()),
+
             Expr::Range { range, .. } => match range {
                 Range::Range { from, to } => {
                     self.write_expr(from)?;
@@ -372,8 +374,8 @@ impl<W: Write> Writer<W> {
                     CallType::VariantConstructor(name) => name.to_string(),
                     CallType::EnumConstructor(name) => name.to_string(),
                     CallType::InstanceCreation(instance) => match instance {
-                        InstanceCreationType::Worker { .. } => "instance".to_string(),
-                        InstanceCreationType::Resource { resource_name, .. } => {
+                        InstanceCreationType::WitWorker { .. } => "instance".to_string(),
+                        InstanceCreationType::WitResource { resource_name, .. } => {
                             resource_name.resource_name.to_string()
                         }
                     },
@@ -567,7 +569,7 @@ mod internal {
         }
     }
 
-    pub(crate) fn get_expr_type(expr: &Expr) -> ExprType {
+    pub(crate) fn get_expr_type(expr: &Expr) -> ExprType<'_> {
         match expr {
             Expr::Literal { value, .. } => ExprType::Text(value),
             Expr::Concat { .. } => ExprType::StringInterpolated,

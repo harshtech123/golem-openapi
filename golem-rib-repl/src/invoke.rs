@@ -14,10 +14,11 @@
 
 use crate::repl_state::ReplState;
 use async_trait::async_trait;
-use golem_wasm_rpc::ValueAndType;
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::ValueAndType;
 use rib::{
-    EvaluatedFnArgs, EvaluatedFqFn, EvaluatedWorkerName, InstructionId, RibFunctionInvoke,
-    RibFunctionInvokeResult,
+    ComponentDependencyKey, EvaluatedFnArgs, EvaluatedFqFn, EvaluatedWorkerName, InstructionId,
+    RibComponentFunctionInvoke, RibFunctionInvokeResult,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -28,10 +29,11 @@ pub trait WorkerFunctionInvoke {
         &self,
         component_id: Uuid,
         component_name: &str,
-        worker_name: Option<String>,
+        worker_name: &str,
         function_name: &str,
         args: Vec<ValueAndType>,
-    ) -> anyhow::Result<ValueAndType>;
+        return_type: Option<AnalysedType>,
+    ) -> anyhow::Result<Option<ValueAndType>>;
 }
 
 // Note: Currently, the Rib interpreter supports only one component, so the
@@ -48,7 +50,7 @@ impl ReplRibFunctionInvoke {
         Self { repl_state }
     }
 
-    fn get_cached_result(&self, instruction_id: &InstructionId) -> Option<ValueAndType> {
+    fn get_cached_result(&self, instruction_id: &InstructionId) -> Option<Option<ValueAndType>> {
         // If the current instruction index is greater than the last played index result,
         // then we shouldn't use the cache result no matter what.
         // This check is important because without this, loops end up reusing the cached invocation result
@@ -61,17 +63,16 @@ impl ReplRibFunctionInvoke {
 }
 
 #[async_trait]
-impl RibFunctionInvoke for ReplRibFunctionInvoke {
+impl RibComponentFunctionInvoke for ReplRibFunctionInvoke {
     async fn invoke(
         &self,
+        component_dependency: ComponentDependencyKey,
         instruction_id: &InstructionId,
-        worker_name: Option<EvaluatedWorkerName>,
+        worker_name: EvaluatedWorkerName,
         function_name: EvaluatedFqFn,
         args: EvaluatedFnArgs,
+        return_type: Option<AnalysedType>,
     ) -> RibFunctionInvokeResult {
-        let component_id = self.repl_state.dependency().component_id;
-        let component_name = &self.repl_state.dependency().component_name;
-
         match self.get_cached_result(instruction_id) {
             Some(result) => Ok(result),
             None => {
@@ -79,11 +80,12 @@ impl RibFunctionInvoke for ReplRibFunctionInvoke {
                     .repl_state
                     .worker_function_invoke()
                     .invoke(
-                        component_id,
-                        component_name,
-                        worker_name.map(|x| x.0),
-                        function_name.0.as_str(),
+                        component_dependency.component_id,
+                        &component_dependency.component_name,
+                        &worker_name.0,
+                        &function_name.0,
                         args.0,
+                        return_type,
                     )
                     .await;
 

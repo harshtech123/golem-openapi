@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::components::cloud_service::CloudService;
 use crate::components::component_service::ComponentService;
 use crate::components::k8s::{K8sNamespace, K8sRoutingType};
 use crate::components::redis::Redis;
@@ -28,7 +29,7 @@ use tokio::sync::Mutex;
 use tracing::{info, Instrument, Level};
 
 pub struct K8sWorkerExecutorCluster {
-    worker_executors: Vec<Arc<dyn WorkerExecutor + Send + Sync + 'static>>,
+    worker_executors: Vec<Arc<dyn WorkerExecutor>>,
     stopped_indices: Arc<Mutex<HashSet<usize>>>,
 }
 
@@ -37,15 +38,16 @@ impl K8sWorkerExecutorCluster {
         idx: usize,
         namespace: K8sNamespace,
         routing_type: K8sRoutingType,
-        redis: Arc<dyn Redis + Send + Sync + 'static>,
-        component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
-        shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
-        worker_service: Arc<dyn WorkerService + 'static>,
+        redis: Arc<dyn Redis>,
+        component_service: Arc<dyn ComponentService>,
+        shard_manager: Arc<dyn ShardManager>,
+        worker_service: Arc<dyn WorkerService>,
         verbosity: Level,
         timeout: Duration,
         service_annotations: Option<std::collections::BTreeMap<String, String>>,
         shared_client: bool,
-    ) -> Arc<dyn WorkerExecutor + Send + Sync + 'static> {
+        cloud_service: Arc<dyn CloudService>,
+    ) -> Arc<dyn WorkerExecutor> {
         Arc::new(
             K8sWorkerExecutor::new(
                 &namespace,
@@ -59,6 +61,7 @@ impl K8sWorkerExecutorCluster {
                 timeout,
                 service_annotations,
                 shared_client,
+                cloud_service,
             )
             .await,
         )
@@ -68,14 +71,15 @@ impl K8sWorkerExecutorCluster {
         size: usize,
         namespace: &K8sNamespace,
         routing_type: &K8sRoutingType,
-        redis: Arc<dyn Redis + Send + Sync + 'static>,
-        component_service: Arc<dyn ComponentService + Send + Sync + 'static>,
-        shard_manager: Arc<dyn ShardManager + Send + Sync + 'static>,
-        worker_service: Arc<dyn WorkerService + 'static>,
+        redis: Arc<dyn Redis>,
+        component_service: Arc<dyn ComponentService>,
+        shard_manager: Arc<dyn ShardManager>,
+        worker_service: Arc<dyn WorkerService>,
         verbosity: Level,
         timeout: Duration,
         service_annotations: Option<std::collections::BTreeMap<String, String>>,
         shared_client: bool,
+        cloud_service: Arc<dyn CloudService>,
     ) -> Self {
         info!("Starting a cluster of golem-worker-executors of size {size}");
         let mut worker_executors_joins = Vec::new();
@@ -94,6 +98,7 @@ impl K8sWorkerExecutorCluster {
                     timeout,
                     service_annotations.clone(),
                     shared_client,
+                    cloud_service.clone(),
                 )
                 .in_current_span(),
             );
@@ -149,7 +154,7 @@ impl WorkerExecutorCluster for K8sWorkerExecutorCluster {
         }
     }
 
-    fn to_vec(&self) -> Vec<Arc<dyn WorkerExecutor + Send + Sync + 'static>> {
+    fn to_vec(&self) -> Vec<Arc<dyn WorkerExecutor>> {
         self.worker_executors.to_vec()
     }
 

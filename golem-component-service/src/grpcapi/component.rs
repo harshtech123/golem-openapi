@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::api::common::ComponentTraceErrorKind;
+use crate::authed::component::AuthedComponentService;
+use crate::grpcapi::{auth, bad_request_error, internal_error, require_component_id};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::Instrument;
-
-use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
-use futures_util::TryStreamExt;
-use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody};
-use golem_api_grpc::proto::golem::component::v1::component_service_server::ComponentService;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use golem_api_grpc::proto::golem::common::{Empty, ErrorBody};
+use golem_api_grpc::proto::golem::component::v1::component_service_server::ComponentService as GrpcComponentService;
 use golem_api_grpc::proto::golem::component::v1::{
     component_error, create_component_constraints_response, create_component_request,
     create_component_response, delete_component_constraints_response, download_component_response,
@@ -42,82 +41,49 @@ use golem_api_grpc::proto::golem::component::v1::{
     UninstallPluginResponse, UpdateComponentRequest, UpdateComponentRequestHeader,
     UpdateComponentResponse, UpdateInstalledPluginRequest, UpdateInstalledPluginResponse,
 };
-use golem_api_grpc::proto::golem::component::ComponentConstraints as ComponentConstraintsProto;
-use golem_api_grpc::proto::golem::component::FunctionConstraintCollection as FunctionConstraintCollectionProto;
 use golem_api_grpc::proto::golem::component::{Component, PluginInstallation};
 use golem_common::grpc::{proto_component_id_string, proto_plugin_installation_id_string};
-use golem_common::model::component::DefaultComponentOwner;
 use golem_common::model::component_constraint::FunctionConstraints;
 use golem_common::model::component_metadata::DynamicLinkedInstance;
-use golem_common::model::plugin::{
-    DefaultPluginOwner, DefaultPluginScope, PluginInstallationCreation, PluginInstallationUpdate,
-};
+use golem_common::model::plugin::{PluginInstallationCreation, PluginInstallationUpdate};
+use golem_common::model::ProjectId;
 use golem_common::model::{ComponentId, ComponentType};
 use golem_common::recorded_grpc_api_request;
-use golem_component_service_base::api::common::ComponentTraceErrorKind;
-use golem_component_service_base::model::ComponentConstraints;
-use golem_component_service_base::service::component;
-use golem_component_service_base::service::plugin::{PluginError, PluginService};
+use golem_service_base::grpc::proto_project_id_string;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
-
-pub(crate) fn bad_request_error(error: &str) -> ComponentError {
-    ComponentError {
-        error: Some(component_error::Error::BadRequest(ErrorsBody {
-            errors: vec![error.to_string()],
-        })),
-    }
-}
-
-fn internal_error(error: &str) -> ComponentError {
-    ComponentError {
-        error: Some(component_error::Error::InternalError(ErrorBody {
-            error: error.to_string(),
-        })),
-    }
-}
+use tracing::Instrument;
 
 pub struct ComponentGrpcApi {
-    component_service: Arc<dyn component::ComponentService<DefaultComponentOwner>>,
-    plugin_service: Arc<dyn PluginService<DefaultPluginOwner, DefaultPluginScope>>,
+    component_service: Arc<AuthedComponentService>,
 }
 
 impl ComponentGrpcApi {
-    pub fn new(
-        component_service: Arc<dyn component::ComponentService<DefaultComponentOwner>>,
-        plugin_service: Arc<dyn PluginService<DefaultPluginOwner, DefaultPluginScope>>,
-    ) -> Self {
-        Self {
-            component_service,
-            plugin_service,
-        }
+    pub fn new(component_service: Arc<AuthedComponentService>) -> Self {
+        Self { component_service }
     }
 
-    fn require_component_id(
-        source: &Option<golem_api_grpc::proto::golem::component::ComponentId>,
-    ) -> Result<ComponentId, ComponentError> {
-        match source {
-            Some(id) => (*id)
-                .try_into()
-                .map_err(|err| bad_request_error(&format!("Invalid component id: {err}"))),
-            None => Err(bad_request_error("Missing component id")),
-        }
-    }
-
-    async fn get(&self, request: GetComponentRequest) -> Result<Vec<Component>, ComponentError> {
-        let id = Self::require_component_id(&request.component_id)?;
-        let result = self
-            .component_service
-            .get(&id, &DefaultComponentOwner)
-            .await?;
-        Ok(result.into_iter().map(Component::from).collect())
+    async fn get(
+        &self,
+        request: GetComponentRequest,
+        metadata: MetadataMap,
+    ) -> Result<Vec<Component>, ComponentError> {
+        let auth = auth(metadata)?;
+        let id = require_component_id(&request.component_id)?;
+        let result = self.component_service.get(&id, &auth).await?;
+        Ok(result.into_iter().map(|c| c.into()).collect())
     }
 
     async fn get_component_metadata(
         &self,
         request: GetVersionedComponentRequest,
+        metadata: MetadataMap,
     ) -> Result<Option<Component>, ComponentError> {
-        let id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
 
+        let id = require_component_id(&request.component_id)?;
         let version = request.version;
 
         let versioned_component_id = golem_common::model::component::VersionedComponentId {
@@ -127,33 +93,38 @@ impl ComponentGrpcApi {
 
         let result = self
             .component_service
-            .get_by_version(&versioned_component_id, &DefaultComponentOwner)
+            .get_by_version(&versioned_component_id, &auth)
             .await?;
-        Ok(result.map(|p| p.into()))
+        Ok(result.map(|c| c.into()))
     }
 
     async fn get_all(
         &self,
         request: GetComponentsRequest,
+        metadata: MetadataMap,
     ) -> Result<Vec<Component>, ComponentError> {
+        let auth = auth(metadata)?;
+        let project_id: Option<ProjectId> = request.project_id.and_then(|id| id.try_into().ok());
         let name: Option<golem_service_base::model::ComponentName> = request
             .component_name
             .map(golem_service_base::model::ComponentName);
         let result = self
             .component_service
-            .find_by_name(name, &DefaultComponentOwner)
+            .find_by_project_and_name(project_id, name, &auth)
             .await?;
-        Ok(result.into_iter().map(|p| p.into()).collect())
+        Ok(result.into_iter().map(|c| c.into()).collect())
     }
 
     async fn get_latest_component_metadata(
         &self,
         request: GetLatestComponentRequest,
+        metadata: MetadataMap,
     ) -> Result<Component, ComponentError> {
-        let id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
+        let id = require_component_id(&request.component_id)?;
         let result = self
             .component_service
-            .get_latest_version(&id, &DefaultComponentOwner)
+            .get_latest_version(&id, &auth)
             .await?;
         match result {
             Some(component) => Ok(component.into()),
@@ -168,22 +139,26 @@ impl ComponentGrpcApi {
     async fn download(
         &self,
         request: DownloadComponentRequest,
+        metadata: MetadataMap,
     ) -> Result<BoxStream<'static, Result<Vec<u8>, anyhow::Error>>, ComponentError> {
-        let id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
+        let id = require_component_id(&request.component_id)?;
         let version = request.version;
         let result = self
             .component_service
-            .download_stream(&id, version, &DefaultComponentOwner)
+            .download_stream(&id, version, &auth)
             .await?;
         Ok(result)
     }
 
     async fn create(
         &self,
-        component_id: ComponentId,
         request: CreateComponentRequestHeader,
         data: Vec<u8>,
+        metadata: MetadataMap,
     ) -> Result<Component, ComponentError> {
+        let auth = auth(metadata)?;
+        let project_id: Option<ProjectId> = request.project_id.and_then(|id| id.try_into().ok());
         let name = golem_service_base::model::ComponentName(request.component_name.clone());
         let files = request
             .files
@@ -191,6 +166,7 @@ impl ComponentGrpcApi {
             .map(|f| f.clone().try_into())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e: String| bad_request_error(&format!("Failed reading files: {e}")))?;
+
         let dynamic_linking: HashMap<String, DynamicLinkedInstance> = HashMap::from_iter(
             request
                 .dynamic_linking
@@ -201,20 +177,29 @@ impl ComponentGrpcApi {
                     bad_request_error(&format!("Invalid dynamic linking information: {e}"))
                 })?,
         );
+
+        let agent_types = request
+            .agent_types
+            .iter()
+            .map(|agent_type| agent_type.clone().try_into())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| bad_request_error(&format!("Invalid agent types: {e}")))?;
+
         let result = self
             .component_service
             .create_internal(
-                &component_id,
+                project_id,
                 &name,
                 request.component_type().into(),
                 data,
                 files,
-                vec![],
                 dynamic_linking,
-                &DefaultComponentOwner,
+                &auth,
                 request.env,
+                agent_types,
             )
             .await?;
+
         Ok(result.into())
     }
 
@@ -222,9 +207,10 @@ impl ComponentGrpcApi {
         &self,
         request: UpdateComponentRequestHeader,
         data: Vec<u8>,
+        metadata: MetadataMap,
     ) -> Result<Component, ComponentError> {
-        let id = Self::require_component_id(&request.component_id)?;
-
+        let auth = auth(metadata)?;
+        let id = require_component_id(&request.component_id)?;
         let component_type = match request.component_type {
             Some(n) => Some(
                 ComponentType::try_from(n)
@@ -232,7 +218,6 @@ impl ComponentGrpcApi {
             ),
             None => None,
         };
-
         let files = if request.update_files {
             let value = request
                 .files
@@ -256,6 +241,13 @@ impl ComponentGrpcApi {
                 })?,
         );
 
+        let agent_types = request
+            .agent_types
+            .iter()
+            .map(|agent_type| agent_type.clone().try_into())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| bad_request_error(&format!("Invalid agent types: {e}")))?;
+
         let result = self
             .component_service
             .update_internal(
@@ -264,45 +256,63 @@ impl ComponentGrpcApi {
                 component_type,
                 files,
                 dynamic_linking,
-                &DefaultComponentOwner,
+                &auth,
                 request.env,
+                agent_types,
             )
             .await?;
+
         Ok(result.into())
     }
 
     async fn create_component_constraints(
         &self,
-        component_constraint: &ComponentConstraints<DefaultComponentOwner>,
-    ) -> Result<ComponentConstraintsProto, ComponentError> {
+        component_id: ComponentId,
+        constraints: FunctionConstraints,
+        metadata: MetadataMap,
+    ) -> Result<golem_api_grpc::proto::golem::component::ComponentConstraints, ComponentError> {
+        let auth = auth(metadata)?;
+
         let response = self
             .component_service
-            .create_or_update_constraint(component_constraint)
+            .create_or_update_constraint(component_id, constraints, &auth)
             .await
-            .map(|v| ComponentConstraintsProto {
-                component_id: Some(v.component_id.into()),
-                constraints: Some(FunctionConstraintCollectionProto::from(v.constraints)),
-            })?;
+            .map(
+                |v| golem_api_grpc::proto::golem::component::ComponentConstraints {
+                    component_id: Some(v.component_id.into()),
+                    constraints: Some(
+                        golem_api_grpc::proto::golem::component::FunctionConstraintCollection::from(
+                            v.constraints,
+                        ),
+                    ),
+                },
+            )?;
 
         Ok(response)
     }
 
     async fn delete_component_constraints(
         &self,
-        component_constraint: &ComponentConstraints<DefaultComponentOwner>,
-    ) -> Result<ComponentConstraintsProto, ComponentError> {
+        component_id: ComponentId,
+        constraints: FunctionConstraints,
+        metadata: MetadataMap,
+    ) -> Result<golem_api_grpc::proto::golem::component::ComponentConstraints, ComponentError> {
+        let auth = auth(metadata)?;
+
         let response = self
             .component_service
-            .delete_constraints(
-                &component_constraint.owner,
-                &component_constraint.component_id,
-                &component_constraint.function_signatures(),
-            )
+            .delete_constraints(component_id, constraints, &auth)
             .await
-            .map(|v| ComponentConstraintsProto {
-                component_id: Some(v.component_id.into()),
-                constraints: Some(FunctionConstraintCollectionProto::from(v.constraints)),
-            })?;
+            .map(
+                |v| golem_api_grpc::proto::golem::component::ComponentConstraints {
+                    component_id: Some(v.component_id.into()),
+                    constraints: Some(
+                        golem_api_grpc::proto::golem::component::FunctionConstraintCollection::from(
+                            v.constraints,
+                        ),
+                    ),
+                },
+            )?;
 
         Ok(response)
     }
@@ -310,14 +320,16 @@ impl ComponentGrpcApi {
     async fn get_installed_plugins(
         &self,
         request: &GetInstalledPluginsRequest,
+        metadata: MetadataMap,
     ) -> Result<Vec<PluginInstallation>, ComponentError> {
-        let component_id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
+        let component_id = require_component_id(&request.component_id)?;
 
         let version = match &request.version {
             Some(version) => *version,
             None => self
                 .component_service
-                .get_latest_version(&component_id, &DefaultComponentOwner)
+                .get_latest_version(&component_id, &auth)
                 .await?
                 .map(|v| v.versioned_component_id.version)
                 .ok_or_else(|| bad_request_error("Component not found"))?,
@@ -325,7 +337,7 @@ impl ComponentGrpcApi {
 
         let response = self
             .component_service
-            .get_plugin_installations_for_component(&DefaultComponentOwner, &component_id, version)
+            .get_plugin_installations_for_component(&auth, &component_id, version)
             .await?;
 
         Ok(response.into_iter().map(|v| v.into()).collect())
@@ -334,8 +346,11 @@ impl ComponentGrpcApi {
     async fn install_plugin(
         &self,
         request: &InstallPluginRequest,
+        metadata: MetadataMap,
     ) -> Result<PluginInstallation, ComponentError> {
-        let component_id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
+
+        let component_id = require_component_id(&request.component_id)?;
 
         let plugin_installation_creation: PluginInstallationCreation = PluginInstallationCreation {
             name: request.name.clone(),
@@ -344,37 +359,14 @@ impl ComponentGrpcApi {
             parameters: request.parameters.clone(),
         };
 
-        let plugin_definition = self
-            .plugin_service
-            .get(
-                &DefaultPluginOwner,
-                &plugin_installation_creation.name,
-                &plugin_installation_creation.version,
+        let response = self
+            .component_service
+            .create_plugin_installation_for_component(
+                &auth,
+                &component_id,
+                plugin_installation_creation,
             )
             .await?;
-
-        let response = if let Some(plugin_definition) = plugin_definition {
-            if plugin_definition.scope.valid_in_component(&component_id) {
-                self.component_service
-                    .create_plugin_installation_for_component(
-                        &DefaultComponentOwner,
-                        &component_id,
-                        plugin_installation_creation.clone(),
-                    )
-                    .await
-            } else {
-                Err(PluginError::InvalidScope {
-                    plugin_name: plugin_installation_creation.name,
-                    plugin_version: plugin_installation_creation.version,
-                    details: format!("not available for component {}", component_id),
-                })
-            }
-        } else {
-            Err(PluginError::PluginNotFound {
-                plugin_name: plugin_installation_creation.name,
-                plugin_version: plugin_installation_creation.version,
-            })
-        }?;
 
         Ok(response.into())
     }
@@ -382,8 +374,11 @@ impl ComponentGrpcApi {
     async fn update_installed_plugin(
         &self,
         request: &UpdateInstalledPluginRequest,
+        metadata: MetadataMap,
     ) -> Result<(), ComponentError> {
-        let component_id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
+
+        let component_id = require_component_id(&request.component_id)?;
 
         let installation_id = request
             .installation_id
@@ -397,7 +392,7 @@ impl ComponentGrpcApi {
 
         self.component_service
             .update_plugin_installation_for_component(
-                &DefaultComponentOwner,
+                &auth,
                 &installation_id,
                 &component_id,
                 update,
@@ -410,8 +405,11 @@ impl ComponentGrpcApi {
     async fn uninstall_plugin(
         &self,
         request: &UninstallPluginRequest,
+        metadata: MetadataMap,
     ) -> Result<(), ComponentError> {
-        let component_id = Self::require_component_id(&request.component_id)?;
+        let auth = auth(metadata)?;
+
+        let component_id = require_component_id(&request.component_id)?;
 
         let installation_id = request
             .installation_id
@@ -419,11 +417,7 @@ impl ComponentGrpcApi {
             .ok_or_else(|| bad_request_error("Missing installation id"))?;
 
         self.component_service
-            .delete_plugin_installation_for_component(
-                &DefaultComponentOwner,
-                &installation_id,
-                &component_id,
-            )
+            .delete_plugin_installation_for_component(&auth, &installation_id, &component_id)
             .await?;
 
         Ok(())
@@ -431,15 +425,18 @@ impl ComponentGrpcApi {
 }
 
 #[async_trait]
-impl ComponentService for ComponentGrpcApi {
+impl GrpcComponentService for ComponentGrpcApi {
     async fn get_components(
         &self,
         request: Request<GetComponentsRequest>,
     ) -> Result<Response<GetComponentsResponse>, Status> {
-        let request = request.into_inner();
-        let record = recorded_grpc_api_request!("get_components",);
+        let (m, _, r) = request.into_parts();
+        let record = recorded_grpc_api_request!(
+            "get_components",
+            project_id = proto_project_id_string(&r.project_id)
+        );
 
-        let response = match self.get_all(request).instrument(record.span.clone()).await {
+        let response = match self.get_all(r, m).instrument(record.span.clone()).await {
             Ok(components) => record.succeed(get_components_response::Result::Success(
                 GetComponentsSuccessResponse { components },
             )),
@@ -458,8 +455,8 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<Streaming<CreateComponentRequest>>,
     ) -> Result<Response<CreateComponentResponse>, Status> {
-        let chunks: Vec<CreateComponentRequest> =
-            request.into_inner().into_stream().try_collect().await?;
+        let (m, _, r) = request.into_parts();
+        let chunks: Vec<CreateComponentRequest> = r.into_stream().try_collect().await?;
         let header = chunks.iter().find_map(|c| {
             c.clone().data.and_then(|d| match d {
                 create_component_request::Data::Header(d) => Some(d),
@@ -467,11 +464,10 @@ impl ComponentService for ComponentGrpcApi {
             })
         });
 
-        let component_id = ComponentId::new_v4();
         let record = recorded_grpc_api_request!(
             "create_component",
             component_name = header.as_ref().map(|r| r.component_name.clone()),
-            component_id = component_id.to_string(),
+            project_id = proto_project_id_string(&header.as_ref().and_then(|r| r.project_id))
         );
 
         let result = match header {
@@ -488,7 +484,7 @@ impl ComponentService for ComponentGrpcApi {
                             .unwrap_or_default()
                     })
                     .collect();
-                self.create(component_id, request, data)
+                self.create(request, data, m)
                     .instrument(record.span.clone())
                     .await
             }
@@ -514,14 +510,13 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<DownloadComponentRequest>,
     ) -> Result<Response<Self::DownloadComponentStream>, Status> {
-        let request = request.into_inner();
+        let (m, _, r) = request.into_parts();
         let record = recorded_grpc_api_request!(
             "download_component",
-            component_id = proto_component_id_string(&request.component_id),
-            component_version = request.version.unwrap_or_default().to_string(),
+            component_id = proto_component_id_string(&r.component_id)
         );
         let stream: Self::DownloadComponentStream =
-            match self.download(request).instrument(record.span.clone()).await {
+            match self.download(r, m).instrument(record.span.clone()).await {
                 Ok(response) => {
                     let stream = response.map(|content| {
                         let res = match content {
@@ -559,13 +554,13 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<GetComponentRequest>,
     ) -> Result<Response<GetComponentMetadataAllVersionsResponse>, Status> {
-        let request = request.into_inner();
+        let (m, _, r) = request.into_parts();
         let record = recorded_grpc_api_request!(
             "get_component_metadata_all_versions",
-            component_id = proto_component_id_string(&request.component_id)
+            component_id = proto_component_id_string(&r.component_id)
         );
 
-        let response = match self.get(request).instrument(record.span.clone()).await {
+        let response = match self.get(r, m).instrument(record.span.clone()).await {
             Ok(components) => record.succeed(
                 get_component_metadata_all_versions_response::Result::Success(
                     GetComponentSuccessResponse { components },
@@ -586,14 +581,14 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<GetLatestComponentRequest>,
     ) -> Result<Response<GetComponentMetadataResponse>, Status> {
-        let request = request.into_inner();
+        let (m, _, r) = request.into_parts();
         let record = recorded_grpc_api_request!(
             "get_latest_component_metadata",
-            component_id = proto_component_id_string(&request.component_id),
+            component_id = proto_component_id_string(&r.component_id)
         );
 
         let response = match self
-            .get_latest_component_metadata(request)
+            .get_latest_component_metadata(r, m)
             .instrument(record.span.clone())
             .await
         {
@@ -617,8 +612,8 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<Streaming<UpdateComponentRequest>>,
     ) -> Result<Response<UpdateComponentResponse>, Status> {
-        let chunks: Vec<UpdateComponentRequest> =
-            request.into_inner().into_stream().try_collect().await?;
+        let (m, _, r) = request.into_parts();
+        let chunks: Vec<UpdateComponentRequest> = r.into_stream().try_collect().await?;
 
         let header = chunks.iter().find_map(|c| {
             c.clone().data.and_then(|d| match d {
@@ -646,7 +641,7 @@ impl ComponentService for ComponentGrpcApi {
                             .unwrap_or_default()
                     })
                     .collect();
-                self.update(request, data)
+                self.update(request, data, m)
                     .instrument(record.span.clone())
                     .await
             }
@@ -670,15 +665,14 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<GetVersionedComponentRequest>,
     ) -> Result<Response<GetComponentMetadataResponse>, Status> {
-        let request = request.into_inner();
+        let (m, _, r) = request.into_parts();
         let record = recorded_grpc_api_request!(
             "get_component_metadata",
-            component_id = proto_component_id_string(&request.component_id),
-            component_version = request.version.to_string(),
+            component_id = proto_component_id_string(&r.component_id)
         );
 
         let response = match self
-            .get_component_metadata(request)
+            .get_component_metadata(r, m)
             .instrument(record.span.clone())
             .await
         {
@@ -700,10 +694,17 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<CreateComponentConstraintsRequest>,
     ) -> Result<Response<CreateComponentConstraintsResponse>, Status> {
-        let request = request.into_inner();
-        let record = recorded_grpc_api_request!("create_component_constraints",);
+        let (m, _, r) = request.into_parts();
+        let record = recorded_grpc_api_request!(
+            "create_constraints",
+            component_id = &proto_component_id_string(
+                &r.component_constraints
+                    .as_ref()
+                    .and_then(|c| c.component_id)
+            )
+        );
 
-        match request.component_constraints {
+        match r.component_constraints {
             Some(proto_constraints) => {
                 let component_id = match proto_constraints
                     .component_id
@@ -749,14 +750,8 @@ impl ComponentService for ComponentGrpcApi {
                         }));
                     };
 
-                let component_constraint = ComponentConstraints {
-                    owner: DefaultComponentOwner,
-                    component_id,
-                    constraints,
-                };
-
                 let response = match self
-                    .create_component_constraints(&component_constraint)
+                    .create_component_constraints(component_id, constraints, m)
                     .instrument(record.span.clone())
                     .await
                 {
@@ -795,10 +790,17 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<DeleteComponentConstraintsRequest>,
     ) -> Result<Response<DeleteComponentConstraintsResponse>, Status> {
-        let request = request.into_inner();
-        let record = recorded_grpc_api_request!("delete_component_constraints",);
+        let (m, _, r) = request.into_parts();
+        let record = recorded_grpc_api_request!(
+            "delete_component_constraints",
+            component_id = &proto_component_id_string(
+                &r.component_constraints
+                    .as_ref()
+                    .and_then(|c| c.component_id)
+            )
+        );
 
-        match request.component_constraints {
+        match r.component_constraints {
             Some(proto_constraints) => {
                 let component_id = match proto_constraints
                     .component_id
@@ -844,14 +846,8 @@ impl ComponentService for ComponentGrpcApi {
                     }));
                 };
 
-                let component_constraint = ComponentConstraints {
-                    owner: DefaultComponentOwner,
-                    component_id,
-                    constraints,
-                };
-
                 let response = match self
-                    .delete_component_constraints(&component_constraint)
+                    .delete_component_constraints(component_id, constraints, m)
                     .instrument(record.span.clone())
                     .await
                 {
@@ -890,14 +886,15 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<GetInstalledPluginsRequest>,
     ) -> Result<Response<GetInstalledPluginsResponse>, Status> {
-        let request = request.into_inner();
+        let (metadata, _, request) = request.into_parts();
+
         let record = recorded_grpc_api_request!(
             "get_installed_plugins",
             component_id = proto_component_id_string(&request.component_id)
         );
 
         let response = match self
-            .get_installed_plugins(&request)
+            .get_installed_plugins(&request, metadata)
             .instrument(record.span.clone())
             .await
         {
@@ -919,7 +916,7 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<InstallPluginRequest>,
     ) -> Result<Response<InstallPluginResponse>, Status> {
-        let request = request.into_inner();
+        let (metadata, _, request) = request.into_parts();
         let record = recorded_grpc_api_request!(
             "install_plugin",
             component_id = proto_component_id_string(&request.component_id),
@@ -928,7 +925,7 @@ impl ComponentService for ComponentGrpcApi {
         );
 
         let response = match self
-            .install_plugin(&request)
+            .install_plugin(&request, metadata)
             .instrument(record.span.clone())
             .await
         {
@@ -952,7 +949,8 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<UpdateInstalledPluginRequest>,
     ) -> Result<Response<UpdateInstalledPluginResponse>, Status> {
-        let request = request.into_inner();
+        let (metadata, _, request) = request.into_parts();
+
         let record = recorded_grpc_api_request!(
             "update_installed_plugin",
             component_id = proto_component_id_string(&request.component_id),
@@ -960,7 +958,7 @@ impl ComponentService for ComponentGrpcApi {
         );
 
         let response = match self
-            .update_installed_plugin(&request)
+            .update_installed_plugin(&request, metadata)
             .instrument(record.span.clone())
             .await
         {
@@ -980,7 +978,8 @@ impl ComponentService for ComponentGrpcApi {
         &self,
         request: Request<UninstallPluginRequest>,
     ) -> Result<Response<UninstallPluginResponse>, Status> {
-        let request = request.into_inner();
+        let (metadata, _, request) = request.into_parts();
+
         let record = recorded_grpc_api_request!(
             "uninstall_plugin",
             component_id = proto_component_id_string(&request.component_id),
@@ -988,7 +987,7 @@ impl ComponentService for ComponentGrpcApi {
         );
 
         let response = match self
-            .uninstall_plugin(&request)
+            .uninstall_plugin(&request, metadata)
             .instrument(record.span.clone())
             .await
         {

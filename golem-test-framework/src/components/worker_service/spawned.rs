@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::{new_worker_grpc_client, WorkerServiceGrpcClient};
+use crate::components::cloud_service::CloudService;
 use crate::components::component_service::ComponentService;
 use crate::components::rdb::Rdb;
 use crate::components::shard_manager::ShardManager;
-use crate::components::worker_service::{
-    new_api_definition_client, new_api_deployment_client, new_api_security_client,
-    new_worker_client, wait_for_startup, ApiDefinitionServiceClient, ApiDeploymentServiceClient,
-    ApiSecurityServiceClient, WorkerService, WorkerServiceClient,
-};
-use crate::components::ChildProcessLogger;
+use crate::components::worker_service::{wait_for_startup, WorkerService};
+use crate::components::{new_reqwest_client, ChildProcessLogger};
 use crate::config::GolemClientProtocol;
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::OnceCell;
+use tonic::transport::Channel;
 use tracing::info;
 use tracing::Level;
-
-use super::WorkerServiceInternal;
 
 pub struct SpawnedWorkerService {
     http_port: u16,
@@ -39,11 +37,9 @@ pub struct SpawnedWorkerService {
     child: Arc<Mutex<Option<Child>>>,
     _logger: ChildProcessLogger,
     client_protocol: GolemClientProtocol,
-    worker_client: WorkerServiceClient,
-    api_definition_client: ApiDefinitionServiceClient,
-    api_deployment_client: ApiDeploymentServiceClient,
-    api_security_client: ApiSecurityServiceClient,
     component_service: Arc<dyn ComponentService>,
+    base_http_client: OnceCell<reqwest::Client>,
+    worker_grpc_client: OnceCell<WorkerServiceGrpcClient<Channel>>,
 }
 
 impl SpawnedWorkerService {
@@ -54,12 +50,13 @@ impl SpawnedWorkerService {
         grpc_port: u16,
         custom_request_port: u16,
         component_service: Arc<dyn ComponentService>,
-        shard_manager: Arc<dyn ShardManager + Send + Sync>,
-        rdb: Arc<dyn Rdb + Send + Sync>,
+        shard_manager: Arc<dyn ShardManager>,
+        rdb: Arc<dyn Rdb>,
         verbosity: Level,
         out_level: Level,
         err_level: Level,
         client_protocol: GolemClientProtocol,
+        cloud_service: Arc<dyn CloudService>,
     ) -> Self {
         info!("Starting golem-worker-service process");
 
@@ -79,6 +76,7 @@ impl SpawnedWorkerService {
                     &rdb,
                     verbosity,
                     false,
+                    &cloud_service,
                 )
                 .await,
             )
@@ -107,30 +105,9 @@ impl SpawnedWorkerService {
             child: Arc::new(Mutex::new(Some(child))),
             _logger: logger,
             client_protocol,
-            worker_client: new_worker_client(client_protocol, "localhost", grpc_port, http_port)
-                .await,
-            api_definition_client: new_api_definition_client(
-                client_protocol,
-                "localhost",
-                grpc_port,
-                http_port,
-            )
-            .await,
-            api_deployment_client: new_api_deployment_client(
-                client_protocol,
-                "localhost",
-                grpc_port,
-                http_port,
-            )
-            .await,
-            api_security_client: new_api_security_client(
-                client_protocol,
-                "localhost",
-                grpc_port,
-                http_port,
-            )
-            .await,
-            component_service: component_service.clone(),
+            component_service,
+            base_http_client: OnceCell::new(),
+            worker_grpc_client: OnceCell::new(),
         }
     }
 
@@ -142,34 +119,32 @@ impl SpawnedWorkerService {
     }
 }
 
-impl WorkerServiceInternal for SpawnedWorkerService {
+#[async_trait]
+impl WorkerService for SpawnedWorkerService {
+    fn component_service(&self) -> &Arc<dyn ComponentService> {
+        &self.component_service
+    }
+
     fn client_protocol(&self) -> GolemClientProtocol {
         self.client_protocol
     }
 
-    fn worker_client(&self) -> WorkerServiceClient {
-        self.worker_client.clone()
+    async fn base_http_client(&self) -> reqwest::Client {
+        self.base_http_client
+            .get_or_init(async || new_reqwest_client())
+            .await
+            .clone()
     }
 
-    fn api_definition_client(&self) -> ApiDefinitionServiceClient {
-        self.api_definition_client.clone()
+    async fn worker_grpc_client(&self) -> WorkerServiceGrpcClient<Channel> {
+        self.worker_grpc_client
+            .get_or_init(async || {
+                new_worker_grpc_client(&self.public_host(), self.public_grpc_port()).await
+            })
+            .await
+            .clone()
     }
 
-    fn api_deployment_client(&self) -> ApiDeploymentServiceClient {
-        self.api_deployment_client.clone()
-    }
-
-    fn api_security_client(&self) -> ApiSecurityServiceClient {
-        self.api_security_client.clone()
-    }
-
-    fn component_service(&self) -> &Arc<dyn ComponentService> {
-        &self.component_service
-    }
-}
-
-#[async_trait]
-impl WorkerService for SpawnedWorkerService {
     fn private_host(&self) -> String {
         "localhost".to_string()
     }

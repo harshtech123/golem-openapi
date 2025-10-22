@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::{start, TestContext};
+use crate::{LastUniqueId, Tracing, WorkerExecutorTestDependencies};
 use axum::extract::Query;
 use axum::response::Response;
 use axum::routing::get;
 use axum::{BoxError, Router};
 use bytes::Bytes;
-use futures_util::{stream, StreamExt};
-use golem_wasm_rpc::{IntoValueAndType, Value};
+use futures::{stream, StreamExt};
+use golem_test_framework::config::TestDependencies;
+use golem_test_framework::dsl::TestDslUnsafe;
+use golem_wasm::analysis::{AnalysedResourceId, AnalysedResourceMode, AnalysedType, TypeHandle};
+use golem_wasm::{IntoValueAndType, Value, ValueAndType};
 use http::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -27,10 +32,6 @@ use std::sync::Arc;
 use test_r::{inherit_test_dep, test};
 use tokio::sync::Mutex;
 use tracing::Instrument;
-
-use crate::common::{start, TestContext};
-use crate::{LastUniqueId, Tracing, WorkerExecutorTestDependencies};
-use golem_test_framework::dsl::TestDslUnsafe;
 
 inherit_test_dep!(WorkerExecutorTestDependencies);
 inherit_test_dep!(LastUniqueId);
@@ -44,7 +45,7 @@ async fn custom_durability_1(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let response = Arc::new(AtomicU32::new(0));
     let response_clone = response.clone();
@@ -83,7 +84,7 @@ async fn custom_durability_1(
     env.insert("PORT".to_string(), host_http_port.to_string());
 
     let worker_id = executor
-        .start_worker_with(&component_id, "custom-durability-1", vec![], env)
+        .start_worker_with(&component_id, "custom-durability-1", vec![], env, vec![])
         .await;
 
     let result1 = executor
@@ -99,7 +100,7 @@ async fn custom_durability_1(
 
     drop(executor);
 
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let result2 = executor
         .invoke_and_await(
@@ -127,7 +128,7 @@ async fn lazy_pollable(
     _tracing: &Tracing,
 ) {
     let context = TestContext::new(last_unique_id);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
 
@@ -154,7 +155,7 @@ async fn lazy_pollable(
                         async move {
                             tracing::info!("fetch awaiting signal");
                             signal_rx.lock().await.recv().await;
-                            let fragment_str = format!("chunk-{}-{}\n", idx, i);
+                            let fragment_str = format!("chunk-{idx}-{i}\n");
                             tracing::info!("emitting response fragment: {fragment_str}");
                             let fragment = Bytes::from(fragment_str);
                             Ok::<Bytes, BoxError>(fragment)
@@ -178,16 +179,32 @@ async fn lazy_pollable(
     env.insert("PORT".to_string(), host_http_port.to_string());
 
     let worker_id = executor
-        .start_worker_with(&component_id, "custom-durability-1", vec![], env)
+        .start_worker_with(&component_id, "custom-durability-1", vec![], env, vec![])
         .await;
 
     signal_tx.send(()).unwrap();
 
+    let res1 = executor
+        .invoke_and_await(
+            &worker_id,
+            "golem:it-exports/golem-it-api.{[constructor]lazy-pollable-test}",
+            vec![],
+        )
+        .await
+        .unwrap();
+    let res_handle_type = AnalysedType::Handle(TypeHandle {
+        name: None,
+        owner: None,
+        resource_id: AnalysedResourceId(0),
+        mode: AnalysedResourceMode::Borrowed,
+    });
+    let res = ValueAndType::new(res1[0].clone(), res_handle_type);
+
     let s1 = executor
         .invoke_and_await(
             &worker_id,
-            "golem:it-exports/golem-it-api.{lazy-pollable-test().test}",
-            vec![1u32.into_value_and_type()],
+            "golem:it-exports/golem-it-api.{[method]lazy-pollable-test.test}",
+            vec![res.clone(), 1u32.into_value_and_type()],
         )
         .await
         .unwrap();
@@ -197,8 +214,8 @@ async fn lazy_pollable(
     let s2 = executor
         .invoke_and_await(
             &worker_id,
-            "golem:it-exports/golem-it-api.{lazy-pollable-test().test}",
-            vec![2u32.into_value_and_type()],
+            "golem:it-exports/golem-it-api.{[method]lazy-pollable-test.test}",
+            vec![res.clone(), 2u32.into_value_and_type()],
         )
         .await
         .unwrap();
@@ -208,8 +225,8 @@ async fn lazy_pollable(
     let s3 = executor
         .invoke_and_await(
             &worker_id,
-            "golem:it-exports/golem-it-api.{lazy-pollable-test().test}",
-            vec![3u32.into_value_and_type()],
+            "golem:it-exports/golem-it-api.{[method]lazy-pollable-test.test}",
+            vec![res.clone(), 3u32.into_value_and_type()],
         )
         .await
         .unwrap();
@@ -217,15 +234,15 @@ async fn lazy_pollable(
     signal_tx.send(()).unwrap();
 
     drop(executor);
-    let executor = start(deps, &context).await.unwrap();
+    let executor = start(deps, &context).await.unwrap().into_admin().await;
 
     signal_tx.send(()).unwrap();
 
     let s4 = executor
         .invoke_and_await(
             &worker_id,
-            "golem:it-exports/golem-it-api.{lazy-pollable-test().test}",
-            vec![3u32.into_value_and_type()],
+            "golem:it-exports/golem-it-api.{[method]lazy-pollable-test.test}",
+            vec![res.clone(), 3u32.into_value_and_type()],
         )
         .await
         .unwrap();

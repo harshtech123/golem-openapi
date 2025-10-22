@@ -18,16 +18,16 @@ use std::time::SystemTime;
 use fs_set_times::{set_symlink_times, SystemTimeSpec};
 use metrohash::MetroHash128;
 use wasmtime::component::Resource;
-use wasmtime_wasi::bindings::clocks::wall_clock::Datetime;
-use wasmtime_wasi::bindings::filesystem::types::{
+use wasmtime_wasi::p2::bindings::clocks::wall_clock::Datetime;
+use wasmtime_wasi::p2::bindings::filesystem::types::{
     Advice, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry,
     DirectoryEntryStream, Error, ErrorCode, Filesize, Host, HostDescriptor,
     HostDirectoryEntryStream, InputStream, MetadataHashValue, NewTimestamp, OpenFlags,
     OutputStream, PathFlags,
 };
+use wasmtime_wasi::p2::FsError;
+use wasmtime_wasi::p2::ReaddirIterator;
 use wasmtime_wasi::runtime::spawn_blocking;
-use wasmtime_wasi::FsError;
-use wasmtime_wasi::ReaddirIterator;
 
 use golem_common::model::oplog::DurableFunctionType;
 
@@ -84,7 +84,7 @@ impl<Ctx: WorkerCtx> HostDescriptor for DurableWorkerCtx<Ctx> {
     async fn get_flags(&mut self, fd: Resource<Descriptor>) -> Result<DescriptorFlags, FsError> {
         self.observe_function_call("filesystem::types::descriptor", "get_flags");
 
-        let read_only = self.is_read_only(&fd)?;
+        let read_only = self.check_if_file_is_readonly(&fd)?;
         let wasi_view = &mut self.as_wasi_view();
         let mut descriptor_flags = HostDescriptor::get_flags(wasi_view, fd).await?;
 

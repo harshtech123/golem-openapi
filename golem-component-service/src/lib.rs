@@ -12,37 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::api::{make_open_api_service, ApiServices};
+pub mod api;
+pub mod authed;
+pub mod bootstrap;
+pub mod config;
+pub mod error;
+pub mod grpcapi;
+pub mod metrics;
+pub mod model;
+pub mod repo;
+pub mod service;
+
+use crate::api::Apis;
+use crate::bootstrap::Services;
 use crate::config::ComponentServiceConfig;
-use crate::service::Services;
 use anyhow::{anyhow, Context};
 use golem_common::config::DbConfig;
-use golem_common::golem_version;
 use golem_service_base::db;
-use golem_service_base::migration::Migrations;
+use golem_service_base::migration::{IncludedMigrationsDir, Migrations};
 use include_dir::{include_dir, Dir};
-use poem::endpoint::BoxEndpoint;
+use poem::endpoint::{BoxEndpoint, PrometheusExporter};
 use poem::listener::Acceptor;
 use poem::listener::Listener;
-use poem::{EndpointExt, IntoEndpoint};
+use poem::middleware::{CookieJarManager, Cors};
+use poem::{EndpointExt, Route};
 use poem_openapi::OpenApiService;
 use prometheus::Registry;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::task::JoinSet;
-use tracing::{info, Instrument};
-
-pub mod api;
-pub mod config;
-pub mod grpcapi;
-pub mod metrics;
-pub mod service;
-
-const VERSION: &str = golem_version!();
-
-static DB_MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/db/migration");
+use tracing::{debug, info, Instrument};
 
 #[cfg(test)]
 test_r::enable!();
+
+static DB_MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/db/migration");
 
 pub struct RunDetails {
     pub grpc_port: u16,
@@ -65,12 +68,10 @@ impl ComponentService {
     pub async fn new(
         config: ComponentServiceConfig,
         prometheus_registry: Registry,
-        migrations: impl Migrations,
     ) -> Result<Self, anyhow::Error> {
-        info!(
-            "Starting cloud server on ports: http: {}, grpc: {}",
-            config.http_port, config.grpc_port
-        );
+        debug!("Initializing component service");
+
+        let migrations = IncludedMigrationsDir::new(&DB_MIGRATIONS);
 
         match config.db.clone() {
             DbConfig::Postgres(c) => {
@@ -101,7 +102,10 @@ impl ComponentService {
         join_set: &mut JoinSet<Result<(), anyhow::Error>>,
     ) -> Result<RunDetails, anyhow::Error> {
         let grpc_port = self.start_grpc_server(join_set).await?;
-        let http_port = self.start_standalone_http_server(join_set).await?;
+        let http_port = self.start_http_server(join_set).await?;
+
+        info!("Started component service on ports: http: {http_port}, grpc: {grpc_port}");
+
         self.services
             .compilation_service
             .set_self_grpc_port(grpc_port);
@@ -117,7 +121,7 @@ impl ComponentService {
         join_set: &mut JoinSet<Result<(), anyhow::Error>>,
     ) -> Result<TrafficReadyEndpoints, anyhow::Error> {
         let grpc_port = self.start_grpc_server(join_set).await?;
-        let endpoint = self.main_endpoint();
+        let endpoint = api::make_open_api_service(&self.services).boxed();
         self.services
             .compilation_service
             .set_self_grpc_port(grpc_port);
@@ -127,12 +131,8 @@ impl ComponentService {
         })
     }
 
-    pub fn db_migrations() -> Dir<'static> {
-        DB_MIGRATIONS.clone()
-    }
-
-    pub fn http_service(&self) -> OpenApiService<ApiServices, ()> {
-        make_open_api_service(&self.services)
+    pub fn http_service(&self) -> OpenApiService<Apis, ()> {
+        api::make_open_api_service(&self.services)
     }
 
     async fn start_grpc_server(
@@ -141,26 +141,36 @@ impl ComponentService {
     ) -> Result<u16, anyhow::Error> {
         grpcapi::start_grpc_server(
             SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), self.config.grpc_port).into(),
-            self.services.clone(),
+            &self.services,
             join_set,
         )
         .await
         .map_err(|err| anyhow!(err).context("gRPC server failed"))
     }
 
-    fn main_endpoint(&self) -> BoxEndpoint<'static> {
-        api::make_open_api_service(&self.services)
-            .into_endpoint()
-            .boxed()
-    }
-
-    async fn start_standalone_http_server(
+    async fn start_http_server(
         &self,
         join_set: &mut JoinSet<Result<(), anyhow::Error>>,
     ) -> Result<u16, anyhow::Error> {
         let prometheus_registry = self.prometheus_registry.clone();
 
-        let app = api::combined_routes(prometheus_registry, &self.services);
+        let api_service = api::make_open_api_service(&self.services);
+
+        let ui = api_service.swagger_ui();
+        let spec = api_service.spec_endpoint_yaml();
+        let metrics = PrometheusExporter::new(prometheus_registry.clone());
+
+        let cors = Cors::new()
+            .allow_origin_regex(&self.config.cors_origin_regex)
+            .allow_credentials(true);
+
+        let app = Route::new()
+            .nest("/", api_service)
+            .nest("/docs", ui)
+            .nest("/specs", spec)
+            .nest("/metrics", metrics)
+            .with(CookieJarManager::new())
+            .with(cors);
 
         let poem_listener =
             poem::listener::TcpListener::bind(format!("0.0.0.0:{}", self.config.http_port));

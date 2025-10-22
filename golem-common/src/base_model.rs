@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::model::agent::{AgentId, AgentTypeResolver};
+use crate::model::component_metadata::ComponentMetadata;
 use crate::newtype_uuid;
 use bincode::{Decode, Encode};
-use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -33,11 +34,28 @@ newtype_uuid!(
     golem_api_grpc::proto::golem::common::PluginInstallationId
 );
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Encode, Decode)]
-#[cfg_attr(feature = "model", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
-#[cfg_attr(feature = "model", serde(rename_all = "camelCase"))]
+newtype_uuid!(PlanId, golem_api_grpc::proto::golem::account::PlanId);
+newtype_uuid!(ProjectGrantId);
+newtype_uuid!(ProjectPolicyId);
+newtype_uuid!(TokenId, golem_api_grpc::proto::golem::token::TokenId);
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Encode,
+    Decode,
+    serde::Serialize,
+    serde::Deserialize,
+    poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct ShardId {
     pub(crate) value: i64,
 }
@@ -60,7 +78,7 @@ impl ShardId {
         );
         let high = Self::hash_string(&high_bits.to_string());
         let worker_name = &worker_id.worker_name;
-        let component_worker_name = format!("{}{}", low_bits, worker_name);
+        let component_worker_name = format!("{low_bits}{worker_name}");
         let low = Self::hash_string(&component_worker_name);
         ((high as i64) << 32) | ((low as i64) & 0xFFFFFFFF)
     }
@@ -86,24 +104,34 @@ impl Display for ShardId {
     }
 }
 
-#[cfg(feature = "model")]
-impl golem_wasm_rpc::IntoValue for ShardId {
-    fn into_value(self) -> golem_wasm_rpc::Value {
-        golem_wasm_rpc::Value::S64(self.value)
+impl golem_wasm::IntoValue for ShardId {
+    fn into_value(self) -> golem_wasm::Value {
+        golem_wasm::Value::S64(self.value)
     }
 
-    fn get_type() -> golem_wasm_ast::analysis::AnalysedType {
-        golem_wasm_ast::analysis::analysed_type::s64()
+    fn get_type() -> golem_wasm::analysis::AnalysedType {
+        golem_wasm::analysis::analysed_type::s64()
     }
 }
 
 pub type ComponentVersion = u64;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Encode, Decode)]
-#[cfg_attr(feature = "model", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
-#[cfg_attr(feature = "model", serde(rename_all = "camelCase"))]
+static WORKER_ID_MAX_LENGTH: usize = 512;
+
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Encode,
+    Decode,
+    serde::Serialize,
+    serde::Deserialize,
+    poem_openapi::Object,
+)]
+#[oai(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerId {
     pub component_id: ComponentId,
     pub worker_name: String,
@@ -118,26 +146,61 @@ impl WorkerId {
         format!("urn:worker:{}/{}", self.component_id, self.worker_name)
     }
 
-    /// The dual of `TargetWorkerId::into_worker_id`
-    pub fn into_target_worker_id(self) -> TargetWorkerId {
-        TargetWorkerId {
-            component_id: self.component_id,
-            worker_name: Some(self.worker_name),
+    pub fn from_agent_id(
+        component_id: ComponentId,
+        agent_id: &AgentId,
+    ) -> Result<WorkerId, String> {
+        let agent_id = agent_id.to_string();
+        if agent_id.len() > WORKER_ID_MAX_LENGTH {
+            return Err(format!(
+                "Agent id is too long: {}, max length: {}, agent id: {}",
+                agent_id.len(),
+                WORKER_ID_MAX_LENGTH,
+                agent_id,
+            ));
         }
+        Ok(Self {
+            component_id,
+            worker_name: agent_id,
+        })
     }
 
-    pub fn validate_worker_name(name: &str) -> Result<(), &'static str> {
-        let length = name.len();
-        if !(1..=512).contains(&length) {
-            Err("Worker name must be between 1 and 512 characters")
-        } else if name.chars().any(|c| c.is_whitespace()) {
-            Err("Worker name must not contain whitespaces")
-        } else if name.contains('/') {
-            Err("Worker name must not contain '/'")
-        } else if name.starts_with('-') {
-            Err("Worker name must not start with '-'")
+    pub fn from_agent_id_literal<S: AsRef<str>>(
+        component_id: ComponentId,
+        agent_id: S,
+        resolver: impl AgentTypeResolver,
+    ) -> Result<WorkerId, String> {
+        Self::from_agent_id(component_id, &AgentId::parse(agent_id, resolver)?)
+    }
+
+    pub fn from_component_metadata_and_worker_id<S: AsRef<str>>(
+        component_id: ComponentId,
+        component_metadata: &ComponentMetadata,
+        id: S,
+    ) -> Result<WorkerId, String> {
+        if component_metadata.is_agent() {
+            Self::from_agent_id_literal(component_id, id, component_metadata)
         } else {
-            Ok(())
+            let id = id.as_ref();
+            if id.len() > WORKER_ID_MAX_LENGTH {
+                return Err(format!(
+                    "Legacy worker id is too long: {}, max length: {}, worker id: {}",
+                    id.len(),
+                    WORKER_ID_MAX_LENGTH,
+                    id,
+                ));
+            }
+            if id.contains('/') {
+                return Err(format!(
+                    "Legacy worker id cannot contain '/', worker id: {}",
+                    id,
+                ));
+            }
+
+            Ok(WorkerId {
+                component_id,
+                worker_name: id.to_string(),
+            })
         }
     }
 }
@@ -176,17 +239,16 @@ impl AsRef<WorkerId> for &WorkerId {
     }
 }
 
-#[cfg(feature = "model")]
-impl golem_wasm_rpc::IntoValue for WorkerId {
-    fn into_value(self) -> golem_wasm_rpc::Value {
-        golem_wasm_rpc::Value::Record(vec![
+impl golem_wasm::IntoValue for WorkerId {
+    fn into_value(self) -> golem_wasm::Value {
+        golem_wasm::Value::Record(vec![
             self.component_id.into_value(),
             self.worker_name.into_value(),
         ])
     }
 
-    fn get_type() -> golem_wasm_ast::analysis::AnalysedType {
-        use golem_wasm_ast::analysis::analysed_type::{field, record};
+    fn get_type() -> golem_wasm::analysis::AnalysedType {
+        use golem_wasm::analysis::analysed_type::{field, record};
         record(vec![
             field("component_id", ComponentId::get_type()),
             field("worker_name", String::get_type()),
@@ -194,126 +256,21 @@ impl golem_wasm_rpc::IntoValue for WorkerId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Encode, Decode)]
-#[cfg_attr(feature = "model", derive(serde::Serialize, serde::Deserialize))]
-pub struct TargetWorkerId {
-    pub component_id: ComponentId,
-    pub worker_name: Option<String>,
-}
-
-impl TargetWorkerId {
-    /// Converts a `TargetWorkerId` to a `WorkerId` if the worker name is specified
-    pub fn try_into_worker_id(self) -> Option<WorkerId> {
-        self.worker_name.map(|worker_name| WorkerId {
-            component_id: self.component_id,
-            worker_name,
-        })
-    }
-
-    /// Converts a `TargetWorkerId` to a `WorkerId`. If the worker name was not specified,
-    /// it generates a new unique one, and if the `force_in_shard` set is not empty, it guarantees
-    /// that the generated worker ID will belong to one of the provided shards.
-    ///
-    /// If the worker name was specified, `force_in_shard` is ignored.
-    pub fn into_worker_id(
-        self,
-        force_in_shard: &HashSet<ShardId>,
-        number_of_shards: usize,
-    ) -> WorkerId {
-        let TargetWorkerId {
-            component_id,
-            worker_name,
-        } = self;
-        match worker_name {
-            Some(worker_name) => WorkerId {
-                component_id,
-                worker_name,
-            },
-            None => {
-                if force_in_shard.is_empty() || number_of_shards == 0 {
-                    let worker_name = Uuid::new_v4().to_string();
-                    WorkerId {
-                        component_id,
-                        worker_name,
-                    }
-                } else {
-                    let mut current = Uuid::new_v4().to_u128_le();
-                    loop {
-                        let uuid = Uuid::from_u128_le(current);
-                        let worker_name = uuid.to_string();
-                        let worker_id = WorkerId {
-                            component_id: component_id.clone(),
-                            worker_name,
-                        };
-                        let shard_id = ShardId::from_worker_id(&worker_id, number_of_shards);
-                        if force_in_shard.contains(&shard_id) {
-                            return worker_id;
-                        }
-                        current += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // NOTE: Deprecated, to be removed once the wasm-rpc constructor is changed to accept worker-id
-    pub fn parse_worker_urn(urn: &str) -> Option<TargetWorkerId> {
-        if !urn.starts_with("urn:worker:") {
-            None
-        } else {
-            let remaining = &urn[11..];
-            let parts: Vec<&str> = remaining.split('/').collect();
-            match parts.len() {
-                2 => {
-                    let component_id = ComponentId::from_str(parts[0]).ok()?;
-                    let worker_name = parts[1];
-                    Some(TargetWorkerId {
-                        component_id,
-                        worker_name: Some(worker_name.to_string()),
-                    })
-                }
-                1 => {
-                    let component_id = ComponentId::from_str(parts[0]).ok()?;
-                    Some(TargetWorkerId {
-                        component_id,
-                        worker_name: None,
-                    })
-                }
-                _ => None,
-            }
-        }
-    }
-}
-
-impl Display for TargetWorkerId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self.worker_name {
-            Some(worker_name) => write!(f, "{}/{}", self.component_id, worker_name),
-            None => write!(f, "{}/*", self.component_id),
-        }
-    }
-}
-
-impl From<WorkerId> for TargetWorkerId {
-    fn from(value: WorkerId) -> Self {
-        value.into_target_worker_id()
-    }
-}
-
-impl From<&WorkerId> for TargetWorkerId {
-    fn from(value: &WorkerId) -> Self {
-        value.clone().into_target_worker_id()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Encode, Decode)]
-#[cfg_attr(
-    feature = "model",
-    derive(serde::Serialize, serde::Deserialize, golem_wasm_rpc_derive::IntoValue)
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Encode,
+    Decode,
+    serde::Serialize,
+    serde::Deserialize,
+    golem_wasm_derive::IntoValue,
+    poem_openapi::Object,
 )]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename_all = "camelCase"))]
-#[cfg_attr(feature = "model", serde(rename_all = "camelCase"))]
+#[oai(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct PromiseId {
     pub worker_id: WorkerId,
     pub oplog_idx: OplogIndex,
@@ -331,11 +288,22 @@ impl Display for PromiseId {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Default)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::NewType))]
-#[cfg_attr(
-    feature = "model",
-    derive(serde::Serialize, serde::Deserialize, golem_wasm_rpc_derive::IntoValue)
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Encode,
+    Decode,
+    Default,
+    poem_openapi::NewType,
+    serde::Serialize,
+    serde::Deserialize,
+    golem_wasm_derive::IntoValue,
 )]
 pub struct OplogIndex(pub(crate) u64);
 
@@ -352,6 +320,11 @@ impl OplogIndex {
         OplogIndex(self.0 - 1)
     }
 
+    /// Subtract the given number of entries from the oplog index
+    pub fn subtract(&self, n: u64) -> OplogIndex {
+        OplogIndex(self.0 - n)
+    }
+
     /// Gets the next oplog index
     pub fn next(&self) -> OplogIndex {
         OplogIndex(self.0 + 1)
@@ -361,6 +334,11 @@ impl OplogIndex {
     /// having `count` elements.
     pub fn range_end(&self, count: u64) -> OplogIndex {
         OplogIndex(self.0 + count - 1)
+    }
+
+    /// Check whether the oplog index is not None.
+    pub fn is_defined(&self) -> bool {
+        self.0 > 0
     }
 }
 
@@ -376,34 +354,84 @@ impl From<OplogIndex> for u64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ComponentId, TargetWorkerId};
-    use test_r::test;
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Encode,
+    Decode,
+    Default,
+    poem_openapi::NewType,
+    serde::Serialize,
+    serde::Deserialize,
+    golem_wasm_derive::IntoValue,
+)]
+pub struct TransactionId(pub(crate) String);
 
-    #[test]
-    fn test_parse_worker_urn() {
-        let component_id = ComponentId::new_v4();
+impl TransactionId {
+    pub fn new<Id: Display>(id: Id) -> Self {
+        Self(id.to_string())
+    }
 
-        fn check(urn: String, expected: Option<TargetWorkerId>) {
-            assert_eq!(TargetWorkerId::parse_worker_urn(&urn), expected, "{urn}");
+    pub fn generate() -> Self {
+        Self::new(uuid::Uuid::new_v4())
+    }
+}
+
+impl Display for TransactionId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<TransactionId> for String {
+    fn from(value: TransactionId) -> Self {
+        value.0
+    }
+}
+
+impl From<String> for TransactionId {
+    fn from(value: String) -> Self {
+        TransactionId(value)
+    }
+}
+
+mod sql {
+    use crate::model::TransactionId;
+    use sqlx::encode::IsNull;
+    use sqlx::error::BoxDynError;
+    use sqlx::postgres::PgTypeInfo;
+    use sqlx::{Database, Postgres, Type};
+    use std::io::Write;
+
+    impl sqlx::Decode<'_, Postgres> for TransactionId {
+        fn decode(value: <Postgres as Database>::ValueRef<'_>) -> Result<Self, BoxDynError> {
+            let bytes = value.as_bytes()?;
+            Ok(TransactionId(
+                u64::from_be_bytes(bytes.try_into()?).to_string(),
+            ))
         }
+    }
 
-        check(
-            format!("urn:worker:{}", component_id),
-            Some(TargetWorkerId {
-                component_id: component_id.clone(),
-                worker_name: None,
-            }),
-        );
-        check(
-            format!("urn:worker:{}/worker1", component_id),
-            Some(TargetWorkerId {
-                component_id: component_id.clone(),
-                worker_name: Some("worker1".to_string()),
-            }),
-        );
-        check(format!("urn:worker:{}/worker1/worker2", component_id), None);
-        check(format!("urn:component:{}", component_id), None);
+    impl sqlx::Encode<'_, Postgres> for TransactionId {
+        fn encode_by_ref(
+            &self,
+            buf: &mut <Postgres as Database>::ArgumentBuffer<'_>,
+        ) -> Result<IsNull, BoxDynError> {
+            let u64 = self.0.parse::<u64>()?;
+            let bytes = u64.to_be_bytes();
+            buf.write_all(&bytes)?;
+            Ok(IsNull::No)
+        }
+    }
+
+    impl Type<Postgres> for TransactionId {
+        fn type_info() -> PgTypeInfo {
+            PgTypeInfo::with_name("xid8")
+        }
     }
 }

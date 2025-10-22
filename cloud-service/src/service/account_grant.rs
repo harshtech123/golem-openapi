@@ -1,17 +1,27 @@
-use std::sync::Arc;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use async_trait::async_trait;
-use golem_common::model::AccountId;
-use tracing::error;
-
+use super::auth::AuthServiceError;
 use crate::repo::account::AccountRepo;
 use crate::repo::account_grant::AccountGrantRepo;
-use crate::{auth::AccountAuthorisation, model::AccountAction};
-use cloud_common::model::Role;
+use async_trait::async_trait;
+use golem_common::model::auth::Role;
+use golem_common::model::AccountId;
 use golem_common::SafeDisplay;
 use golem_service_base::repo::RepoError;
-
-use super::auth::{AuthService, AuthServiceError};
+use std::sync::Arc;
+use tracing::error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccountGrantServiceError {
@@ -37,40 +47,31 @@ impl SafeDisplay for AccountGrantServiceError {
 }
 
 #[async_trait]
-pub trait AccountGrantService {
-    async fn get(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<Vec<Role>, AccountGrantServiceError>;
+pub trait AccountGrantService: Send + Sync {
+    async fn get(&self, account_id: &AccountId) -> Result<Vec<Role>, AccountGrantServiceError>;
     async fn add(
         &self,
         account_id: &AccountId,
         role: &Role,
-        auth: &AccountAuthorisation,
     ) -> Result<(), AccountGrantServiceError>;
     async fn remove(
         &self,
         account_id: &AccountId,
         role: &Role,
-        auth: &AccountAuthorisation,
     ) -> Result<(), AccountGrantServiceError>;
 }
 
 pub struct AccountGrantServiceDefault {
-    auth_service: Arc<dyn AuthService>,
-    account_grant_repo: Arc<dyn AccountGrantRepo + Send + Sync>,
-    account_repo: Arc<dyn AccountRepo + Sync + Send>,
+    account_grant_repo: Arc<dyn AccountGrantRepo>,
+    account_repo: Arc<dyn AccountRepo>,
 }
 
 impl AccountGrantServiceDefault {
     pub fn new(
-        auth_service: Arc<dyn AuthService>,
-        account_grant_repo: Arc<dyn AccountGrantRepo + Send + Sync>,
-        account_repo: Arc<dyn AccountRepo + Sync + Send>,
+        account_grant_repo: Arc<dyn AccountGrantRepo>,
+        account_repo: Arc<dyn AccountRepo>,
     ) -> Self {
         Self {
-            auth_service,
             account_grant_repo,
             account_repo,
         }
@@ -79,15 +80,7 @@ impl AccountGrantServiceDefault {
 
 #[async_trait]
 impl AccountGrantService for AccountGrantServiceDefault {
-    async fn get(
-        &self,
-        account_id: &AccountId,
-        auth: &AccountAuthorisation,
-    ) -> Result<Vec<Role>, AccountGrantServiceError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::ViewAccountGrants)
-            .await?;
-
+    async fn get(&self, account_id: &AccountId) -> Result<Vec<Role>, AccountGrantServiceError> {
         let roles = match self.account_grant_repo.get(account_id).await {
             Ok(roles) => roles,
             Err(error) => {
@@ -103,12 +96,7 @@ impl AccountGrantService for AccountGrantServiceDefault {
         &self,
         account_id: &AccountId,
         role: &Role,
-        auth: &AccountAuthorisation,
     ) -> Result<(), AccountGrantServiceError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::CreateAccountGrant)
-            .await?;
-
         let account = self.account_repo.get(account_id.value.as_str()).await?;
 
         if account.is_none() {
@@ -130,17 +118,7 @@ impl AccountGrantService for AccountGrantServiceDefault {
         &self,
         account_id: &AccountId,
         role: &Role,
-        auth: &AccountAuthorisation,
     ) -> Result<(), AccountGrantServiceError> {
-        self.auth_service
-            .authorize_account_action(auth, account_id, &AccountAction::DeleteAccountGrant)
-            .await?;
-
-        if auth.token.account_id == *account_id && role == &Role::Admin {
-            return Err(AccountGrantServiceError::ArgValidation(vec![
-                "Cannot remove Admin role from current account.".to_string(),
-            ]));
-        };
         match self.account_grant_repo.remove(account_id, role).await {
             Ok(_) => Ok(()),
             Err(error) => {

@@ -15,6 +15,7 @@
 use golem_api_grpc::proto::grpc::health::v1::health_check_response::ServingStatus;
 use golem_api_grpc::proto::grpc::health::v1::HealthCheckRequest;
 use golem_client::api::HealthCheckClient;
+use golem_client::Security;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::Child;
@@ -26,6 +27,7 @@ use tracing::{debug, info, trace};
 use tracing::{error, warn, Level};
 use url::Url;
 
+pub mod cloud_service;
 pub mod component_compilation_service;
 pub mod component_service;
 mod docker;
@@ -146,6 +148,7 @@ pub async fn wait_for_startup_http(host: &str, http_port: u16, name: &str, timeo
                 client: new_reqwest_client(),
                 base_url: Url::from_str(&format!("http://{host}:{http_port}"))
                     .expect("Can't parse HTTP URL for health check"),
+                security_token: Security::Empty,
             },
         };
 
@@ -211,7 +214,7 @@ impl EnvVarBuilder {
                 h2=warn,\
                 hyper=warn,\
                 tower=warn,\
-                fred=warn"
+                fred=error"
             ),
         )
     }

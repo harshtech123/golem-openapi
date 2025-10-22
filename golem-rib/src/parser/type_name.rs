@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Display;
-use std::ops::Deref;
-
+use crate::parser::errors::RibParseError;
+use crate::rib_source_span::GetSourcePosition;
+use crate::{InferredNumber, InferredType, TypeInternal};
 use bincode::{Decode, Encode};
 use combine::parser::char;
 use combine::parser::char::{char, spaces, string};
 use combine::{attempt, between, choice, optional, sep_by, Parser};
 use combine::{parser, ParseError};
-use golem_wasm_ast::analysis::{AnalysedType, TypeResult};
-
-use crate::parser::errors::RibParseError;
-use crate::rib_source_span::GetSourcePosition;
-use crate::{InferredNumber, InferredType, TypeInternal};
+use golem_wasm::analysis::{AnalysedType, TypeResult};
+use std::fmt::Display;
+use std::ops::Deref;
 
 // Rib grammar uses it's own `TypeName` instead of relying from any other crates to annotate types (Example: 1: u32, let x: u32 = 1;),
 // and sticks on to the  Display instance that aligns with what we see in WIT.
@@ -80,28 +78,28 @@ impl Display for TypeName {
             TypeName::F64 => write!(f, "f64"),
             TypeName::Chr => write!(f, "char"),
             TypeName::Str => write!(f, "string"),
-            TypeName::List(inner_type) => write!(f, "list<{}>", inner_type),
+            TypeName::List(inner_type) => write!(f, "list<{inner_type}>"),
             TypeName::Tuple(inner_types) => {
                 write!(f, "tuple<")?;
                 for (i, inner_type) in inner_types.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", inner_type)?;
+                    write!(f, "{inner_type}")?;
                 }
                 write!(f, ">")
             }
-            TypeName::Option(inner_type) => write!(f, "option<{}>", inner_type),
+            TypeName::Option(inner_type) => write!(f, "option<{inner_type}>"),
             // https://component-model.bytecodealliance.org/design/wit.html#results
             TypeName::Result { ok, error } => match (ok, error) {
                 (Some(ok), Some(error)) => {
-                    write!(f, "result<{}, {}>", ok, error)
+                    write!(f, "result<{ok}, {error}>")
                 }
                 (Some(ok), None) => {
-                    write!(f, "result<{}>", ok)
+                    write!(f, "result<{ok}>")
                 }
                 (None, Some(error)) => {
-                    write!(f, "result<_, {}>", error)
+                    write!(f, "result<_, {error}>")
                 }
                 (None, None) => {
                     write!(f, "result")
@@ -113,7 +111,7 @@ impl Display for TypeName {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {}", field, typ)?;
+                    write!(f, "{field}: {typ}")?;
                 }
                 write!(f, " }}")
             }
@@ -123,7 +121,7 @@ impl Display for TypeName {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", flag)?;
+                    write!(f, "{flag}")?;
                 }
                 write!(f, ">")
             }
@@ -133,7 +131,7 @@ impl Display for TypeName {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", case)?;
+                    write!(f, "{case}")?;
                 }
                 write!(f, " }}")
             }
@@ -143,9 +141,9 @@ impl Display for TypeName {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", case)?;
+                    write!(f, "{case}")?;
                     if let Some(typ) = typ {
-                        write!(f, "({})", typ)?;
+                        write!(f, "({typ})")?;
                     }
                 }
                 write!(f, " }}")
@@ -201,7 +199,7 @@ impl TryFrom<AnalysedType> for TypeName {
             AnalysedType::Option(type_option) => Ok(TypeName::Option(Box::new(
                 type_option.inner.deref().clone().try_into()?,
             ))),
-            AnalysedType::Result(TypeResult { ok, err }) => match (ok, err) {
+            AnalysedType::Result(TypeResult { ok, err, .. }) => match (ok, err) {
                 (Some(ok), Some(err)) => Ok(TypeName::Result {
                     ok: Some(Box::new(ok.deref().clone().try_into()?)),
                     error: Some(Box::new(err.deref().clone().try_into()?)),
@@ -252,7 +250,7 @@ impl TryFrom<AnalysedType> for TypeName {
                 })
             }
             AnalysedType::Handle(type_handle) => {
-                Err(format!("Handle type not supported: {:?}", type_handle))
+                Err(format!("Handle type not supported: {type_handle:?}"))
             }
         }
     }
@@ -549,10 +547,9 @@ parser! {
     }
 }
 
-#[cfg(feature = "protobuf")]
 mod protobuf {
-    use golem_api_grpc::proto::golem::rib::type_name::Kind as InnerTypeName;
-    use golem_api_grpc::proto::golem::rib::{
+    use crate::proto::golem::rib::type_name::Kind as InnerTypeName;
+    use crate::proto::golem::rib::{
         BasicTypeName, EnumType, FlagType, KeyValue, ListType, OptionType, RecordType, ResultType,
         TupleType, TypeName as ProtoTypeName, VariantCase, VariantType,
     };
@@ -639,7 +636,7 @@ mod protobuf {
                         Ok(BasicTypeName::F64) => Ok(TypeName::F64),
                         Ok(BasicTypeName::Chr) => Ok(TypeName::Chr),
                         Ok(BasicTypeName::Str) => Ok(TypeName::Str),
-                        _ => Err(format!("Unknown basic type: {:?}", value)),
+                        _ => Err(format!("Unknown basic type: {value:?}")),
                     },
                     InnerTypeName::ListType(inner_type) => {
                         let proto_list_type = inner_type
@@ -722,7 +719,7 @@ mod type_name_tests {
     use super::*;
 
     fn parse_and_compare(input: &str, expected: TypeName) {
-        let written = format!("{}", expected);
+        let written = format!("{expected}");
         let result1 = type_name()
             .easy_parse(position::Stream::new(input))
             .map(|x| x.0);

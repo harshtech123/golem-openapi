@@ -11,29 +11,47 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use crate::api::{make_open_api_service, ApiServices};
+
+pub mod api;
+pub mod aws_config;
+pub mod aws_load_balancer;
+pub mod config;
+pub mod gateway_api_definition;
+pub mod gateway_api_definition_transformer;
+pub mod gateway_api_deployment;
+pub mod gateway_binding;
+pub mod gateway_execution;
+pub mod gateway_middleware;
+pub mod gateway_request;
+pub mod gateway_rib_compiler;
+pub mod gateway_rib_interpreter;
+pub mod gateway_security;
+pub mod getter;
+pub mod grpcapi;
+pub mod headers;
+pub mod http_invocation_context;
+pub mod metrics;
+pub mod model;
+pub mod path;
+pub mod repo;
+pub mod service;
+
+use crate::config::WorkerServiceConfig;
 use crate::service::Services;
 use anyhow::{anyhow, Context};
 use golem_common::config::DbConfig;
 use golem_service_base::db;
-use golem_service_base::migration::Migrations;
-use golem_worker_service_base::app_config::WorkerServiceBaseConfig;
+use golem_service_base::migration::{IncludedMigrationsDir, Migrations};
 use include_dir::{include_dir, Dir};
-use poem::endpoint::BoxEndpoint;
+use poem::endpoint::{BoxEndpoint, PrometheusExporter};
 use poem::listener::Acceptor;
 use poem::listener::Listener;
-use poem::middleware::{OpenTelemetryMetrics, Tracing};
-use poem::EndpointExt;
-use poem_openapi::OpenApiService;
+use poem::middleware::{CookieJarManager, Cors, OpenTelemetryMetrics, Tracing};
+use poem::{EndpointExt, Route};
 use prometheus::Registry;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::task::JoinSet;
-use tracing::Instrument;
-
-pub mod api;
-pub mod config;
-pub mod grpcapi;
-pub mod service;
+use tracing::{info, Instrument};
 
 #[cfg(test)]
 test_r::enable!();
@@ -54,17 +72,18 @@ pub struct TrafficReadyEndpoints {
 
 #[derive(Clone)]
 pub struct WorkerService {
-    config: WorkerServiceBaseConfig,
+    config: WorkerServiceConfig,
     prometheus_registry: Registry,
     services: Services,
 }
 
 impl WorkerService {
     pub async fn new(
-        config: WorkerServiceBaseConfig,
+        config: WorkerServiceConfig,
         prometheus_registry: Registry,
-        migrations: impl Migrations,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> anyhow::Result<Self> {
+        let migrations = IncludedMigrationsDir::new(&DB_MIGRATIONS);
+
         match &config.db {
             DbConfig::Postgres(c) => {
                 db::postgres::migrate(c, migrations.postgres_migrations())
@@ -97,6 +116,11 @@ impl WorkerService {
         let http_port = self.start_http_server(join_set).await?;
         let custom_request_port = self.start_api_gateway_server(join_set).await?;
 
+        info!(
+            "Started worker service on ports: http: {}, grpc: {}, gateway: {}",
+            http_port, grpc_port, custom_request_port
+        );
+
         Ok(RunDetails {
             http_port,
             grpc_port,
@@ -119,15 +143,7 @@ impl WorkerService {
         })
     }
 
-    pub fn db_migrations() -> Dir<'static> {
-        DB_MIGRATIONS.clone()
-    }
-
-    pub fn http_service(&self) -> OpenApiService<ApiServices, ()> {
-        make_open_api_service(&self.services)
-    }
-
-    pub async fn start_grpc_server(
+    async fn start_grpc_server(
         &self,
         join_set: &mut JoinSet<anyhow::Result<()>>,
     ) -> Result<u16, anyhow::Error> {
@@ -144,12 +160,27 @@ impl WorkerService {
         &self,
         join_set: &mut JoinSet<anyhow::Result<()>>,
     ) -> Result<u16, anyhow::Error> {
-        let prometheus_registry = self.prometheus_registry.clone();
+        let api_service = api::make_open_api_service(&self.services);
 
-        let app = api::combined_routes(prometheus_registry, &self.services);
+        let ui = api_service.swagger_ui();
+        let spec = api_service.spec_endpoint_yaml();
+        let metrics = PrometheusExporter::new(self.prometheus_registry.clone());
+
+        let cors = Cors::new()
+            .allow_origin_regex(&self.config.cors_origin_regex)
+            .allow_credentials(true);
+
+        let app = Route::new()
+            .nest("/", api_service)
+            .nest("/docs", ui)
+            .nest("/specs", spec)
+            .nest("/metrics", metrics)
+            .with(CookieJarManager::new())
+            .with(cors);
 
         let poem_listener =
             poem::listener::TcpListener::bind(format!("0.0.0.0:{}", self.config.port));
+
         let acceptor = poem_listener.into_acceptor().await?;
         let port = acceptor.local_addr()[0]
             .as_socket_addr()
@@ -169,11 +200,12 @@ impl WorkerService {
         Ok(port)
     }
 
-    pub async fn start_api_gateway_server(
+    async fn start_api_gateway_server(
         &self,
         join_set: &mut JoinSet<anyhow::Result<()>>,
     ) -> Result<u16, anyhow::Error> {
-        let route = api::custom_request_route(&self.services)
+        let route = Route::new()
+            .nest("/", api::custom_http_request_api(&self.services))
             .with(OpenTelemetryMetrics::new())
             .with(Tracing);
 

@@ -14,17 +14,18 @@
 
 use crate::interpreter::interpreter_stack_value::RibInterpreterStackValue;
 use crate::{
-    EvaluatedFnArgs, EvaluatedFqFn, EvaluatedWorkerName, InstructionId, RibFunctionInvoke,
-    RibInput, VariableId,
+    ComponentDependencyKey, EvaluatedFnArgs, EvaluatedFqFn, EvaluatedWorkerName, InstructionId,
+    RibComponentFunctionInvoke, RibInput, VariableId,
 };
-use golem_wasm_rpc::ValueAndType;
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::ValueAndType;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 pub struct InterpreterEnv {
     pub env: HashMap<EnvironmentKey, RibInterpreterStackValue>,
-    pub call_worker_function_async: Arc<dyn RibFunctionInvoke + Sync + Send>,
+    pub call_worker_function_async: Arc<dyn RibComponentFunctionInvoke + Sync + Send>,
 }
 
 impl Debug for InterpreterEnv {
@@ -47,17 +48,21 @@ impl Default for InterpreterEnv {
 impl InterpreterEnv {
     pub async fn invoke_worker_function_async(
         &self,
+        component_dependency_key: ComponentDependencyKey,
         instruction_id: &InstructionId,
-        worker_name: Option<String>,
+        worker_name: String,
         function_name: String,
         args: Vec<ValueAndType>,
-    ) -> Result<ValueAndType, Box<dyn std::error::Error + Send + Sync>> {
+        return_type: Option<AnalysedType>,
+    ) -> Result<Option<ValueAndType>, Box<dyn std::error::Error + Send + Sync>> {
         self.call_worker_function_async
             .invoke(
+                component_dependency_key,
                 instruction_id,
-                worker_name.map(EvaluatedWorkerName),
+                EvaluatedWorkerName(worker_name),
                 EvaluatedFqFn(function_name),
                 EvaluatedFnArgs(args),
+                return_type,
             )
             .await
     }
@@ -83,7 +88,7 @@ impl InterpreterEnv {
 
     pub fn from(
         input: &RibInput,
-        call_worker_function_async: &Arc<dyn RibFunctionInvoke + Sync + Send>,
+        call_worker_function_async: &Arc<dyn RibComponentFunctionInvoke + Sync + Send>,
     ) -> Self {
         let mut env = Self::from_input(input);
         env.call_worker_function_async = call_worker_function_async.clone();
@@ -117,24 +122,28 @@ impl EnvironmentKey {
 }
 
 mod internal {
-    use crate::interpreter::env::RibFunctionInvoke;
-    use crate::{EvaluatedFnArgs, EvaluatedFqFn, EvaluatedWorkerName, InstructionId};
+    use crate::interpreter::env::RibComponentFunctionInvoke;
+    use crate::{
+        ComponentDependencyKey, EvaluatedFnArgs, EvaluatedFqFn, EvaluatedWorkerName, InstructionId,
+        RibFunctionInvokeResult,
+    };
     use async_trait::async_trait;
-    use golem_wasm_ast::analysis::analysed_type::tuple;
-    use golem_wasm_rpc::{Value, ValueAndType};
+    use golem_wasm::analysis::AnalysedType;
 
     pub(crate) struct NoopRibFunctionInvoke;
 
     #[async_trait]
-    impl RibFunctionInvoke for NoopRibFunctionInvoke {
+    impl RibComponentFunctionInvoke for NoopRibFunctionInvoke {
         async fn invoke(
             &self,
+            _component_info: ComponentDependencyKey,
             _instruction_id: &InstructionId,
-            _worker_name: Option<EvaluatedWorkerName>,
+            _worker_name: EvaluatedWorkerName,
             _function_name: EvaluatedFqFn,
             _args: EvaluatedFnArgs,
-        ) -> Result<ValueAndType, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(ValueAndType::new(Value::Tuple(vec![]), tuple(vec![])))
+            _return_type: Option<AnalysedType>,
+        ) -> RibFunctionInvokeResult {
+            Ok(None)
         }
     }
 }

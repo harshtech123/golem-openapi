@@ -1,13 +1,28 @@
-use crate::api::ApiTags;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::model::*;
 use crate::service::auth::{AuthService, AuthServiceError};
 use crate::service::plan_limit::{PlanLimitError, PlanLimitService};
-use cloud_common::auth::GolemSecurityScheme;
 use golem_common::metrics::api::TraceErrorKind;
+use golem_common::model::auth::AccountAction;
 use golem_common::model::error::{ErrorBody, ErrorsBody};
 use golem_common::model::AccountId;
 use golem_common::recorded_http_api_request;
 use golem_common::SafeDisplay;
+use golem_service_base::api_tags::ApiTags;
+use golem_service_base::model::auth::GolemSecurityScheme;
 use poem_openapi::param::Query;
 use poem_openapi::payload::Json;
 use poem_openapi::*;
@@ -98,8 +113,8 @@ impl From<AuthServiceError> for LimitsError {
 }
 
 pub struct LimitsApi {
-    pub auth_service: Arc<dyn AuthService + Sync + Send>,
-    pub plan_limit_service: Arc<dyn PlanLimitService + Sync + Send>,
+    pub auth_service: Arc<dyn AuthService>,
+    pub plan_limit_service: Arc<dyn PlanLimitService>,
 }
 
 #[OpenApi(prefix_path = "/v1/resource-limits", tag = ApiTags::Limits)]
@@ -131,10 +146,15 @@ impl LimitsApi {
         token: GolemSecurityScheme,
     ) -> Result<Json<ResourceLimits>> {
         let auth = self.auth_service.authorization(token.as_ref()).await?;
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::ViewLimits)
+            .await?;
+
         let result = self
             .plan_limit_service
-            .get_resource_limits(&account_id, &auth)
+            .get_resource_limits(&account_id)
             .await?;
+
         Ok(Json(result))
     }
 
@@ -167,8 +187,14 @@ impl LimitsApi {
             updates.insert(AccountId::from(k.as_str()), *v);
         }
 
+        for account_id in updates.keys() {
+            self.auth_service
+                .authorize_account_action(&auth, account_id, &AccountAction::UpdateLimits)
+                .await?;
+        }
+
         self.plan_limit_service
-            .record_fuel_consumption(updates, &auth)
+            .record_fuel_consumption(updates)
             .await?;
 
         Ok(Json(UpdateResourceLimitsResponse {}))

@@ -12,15 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::{Any, TypeId};
-use std::collections::BTreeMap;
-use std::fmt::{Debug, Formatter};
-use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
-
-use crate::error::GolemError;
 use crate::model::ExecutionStatus;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
@@ -33,12 +24,21 @@ use golem_common::model::oplog::{
     DurableFunctionType, OplogEntry, OplogIndex, OplogPayload, UpdateDescription,
 };
 use golem_common::model::{
-    AccountId, ComponentId, ComponentVersion, IdempotencyKey, OwnedWorkerId, ScanCursor, Timestamp,
-    WorkerId, WorkerMetadata,
+    ComponentId, ComponentVersion, IdempotencyKey, OwnedWorkerId, ProjectId, ScanCursor, Timestamp,
+    WorkerId, WorkerMetadata, WorkerStatusRecord,
 };
+use golem_common::read_only_lock;
 use golem_common::serialization::{serialize, try_deserialize};
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 pub use multilayer::{MultiLayerOplog, MultiLayerOplogService, OplogArchiveService};
 pub use primary::PrimaryOplogService;
+use std::any::{Any, TypeId};
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Formatter};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 mod blob;
 mod compressed;
@@ -71,15 +71,18 @@ pub trait OplogService: Debug + Send + Sync {
         owned_worker_id: &OwnedWorkerId,
         initial_entry: OplogEntry,
         initial_worker_metadata: WorkerMetadata,
-        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
-    ) -> Arc<dyn Oplog + 'static>;
+        last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
+        execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
+    ) -> Arc<dyn Oplog>;
+
     async fn open(
         &self,
         owned_worker_id: &OwnedWorkerId,
         last_oplog_index: OplogIndex,
         initial_worker_metadata: WorkerMetadata,
-        execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
-    ) -> Arc<dyn Oplog + 'static>;
+        last_known_status: read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord>,
+        execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
+    ) -> Arc<dyn Oplog>;
 
     async fn get_last_index(&self, owned_worker_id: &OwnedWorkerId) -> OplogIndex;
 
@@ -101,9 +104,7 @@ pub trait OplogService: Debug + Send + Sync {
     ) -> BTreeMap<OplogIndex, OplogEntry> {
         assert!(
             start_idx <= last_idx,
-            "Invalid range passed to OplogService::read_range: start_idx = {}, last_idx = {}",
-            start_idx,
-            last_idx
+            "Invalid range passed to OplogService::read_range: start_idx = {start_idx}, last_idx = {last_idx}"
         );
 
         self.read(
@@ -131,11 +132,11 @@ pub trait OplogService: Debug + Send + Sync {
     /// Pages can be empty. This operation is slow and is not locking the oplog.
     async fn scan_for_component(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         component_id: &ComponentId,
         cursor: ScanCursor,
         count: u64,
-    ) -> Result<(ScanCursor, Vec<OwnedWorkerId>), GolemError>;
+    ) -> Result<(ScanCursor, Vec<OwnedWorkerId>), WorkerExecutorError>;
 
     /// Uploads a big oplog payload and returns a reference to it
     async fn upload_payload(
@@ -156,8 +157,6 @@ pub trait OplogService: Debug + Send + Sync {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CommitLevel {
     /// Always commit immediately and do not return until it is done
-    Immediate,
-    /// Always commit, both for durable and ephemeral workers, no guarantees that it awaits it
     Always,
     /// Only commit immediately if the worker is durable
     DurableOnly,
@@ -166,8 +165,13 @@ pub enum CommitLevel {
 /// An open oplog providing write access
 #[async_trait]
 pub trait Oplog: Any + Debug + Send + Sync {
-    /// Adds a single entry to the oplog (possibly buffered)
-    async fn add(&self, entry: OplogEntry);
+    /// Adds a single entry to the oplog (possibly buffered), and returns its index
+    async fn add(&self, entry: OplogEntry) -> OplogIndex;
+
+    async fn add_safe(&self, entry: OplogEntry) -> Result<(), String> {
+        self.add(entry).await;
+        Ok(())
+    }
 
     /// Drop a chunk of entries from the beginning of the oplog
     ///
@@ -175,10 +179,14 @@ pub trait Oplog: Any + Debug + Send + Sync {
     async fn drop_prefix(&self, last_dropped_id: OplogIndex);
 
     /// Commits the buffered entries to the oplog
-    async fn commit(&self, level: CommitLevel);
+    async fn commit(&self, level: CommitLevel) -> BTreeMap<OplogIndex, OplogEntry>;
 
     /// Returns the current oplog index
     async fn current_oplog_index(&self) -> OplogIndex;
+
+    /// Returns the index of the last non-hint entry which was added in this session with `add`. If
+    /// there is no such entry, returns `None`.
+    async fn last_added_non_hint_entry(&self) -> Option<OplogIndex>;
 
     /// Waits until indexed store writes all changes into at least `replicas` replicas (or the maximum
     /// available).
@@ -208,7 +216,7 @@ pub trait Oplog: Any + Debug + Send + Sync {
 
 pub(crate) fn downcast_oplog<T: Oplog>(oplog: &Arc<dyn Oplog>) -> Option<Arc<T>> {
     if oplog.deref().type_id() == TypeId::of::<T>() {
-        let raw: *const (dyn Oplog) = Arc::into_raw(oplog.clone());
+        let raw: *const dyn Oplog = Arc::into_raw(oplog.clone());
         let raw: *const T = raw.cast();
         Some(unsafe { Arc::from_raw(raw) })
     } else {
@@ -251,7 +259,7 @@ pub trait OplogOps: Oplog {
             function_name,
             request: request_payload,
             response: response_payload,
-            wrapped_function_type: function_type,
+            durable_function_type: function_type,
         };
         self.add(entry.clone()).await;
         Ok(entry)
@@ -276,6 +284,7 @@ pub trait OplogOps: Oplog {
             trace_id: invocation_context.trace_id,
             trace_states: invocation_context.trace_states,
         };
+
         self.add(entry.clone()).await;
         Ok(entry)
     }
@@ -311,9 +320,6 @@ pub trait OplogOps: Oplog {
 
     async fn get_raw_payload_of_entry(&self, entry: &OplogEntry) -> Result<Option<Bytes>, String> {
         match entry {
-            OplogEntry::ImportedFunctionInvokedV1 { response, .. } => {
-                Ok(Some(self.download_payload(response).await?))
-            }
             OplogEntry::ImportedFunctionInvoked { response, .. } => {
                 Ok(Some(self.download_payload(response).await?))
             }
@@ -327,7 +333,7 @@ pub trait OplogOps: Oplog {
         }
     }
 
-    async fn get_payload_of_entry<T: Decode>(
+    async fn get_payload_of_entry<T: Decode<()>>(
         &self,
         entry: &OplogEntry,
     ) -> Result<Option<T>, String> {
@@ -399,7 +405,7 @@ impl OpenOplogs {
                 .oplogs
                 .get_or_insert(
                     worker_id,
-                    || Ok(()),
+                    || (),
                     async |_| {
                         let result = constructor_clone.create_oplog(close).await;
 
@@ -430,7 +436,7 @@ impl OpenOplogs {
 
                 break oplog;
             } else {
-                self.oplogs.remove(worker_id);
+                self.oplogs.remove(worker_id).await;
                 continue;
             }
         }

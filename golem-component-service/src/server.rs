@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use anyhow::anyhow;
 use golem_common::tracing::init_tracing_with_default_env_filter;
+use golem_common::SafeDisplay;
+use golem_component_service::api::make_open_api_service;
+use golem_component_service::bootstrap::Services;
 use golem_component_service::config::{make_config_loader, ComponentServiceConfig};
 use golem_component_service::{metrics, ComponentService};
-use golem_service_base::migration::MigrationsDir;
 use opentelemetry::global;
+use opentelemetry_sdk::metrics::MeterProviderBuilder;
 use prometheus::Registry;
+use tracing::info;
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--dump-openapi-yaml") {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -27,6 +32,7 @@ fn main() -> Result<(), anyhow::Error> {
             .block_on(dump_openapi_yaml())
     } else if let Some(config) = make_config_loader().load_or_dump_config() {
         init_tracing_with_default_env_filter(&config.tracing);
+        info!("Using configuration:\n{}", config.to_safe_string_indented());
 
         let prometheus = metrics::register_all();
 
@@ -35,27 +41,32 @@ fn main() -> Result<(), anyhow::Error> {
             .build()?;
 
         global::set_meter_provider(
-            opentelemetry_sdk::metrics::MeterProviderBuilder::default()
+            MeterProviderBuilder::default()
                 .with_reader(exporter)
                 .build(),
         );
 
-        Ok(tokio::runtime::Builder::new_multi_thread()
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run(config, prometheus))?)
+            .block_on(async_main(config, prometheus))
     } else {
         Ok(())
     }
 }
 
-async fn run(config: ComponentServiceConfig, prometheus: Registry) -> Result<(), anyhow::Error> {
-    let server = ComponentService::new(
-        config,
-        prometheus,
-        MigrationsDir::new("./db/migration".into()),
-    )
-    .await?;
+async fn dump_openapi_yaml() -> anyhow::Result<()> {
+    let config = ComponentServiceConfig::default();
+    let services = Services::new(&config)
+        .await
+        .map_err(|e| anyhow!("Services - init error: {}", e))?;
+    let open_api_service = make_open_api_service(&services);
+    println!("{}", open_api_service.spec_yaml());
+    Ok(())
+}
+
+async fn async_main(config: ComponentServiceConfig, prometheus: Registry) -> anyhow::Result<()> {
+    let server = ComponentService::new(config, prometheus).await?;
 
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -65,18 +76,5 @@ async fn run(config: ComponentServiceConfig, prometheus: Registry) -> Result<(),
         res??;
     }
 
-    Ok(())
-}
-
-async fn dump_openapi_yaml() -> Result<(), anyhow::Error> {
-    let config = ComponentServiceConfig::default();
-    let service = ComponentService::new(
-        config,
-        Registry::default(),
-        MigrationsDir::new("../../golem-component-service/db/migration".into()),
-    )
-    .await?;
-    let yaml = service.http_service().spec_yaml();
-    println!("{yaml}");
     Ok(())
 }

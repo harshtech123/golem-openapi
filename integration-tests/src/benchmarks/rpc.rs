@@ -14,7 +14,7 @@ use std::collections::HashMap;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use async_trait::async_trait;
-use golem_wasm_rpc::{IntoValueAndType, ValueAndType};
+use golem_wasm::{IntoValueAndType, ValueAndType};
 use tokio::task::JoinSet;
 
 use crate::benchmarks::{
@@ -88,12 +88,16 @@ impl Benchmark for Rpc {
     ) -> Self::IterationContext {
         let child_component_id = benchmark_context
             .deps
+            .admin()
+            .await
             .component("child_component")
             .unique()
             .store()
             .await;
         let component_id = benchmark_context
             .deps
+            .admin()
+            .await
             .component("parent_component_composed")
             .unique()
             .store()
@@ -127,11 +131,14 @@ impl Benchmark for Rpc {
 
             benchmark_context
                 .deps
+                .admin()
+                .await
                 .start_worker_with(
                     &parent_worker_id.component_id,
                     &parent_worker_id.worker_name,
                     vec![],
                     env,
+                    vec![],
                 )
                 .await
                 .expect("Failed to start parent worker");
@@ -206,11 +213,15 @@ impl Benchmark for Rpc {
         for worker_id in &context.worker_ids {
             benchmark_context
                 .deps
+                .admin()
+                .await
                 .delete_worker(&worker_id.parent)
                 .await
                 .expect("Failed to delete parent worker");
             benchmark_context
                 .deps
+                .admin()
+                .await
                 .delete_worker(&worker_id.child)
                 .await
                 .expect("Failed to delete child worker");
@@ -245,7 +256,7 @@ impl Rpc {
             let _ = fibers.spawn(async move {
                 for _ in 0..length {
                     let result = invoke_and_await(
-                        &context_clone.deps,
+                        &context_clone.deps.admin().await,
                         &worker_id_clone,
                         &function_clone,
                         params_clone.clone(),

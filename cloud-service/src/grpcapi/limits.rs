@@ -1,27 +1,41 @@
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::auth::AccountAuthorisation;
 use crate::grpcapi::get_authorisation_token;
 use crate::service::auth::{AuthService, AuthServiceError};
 use crate::service::plan_limit::{PlanLimitError, PlanLimitService};
-use cloud_api_grpc::proto::golem::cloud::limit::v1::cloud_limits_service_server::CloudLimitsService;
-use cloud_api_grpc::proto::golem::cloud::limit::v1::{
+use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody, ResourceLimits};
+use golem_api_grpc::proto::golem::limit::v1::cloud_limits_service_server::CloudLimitsService;
+use golem_api_grpc::proto::golem::limit::v1::{
     batch_update_resource_limits_response, get_resource_limits_response, limits_error,
     update_component_limit_response, update_worker_limit_response,
     BatchUpdateResourceLimitsRequest, BatchUpdateResourceLimitsResponse, GetResourceLimitsRequest,
     GetResourceLimitsResponse, LimitsError, UpdateComponentLimitRequest,
     UpdateComponentLimitResponse, UpdateWorkerLimitRequest, UpdateWorkerLimitResponse,
 };
-use golem_api_grpc::proto::golem::common::{Empty, ErrorBody, ErrorsBody, ResourceLimits};
 use golem_common::grpc::{
     proto_account_id_string, proto_component_id_string, proto_worker_id_string,
 };
 use golem_common::metrics::api::TraceErrorKind;
+use golem_common::model::auth::AccountAction;
 use golem_common::model::AccountId;
 use golem_common::recorded_grpc_api_request;
 use golem_common::SafeDisplay;
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -131,9 +145,13 @@ impl LimitsGrpcApi {
                     })),
                 })?;
 
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::ViewLimits)
+            .await?;
+
         let limits = self
             .plan_limit_service
-            .get_resource_limits(&account_id, &auth)
+            .get_resource_limits(&account_id)
             .await?;
 
         Ok(limits.into())
@@ -152,8 +170,14 @@ impl LimitsGrpcApi {
             }
         }
 
+        for account_id in updates.keys() {
+            self.auth_service
+                .authorize_account_action(&auth, account_id, &AccountAction::UpdateLimits)
+                .await?;
+        }
+
         self.plan_limit_service
-            .record_fuel_consumption(updates, &auth)
+            .record_fuel_consumption(updates)
             .await?;
 
         Ok(())
@@ -170,8 +194,12 @@ impl LimitsGrpcApi {
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
 
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::UpdateLimits)
+            .await?;
+
         self.plan_limit_service
-            .update_worker_limit(&account_id, request.value, &auth)
+            .update_worker_limit(&account_id, request.value)
             .await?;
 
         Ok(())
@@ -188,8 +216,12 @@ impl LimitsGrpcApi {
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
 
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::UpdateLimits)
+            .await?;
+
         self.plan_limit_service
-            .update_worker_connection_limit(&account_id, request.value, &auth)
+            .update_worker_connection_limit(&account_id, request.value)
             .await?;
 
         Ok(())
@@ -206,8 +238,12 @@ impl LimitsGrpcApi {
             .map(|id| id.into())
             .ok_or_else(|| bad_request_error("Missing account id"))?;
 
+        self.auth_service
+            .authorize_account_action(&auth, &account_id, &AccountAction::UpdateLimits)
+            .await?;
+
         self.plan_limit_service
-            .update_component_limit(&account_id, request.count, request.size, &auth)
+            .update_component_limit(&account_id, request.count, request.size)
             .await?;
 
         Ok(())

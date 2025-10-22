@@ -96,8 +96,8 @@ impl SqliteKeyValueStorage {
             KeyValueStorageNamespace::Worker => "worker".to_string(),
             KeyValueStorageNamespace::Promise => "promise".to_string(),
             KeyValueStorageNamespace::Schedule => "schedule".to_string(),
-            KeyValueStorageNamespace::UserDefined { account_id, bucket } => {
-                format!("user-defined:{}:{}", account_id, bucket)
+            KeyValueStorageNamespace::UserDefined { project_id, bucket } => {
+                format!("user-defined:{project_id}:{bucket}")
             }
         }
     }
@@ -220,8 +220,7 @@ impl KeyValueStorage for SqliteKeyValueStorage {
         let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
         let statement = format!(
-            "SELECT key, value FROM kv_storage WHERE key IN ({}) AND namespace = ?;",
-            placeholders
+            "SELECT key, value FROM kv_storage WHERE key IN ({placeholders}) AND namespace = ?;"
         );
         let mut query = sqlx::query_as(&statement);
 

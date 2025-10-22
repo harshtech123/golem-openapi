@@ -16,8 +16,8 @@ fn main() {
 
     println!("Starting code generation for Golem OpenAPI client.");
 
-    println!("Output directory: {:?}", out_dir);
-    println!("Workspace OpenAPI file: {:?}", root_yaml_path);
+    println!("Output directory: {out_dir:?}");
+    println!("Workspace OpenAPI file: {root_yaml_path:?}");
 
     if root_yaml_path.exists() {
         // Copying the file to the crate so it gets packaged
@@ -36,8 +36,16 @@ fn generate(yaml_path: PathBuf, out_dir: OsString) {
         false,
         true,
         &[
-            ("AnalysedExport", "golem_wasm_ast::analysis::AnalysedExport"),
-            ("AnalysedType", "golem_wasm_ast::analysis::AnalysedType"),
+            ("AgentType", "golem_common::model::agent::AgentType"),
+            ("DataSchema", "golem_common::model::agent::DataSchema"),
+            ("AgentInstanceKey", "golem_common::model::AgentInstanceKey"),
+            (
+                "AgentInstanceDescription",
+                "golem_common::model::AgentInstanceDescription",
+            ),
+            ("AnalysedExport", "golem_wasm::analysis::AnalysedExport"),
+            ("AnalysedType", "golem_wasm::analysis::AnalysedType"),
+            ("PluginScope", "golem_common::model::plugin::PluginScope"),
             (
                 "ComponentMetadata",
                 "golem_common::model::component_metadata::ComponentMetadata",
@@ -47,16 +55,7 @@ fn generate(yaml_path: PathBuf, out_dir: OsString) {
                 "golem_common::model::ComponentFilePathWithPermissionsList",
             ),
             ("ComponentType", "golem_common::model::ComponentType"),
-            ("DefaultComponentOwner", "crate::DefaultComponentOwner"),
-            (
-                "DefaultPluginScope",
-                "golem_common::model::plugin::DefaultPluginScope",
-            ),
-            ("DefaultPluginOwner", "crate::DefaultPluginOwner"),
-            (
-                "OplogCursor",
-                "golem_common::model::public_oplog::OplogCursor",
-            ),
+            ("DataValue", "golem_common::model::agent::DataValue"),
             ("Empty", "golem_common::model::Empty"),
             (
                 "InitialComponentFile",
@@ -64,24 +63,58 @@ fn generate(yaml_path: PathBuf, out_dir: OsString) {
             ),
             ("ErrorBody", "golem_common::model::error::ErrorBody"),
             ("ErrorsBody", "golem_common::model::error::ErrorsBody"),
-            ("GolemError", "golem_common::model::error::GolemError"),
             (
-                "ValueAndOptionalType",
-                "golem_wasm_rpc::json::OptionallyTypeAnnotatedValueJson",
+                "ExportedResourceInstanceKey",
+                "golem_common::model::ExportedResourceInstanceKey",
             ),
+            (
+                "ExportedResourceInstanceDescription",
+                "golem_common::model::ExportedResourceInstanceDescription",
+            ),
+            ("GolemError", "golem_common::model::error::GolemError"),
             (
                 "PluginInstallationAction",
                 "golem_common::model::plugin::PluginInstallationAction",
             ),
-            ("PromiseId", "golem_common::model::PromiseId"),
-            ("ShardId", "golem_common::model::ShardId"),
             (
-                "TypeAnnotatedValue",
-                "golem_wasm_rpc::protobuf::type_annotated_value::TypeAnnotatedValue",
+                "OplogCursor",
+                "golem_common::model::public_oplog::OplogCursor",
+            ),
+            ("OplogRegion", "golem_common::model::regions::OplogRegion"),
+            (
+                "ProjectActions",
+                "golem_common::model::auth::ProjectActions",
+            ),
+            (
+                "ProjectPermission",
+                "golem_common::model::auth::ProjectPermission",
+            ),
+            ("PromiseId", "golem_common::model::PromiseId"),
+            (
+                "PublicOplogEntry",
+                "golem_common::model::public_oplog::PublicOplogEntry",
+            ),
+            (
+                "RegisteredAgentType",
+                "golem_common::model::agent::RegisteredAgentType",
+            ),
+            ("ShardId", "golem_common::model::ShardId"),
+            ("ValueAndType", "golem_wasm::ValueAndType"),
+            (
+                "ValueAndOptionalType",
+                "golem_wasm::json::OptionallyValueAndTypeJson",
+            ),
+            (
+                "WasiConfigVarsEntry",
+                "golem_common::model::worker::WasiConfigVarsEntry",
             ),
             (
                 "WasmRpcTarget",
                 "golem_common::model::component_metadata::WasmRpcTarget",
+            ),
+            (
+                "WorkerCreationRequest",
+                "golem_common::model::worker::WorkerCreationRequest",
             ),
             ("WorkerFilter", "golem_common::model::WorkerFilter"),
             ("WorkerId", "golem_common::model::WorkerId"),
@@ -89,11 +122,11 @@ fn generate(yaml_path: PathBuf, out_dir: OsString) {
                 "WorkerBindingType",
                 "golem_common::model::WorkerBindingType",
             ),
-            ("WorkerStatus", "golem_common::model::WorkerStatus"),
             (
-                "PublicOplogEntry",
-                "golem_common::model::public_oplog::PublicOplogEntry",
+                "WorkerResourceDescription",
+                "golem_common::model::WorkerResourceDescription",
             ),
+            ("WorkerStatus", "golem_common::model::WorkerStatus"),
         ],
         &["/v1/components/{component_id}/workers/{worker_name}/connect"],
     )

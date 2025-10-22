@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
 use anyhow::anyhow;
 use async_lock::Mutex;
 use futures::TryStreamExt;
-use golem_common::model::{AccountId, InitialComponentFileKey};
+use golem_common::model::{InitialComponentFileKey, ProjectId};
+use golem_service_base::error::worker_executor::WorkerExecutorError;
 use golem_service_base::service::initial_component_files::InitialComponentFilesService;
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,6 +29,7 @@ use tracing::debug;
 
 // Opaque token for read-only files. This is used to ensure that the file is not deleted while it is in use.
 // Make sure to not drop this token until you are done with the file.
+#[derive(Debug, Clone)]
 pub struct FileUseToken {
     _handle: Arc<CacheEntry>,
 }
@@ -69,14 +70,14 @@ impl FileLoader {
     /// The file will only be valid until the token is dropped.
     pub async fn get_read_only_to(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         key: &InitialComponentFileKey,
         target: &PathBuf,
-    ) -> Result<FileUseToken, GolemError> {
-        self.get_read_only_to_impl(account_id, key, target)
+    ) -> Result<FileUseToken, WorkerExecutorError> {
+        self.get_read_only_to_impl(project_id, key, target)
             .await
             .map_err(|e| {
-                GolemError::initial_file_download_failed(
+                WorkerExecutorError::initial_file_download_failed(
                     target.display().to_string(),
                     e.to_string(),
                 )
@@ -86,14 +87,14 @@ impl FileLoader {
     /// Read-write files are copied to target.
     pub async fn get_read_write_to(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         key: &InitialComponentFileKey,
         target: &PathBuf,
-    ) -> Result<(), GolemError> {
-        self.get_read_write_to_impl(account_id, key, target)
+    ) -> Result<(), WorkerExecutorError> {
+        self.get_read_write_to_impl(project_id, key, target)
             .await
             .map_err(|e| {
-                GolemError::initial_file_download_failed(
+                WorkerExecutorError::initial_file_download_failed(
                     target.display().to_string(),
                     e.to_string(),
                 )
@@ -102,7 +103,7 @@ impl FileLoader {
 
     async fn get_read_only_to_impl(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         key: &InitialComponentFileKey,
         target: &PathBuf,
     ) -> Result<FileUseToken, anyhow::Error> {
@@ -110,7 +111,7 @@ impl FileLoader {
             tokio::fs::create_dir_all(parent).await?;
         };
 
-        let cache_entry = self.get_or_add_cache_entry(account_id, key).await?;
+        let cache_entry = self.get_or_add_cache_entry(project_id, key).await?;
 
         // peek at the cache entry. It's fine to not hold the lock here.
         // as long as we keep a ref to the cache entry, the file will not be deleted
@@ -137,7 +138,7 @@ impl FileLoader {
 
     async fn get_read_write_to_impl(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         key: &InitialComponentFileKey,
         target: &PathBuf,
     ) -> Result<(), anyhow::Error> {
@@ -172,17 +173,18 @@ impl FileLoader {
                     target.display()
                 );
                 tokio::fs::copy(&cache_entry_path, target).await?;
+                return Ok(());
             }
         }
 
         // alternative, download the file directly to the target
-        self.download_file_to_path(account_id, target, key).await?;
+        self.download_file_to_path(project_id, target, key).await?;
         Ok(())
     }
 
     async fn get_or_add_cache_entry(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         key: &InitialComponentFileKey,
     ) -> Result<Arc<CacheEntry>, anyhow::Error> {
         let cache_entry;
@@ -215,11 +217,11 @@ impl FileLoader {
 
                 let counter = self
                     .item_counter
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let path = self.cache_dir.path().join(counter.to_string());
 
                 match self
-                    .download_file_to_path_as_read_only(account_id, &path, key)
+                    .download_file_to_path_as_read_only(project_id, &path, key)
                     .await
                 {
                     Ok(()) => {
@@ -228,7 +230,7 @@ impl FileLoader {
                     }
                     Err(e) => {
                         // we failed to set the file to read-only, we need to fail the entry, remove it from the cache and return the error
-                        *prelocked_entry = Err(format!("Other thread failed to download: {}", e));
+                        *prelocked_entry = Err(format!("Other thread failed to download: {e}"));
                         self.cache.lock().await.remove(key);
 
                         return Err(e);
@@ -242,18 +244,18 @@ impl FileLoader {
 
     async fn download_file_to_path_as_read_only(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         path: &Path,
         key: &InitialComponentFileKey,
     ) -> Result<(), anyhow::Error> {
-        self.download_file_to_path(account_id, path, key).await?;
+        self.download_file_to_path(project_id, path, key).await?;
         self.set_path_read_only(path).await?;
         Ok(())
     }
 
     async fn download_file_to_path(
         &self,
-        account_id: &AccountId,
+        project_id: &ProjectId,
         path: &Path,
         key: &InitialComponentFileKey,
     ) -> Result<(), anyhow::Error> {
@@ -261,7 +263,7 @@ impl FileLoader {
 
         let mut data = self
             .initial_component_files_service
-            .get(account_id, key)
+            .get(project_id, key)
             .await
             .map_err(|e| anyhow!(e))?
             .ok_or_else(|| anyhow!("File not found"))?;
@@ -297,13 +299,14 @@ type Cache = Mutex<HashMap<InitialComponentFileKey, Weak<CacheEntry>>>;
 
 type CacheEntry = Mutex<Result<InitializedCacheEntry, String>>;
 
+#[derive(Debug)]
 struct InitializedCacheEntry {
     path: PathBuf,
 }
 
 impl Drop for InitializedCacheEntry {
     fn drop(&mut self) {
-        tracing::debug!("Removing file {}", self.path.display());
+        debug!("Removing file {}", self.path.display());
         if let Err(e) = std::fs::remove_file(&self.path) {
             tracing::error!("Failed to remove file {}: {}", self.path.display(), e);
         }

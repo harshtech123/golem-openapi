@@ -23,11 +23,11 @@ pub use inferred_type::*;
 pub use instance_type::*;
 pub use interpreter::*;
 pub use parser::type_name::TypeName;
+pub use registry::*;
 pub use text::*;
 pub use type_checker::*;
 pub use type_inference::*;
 pub use type_parameter::*;
-pub use type_registry::*;
 pub use variable_id::*;
 
 mod call_type;
@@ -40,6 +40,7 @@ mod inferred_type;
 mod instance_type;
 mod interpreter;
 mod parser;
+mod registry;
 mod rib_source_span;
 mod rib_type_error;
 mod text;
@@ -48,8 +49,34 @@ mod type_inference;
 mod type_parameter;
 mod type_parameter_parser;
 mod type_refinement;
-mod type_registry;
 mod variable_id;
+
+#[allow(clippy::large_enum_variant)]
+pub mod proto {
+    use uuid::Uuid;
+
+    tonic::include_proto!("mod");
+
+    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("services");
+
+    impl From<Uuid> for golem::rib::Uuid {
+        fn from(value: Uuid) -> Self {
+            let (high_bits, low_bits) = value.as_u64_pair();
+            golem::rib::Uuid {
+                high_bits,
+                low_bits,
+            }
+        }
+    }
+
+    impl From<golem::rib::Uuid> for Uuid {
+        fn from(value: golem::rib::Uuid) -> Self {
+            let high_bits = value.high_bits;
+            let low_bits = value.low_bits;
+            Uuid::from_u64_pair(high_bits, low_bits)
+        }
+    }
+}
 
 #[cfg(test)]
 test_r::enable!();

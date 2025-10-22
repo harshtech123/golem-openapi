@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
 use golem_common::model::{IdempotencyKey, WorkerId};
-use golem_wasm_rpc::protobuf::type_annotated_value::TypeAnnotatedValue;
+use golem_service_base::error::worker_executor::WorkerExecutorError;
+use golem_wasm::ValueAndType;
 use tokio::sync::broadcast::error::RecvError;
 
 pub struct Events {
@@ -77,10 +77,10 @@ pub enum Event {
     InvocationCompleted {
         worker_id: WorkerId,
         idempotency_key: IdempotencyKey,
-        result: Result<TypeAnnotatedValue, GolemError>,
+        result: Result<Option<ValueAndType>, WorkerExecutorError>,
     },
     WorkerLoaded {
         worker_id: WorkerId,
-        result: Result<(), GolemError>,
+        result: Result<(), WorkerExecutorError>,
     },
 }

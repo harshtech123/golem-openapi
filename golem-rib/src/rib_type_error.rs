@@ -1,3 +1,18 @@
+// Copyright 2024-2025 Golem Cloud
+//
+// Licensed under the Golem Source License v1.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://license.golem.cloud/LICENSE
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::rib_source_span::SourceSpan;
 use crate::type_checker::ExhaustivePatternMatchError;
 use crate::{
     ActualType, AmbiguousTypeError, CustomError, ExpectedType, Expr, FunctionCallError,
@@ -9,32 +24,18 @@ use std::fmt::{Debug, Display};
 
 // RibTypeError is front end of all types of errors that can occur during type inference phase
 // or type checker phase such as `UnresolvedTypesError`, `TypeMismatchError`, `AmbiguousTypeError` etc
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RibTypeError {
     pub cause: String,
-    pub expr: Expr,
-    pub immediate_parent: Option<Expr>,
+    pub expr: Option<Expr>,
     pub additional_error_details: Vec<String>,
     pub help_messages: Vec<String>,
-}
-
-impl Debug for RibTypeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self)
-    }
-}
-
-impl RibTypeError {
-    pub fn with_additional_error_detail(&self, detail: &str) -> RibTypeError {
-        let mut error = self.clone();
-        error.additional_error_details.push(detail.to_string());
-        error
-    }
+    pub source_span: SourceSpan,
 }
 
 impl Display for RibTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let span = self.expr.source_span();
+        let span = self.source_span.clone();
 
         writeln!(
             f,
@@ -43,24 +44,21 @@ impl Display for RibTypeError {
             span.start_column()
         )?;
 
-        writeln!(f, "`{}`", self.expr)?;
-
-        if let Some(parent) = &self.immediate_parent {
-            writeln!(f, "found within:")?;
-            writeln!(f, "`{}`", parent)?;
+        if let Some(expr) = &self.expr {
+            writeln!(f, "`{expr}`")?;
         }
 
         writeln!(f, "cause: {}", self.cause)?;
 
         if !self.additional_error_details.is_empty() {
             for message in &self.additional_error_details {
-                writeln!(f, "{}", message)?;
+                writeln!(f, "{message}")?;
             }
         }
 
         if !self.help_messages.is_empty() {
             for message in &self.help_messages {
-                writeln!(f, "help: {}", message)?;
+                writeln!(f, "help: {message}")?;
             }
         }
 
@@ -68,14 +66,80 @@ impl Display for RibTypeError {
     }
 }
 
-impl From<UnResolvedTypesError> for RibTypeError {
+impl RibTypeError {
+    pub fn from_rib_type_error_internal(
+        rib_type_error: RibTypeErrorInternal,
+        rib_program: Expr,
+    ) -> RibTypeError {
+        let wrong_expr = rib_program.lookup(&rib_type_error.source_span);
+
+        RibTypeError {
+            cause: rib_type_error.cause,
+            expr: wrong_expr,
+            additional_error_details: rib_type_error.additional_error_details,
+            help_messages: rib_type_error.help_messages,
+            source_span: rib_type_error.source_span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RibTypeErrorInternal {
+    pub cause: String,
+    pub source_span: SourceSpan,
+    pub additional_error_details: Vec<String>,
+    pub help_messages: Vec<String>,
+}
+
+impl RibTypeErrorInternal {
+    pub fn with_additional_error_detail(&self, detail: &str) -> RibTypeErrorInternal {
+        let mut error = self.clone();
+        error.additional_error_details.push(detail.to_string());
+        error
+    }
+
+    // expr is the original full program, to be used to look up
+    // the source span
+    pub fn printable(&self, expr: &Expr) -> String {
+        let source_span = &self.source_span;
+
+        let wrong_expr = expr.lookup(source_span);
+
+        let mut error_message = format!(
+            "error in the following rib found at line {}, column {}:\n",
+            source_span.start_line(),
+            source_span.start_column()
+        );
+
+        if let Some(wrong_expr) = wrong_expr {
+            error_message.push_str(&format!("`{wrong_expr}`\n"));
+        }
+
+        error_message.push_str(&format!("cause: {}\n", self.cause));
+
+        if !self.additional_error_details.is_empty() {
+            for message in &self.additional_error_details {
+                error_message.push_str(&format!("{message}\n"));
+            }
+        }
+
+        if !self.help_messages.is_empty() {
+            for message in &self.help_messages {
+                error_message.push_str(&format!("help: {message}\n"));
+            }
+        }
+
+        error_message
+    }
+}
+
+impl From<UnResolvedTypesError> for RibTypeErrorInternal {
     fn from(value: UnResolvedTypesError) -> Self {
-        let mut rib_compilation_error = RibTypeError {
+        let mut rib_compilation_error = RibTypeErrorInternal {
             cause: "cannot determine the type".to_string(),
-            expr: value.unresolved_expr,
-            immediate_parent: value.parent_expr,
             additional_error_details: value.additional_messages,
             help_messages: value.help_messages,
+            source_span: value.source_span,
         };
 
         if !value.path.is_empty() {
@@ -88,7 +152,7 @@ impl From<UnResolvedTypesError> for RibTypeError {
     }
 }
 
-impl From<TypeUnificationError> for RibTypeError {
+impl From<TypeUnificationError> for RibTypeErrorInternal {
     fn from(value: TypeUnificationError) -> Self {
         match value {
             TypeUnificationError::TypeMismatchError { error } => error.into(),
@@ -97,27 +161,27 @@ impl From<TypeUnificationError> for RibTypeError {
     }
 }
 
-impl From<TypeMismatchError> for RibTypeError {
+impl From<TypeMismatchError> for RibTypeErrorInternal {
     fn from(value: TypeMismatchError) -> Self {
         let expected = match value.expected_type {
             ExpectedType::AnalysedType(analysed_type) => TypeName::try_from(analysed_type)
-                .map(|x| format!("expected {}", x))
+                .map(|x| format!("expected {x}"))
                 .ok(),
-            ExpectedType::Hint(kind) => Some(format!("expected {}", kind)),
+            ExpectedType::Hint(kind) => Some(format!("expected {kind}")),
             ExpectedType::InferredType(type_name) => {
                 Some(format!("expected {}", type_name.printable()))
             }
         };
 
         let actual = match value.actual_type {
-            ActualType::Hint(type_kind) => Some(format!("found {}", type_kind)),
+            ActualType::Hint(type_kind) => Some(format!("found {type_kind}")),
             ActualType::Inferred(inferred_type) => TypeName::try_from(inferred_type)
-                .map(|x| format!("found {}", x))
+                .map(|x| format!("found {x}"))
                 .ok(),
         };
 
         let cause_suffix = match (expected, actual) {
-            (Some(expected), Some(actual)) => format!("{}, {}", expected, actual),
+            (Some(expected), Some(actual)) => format!("{expected}, {actual}"),
             (Some(expected), None) => expected.to_string(),
             _ => "".to_string(),
         };
@@ -128,30 +192,28 @@ impl From<TypeMismatchError> for RibTypeError {
                 value.field_path, cause_suffix
             )
         } else {
-            format!("type mismatch. {}", cause_suffix)
+            format!("type mismatch. {cause_suffix}")
         };
 
-        RibTypeError {
+        RibTypeErrorInternal {
             cause,
-            expr: value.expr_with_wrong_type,
-            immediate_parent: value.parent_expr,
+            source_span: value.source_span,
             additional_error_details: value.additional_error_detail,
             help_messages: vec![],
         }
     }
 }
 
-impl From<FunctionCallError> for RibTypeError {
+impl From<FunctionCallError> for RibTypeErrorInternal {
     fn from(value: FunctionCallError) -> Self {
         match value {
             FunctionCallError::InvalidFunctionCall {
                 function_name,
-                expr,
+                source_span,
                 message,
-            } => RibTypeError {
-                cause: format!("invalid function call `{}`", function_name),
-                expr,
-                immediate_parent: None,
+            } => RibTypeErrorInternal {
+                cause: format!("invalid function call `{function_name}`"),
+                source_span,
                 additional_error_details: vec![message],
                 help_messages: vec![],
             },
@@ -160,9 +222,9 @@ impl From<FunctionCallError> for RibTypeError {
                 error,
                 ..
             } => {
-                let mut original_compilation: RibTypeError = error.into();
+                let mut original_compilation: RibTypeErrorInternal = error.into();
 
-                let error_detail = format!("invalid argument to the function `{}`", function_name);
+                let error_detail = format!("invalid argument to the function `{function_name}`");
 
                 original_compilation
                     .additional_error_details
@@ -173,7 +235,7 @@ impl From<FunctionCallError> for RibTypeError {
             FunctionCallError::MissingRecordFields {
                 function_name: call_type,
                 missing_fields,
-                argument,
+                argument_source_span,
             } => {
                 let missing_fields = missing_fields
                     .iter()
@@ -181,13 +243,11 @@ impl From<FunctionCallError> for RibTypeError {
                     .collect::<Vec<String>>()
                     .join(", ");
 
-                RibTypeError {
+                RibTypeErrorInternal {
                     cause: format!(
-                        "invalid argument to the function `{}`.  missing field(s) in record: `{}`",
-                        call_type, missing_fields
+                        "invalid argument to the function `{call_type}`.  missing field(s) in record: `{missing_fields}`"
                     ),
-                    expr: argument,
-                    immediate_parent: None,
+                    source_span: argument_source_span,
                     additional_error_details: vec![],
                     help_messages: vec![],
                 }
@@ -200,50 +260,49 @@ impl From<FunctionCallError> for RibTypeError {
                 ..
             } => {
                 let expected = TypeName::try_from(expected_type.clone())
-                    .map(|t| format!("expected {}", t))
+                    .map(|t| format!("expected {t}"))
                     .unwrap_or_default();
 
-                let mut rib_compilation_error = RibTypeError::from(unresolved_error);
+                let mut rib_compilation_error = RibTypeErrorInternal::from(unresolved_error);
 
                 rib_compilation_error
                     .additional_error_details
-                    .push(format!("invalid argument to `{}`. {}", call_type, expected));
+                    .push(format!("invalid argument to `{call_type}`. {expected}"));
 
                 rib_compilation_error
             }
             FunctionCallError::InvalidResourceMethodCall {
-                invalid_lhs,
+                invalid_lhs_source_span,
                 resource_method_name: function_call_name,
-            } => RibTypeError {
-                cause: format!("invalid resource method call: `{}`", function_call_name),
-                expr: invalid_lhs,
-                immediate_parent: None,
+            } => RibTypeErrorInternal {
+                cause: format!("invalid resource method call: `{function_call_name}`"),
+                source_span: invalid_lhs_source_span,
                 additional_error_details: vec![],
                 help_messages: vec![],
             },
             FunctionCallError::InvalidGenericTypeParameter {
                 generic_type_parameter,
                 message,
-            } => RibTypeError {
-                cause: "invalid type parameter".to_string(),
-                expr: Expr::literal(generic_type_parameter),
-                immediate_parent: None,
+                source_span,
+            } => RibTypeErrorInternal {
+                cause: format!(
+                    "invalid generic type parameter: `{generic_type_parameter}`"
+                ),
+                source_span,
                 additional_error_details: vec![message],
                 help_messages: vec![],
             },
 
             FunctionCallError::ArgumentSizeMisMatch {
                 function_name,
-                expr,
+                source_span: argument_source_span,
                 expected,
                 provided,
-            } => RibTypeError {
+            } => RibTypeErrorInternal {
                 cause: format!(
-                    "invalid argument size for function `{}`. expected {} arguments, found {}",
-                    function_name, expected, provided
+                    "invalid argument size for function `{function_name}`. expected {expected} arguments, found {provided}"
                 ),
-                expr,
-                immediate_parent: None,
+                source_span: argument_source_span,
                 additional_error_details: vec![],
                 help_messages: vec![],
             },
@@ -251,23 +310,28 @@ impl From<FunctionCallError> for RibTypeError {
     }
 }
 
-impl From<InvalidWorkerName> for RibTypeError {
+impl From<InvalidWorkerName> for RibTypeErrorInternal {
     fn from(value: InvalidWorkerName) -> Self {
-        RibTypeError {
+        RibTypeErrorInternal {
             cause: value.message,
-            expr: value.worker_name_expr,
-            immediate_parent: None,
+            source_span: value.worker_name_source_span,
             additional_error_details: vec![],
             help_messages: vec![],
         }
     }
 }
 
-impl From<ExhaustivePatternMatchError> for RibTypeError {
+impl From<ExhaustivePatternMatchError> for RibTypeErrorInternal {
     fn from(value: ExhaustivePatternMatchError) -> Self {
-        let expr = match &value {
-            ExhaustivePatternMatchError::MissingConstructors { predicate, .. }
-            | ExhaustivePatternMatchError::DeadCode { predicate, .. } => predicate.clone(),
+        let source_span = match &value {
+            ExhaustivePatternMatchError::MissingConstructors {
+                predicate_source_span,
+                ..
+            }
+            | ExhaustivePatternMatchError::DeadCode {
+                predicate_source_span,
+                ..
+            } => predicate_source_span.clone(),
         };
 
         let cause = match value {
@@ -285,14 +349,13 @@ impl From<ExhaustivePatternMatchError> for RibTypeError {
                 cause,
                 ..
             } => {
-                format!("dead code detected, pattern `{}` is unreachable due to the existence of the pattern `{}` prior to it", dead_pattern, cause)
+                format!("dead code detected, pattern `{dead_pattern}` is unreachable due to the existence of the pattern `{cause}` prior to it")
             }
         };
 
-        RibTypeError {
+        RibTypeErrorInternal {
             cause,
-            expr,
-            immediate_parent: None,
+            source_span,
             additional_error_details: vec![],
             help_messages: vec![
                 "to ensure a complete match, add missing patterns or use wildcard (`_`)"
@@ -302,46 +365,44 @@ impl From<ExhaustivePatternMatchError> for RibTypeError {
     }
 }
 
-impl From<AmbiguousTypeError> for RibTypeError {
+impl From<AmbiguousTypeError> for RibTypeErrorInternal {
     fn from(value: AmbiguousTypeError) -> Self {
         let cause = format!(
             "ambiguous types: {}",
             value
                 .ambiguous_types
                 .iter()
-                .map(|t| format!("`{}`", t))
+                .map(|t| format!("`{t}`"))
                 .collect::<Vec<String>>()
                 .join(", ")
         );
 
-        RibTypeError {
+        RibTypeErrorInternal {
             cause,
-            expr: value.expr,
-            immediate_parent: None,
+            source_span: value.ambiguous_expr_source_span,
             additional_error_details: value.additional_error_details,
             help_messages: vec![],
         }
     }
 }
 
-impl From<InvalidPatternMatchError> for RibTypeError {
+impl From<InvalidPatternMatchError> for RibTypeErrorInternal {
     fn from(value: InvalidPatternMatchError) -> Self {
-        let (cause, expr) = match &value {
+        let (cause, source_span) = match &value {
             InvalidPatternMatchError::ConstructorMismatch {
-                predicate_expr,
+                match_expr_source_span,
                 constructor_name,
                 ..
             } => {
                 (
                     format!(
-                        "invalid pattern match: cannot match to constructor `{}`",
-                        constructor_name
+                        "invalid pattern match: cannot match to constructor `{constructor_name}`"
                     ),
-                    predicate_expr,
+                    match_expr_source_span,
                 )
             }
             InvalidPatternMatchError::ArgSizeMismatch {
-                predicate_expr,
+                match_expr_source_span,
                 expected_arg_size,
                 actual_arg_size,
                 constructor_name,
@@ -349,35 +410,27 @@ impl From<InvalidPatternMatchError> for RibTypeError {
             } => {
                 (
                     format!(
-                        "invalid pattern match: missing arguments in constructor `{}`. expected {} arguments, found {}",
-                        constructor_name, expected_arg_size, actual_arg_size
+                        "invalid pattern match: missing arguments in constructor `{constructor_name}`. expected {expected_arg_size} arguments, found {actual_arg_size}"
                     ),
-                    predicate_expr,
+                    match_expr_source_span,
                 )
             }
         };
 
-        let immediate_parent = match &value {
-            InvalidPatternMatchError::ConstructorMismatch { match_expr, .. } => Some(match_expr),
-            InvalidPatternMatchError::ArgSizeMismatch { match_expr, .. } => Some(match_expr),
-        };
-
-        RibTypeError {
+        RibTypeErrorInternal {
             cause,
-            expr: expr.clone(),
-            immediate_parent: immediate_parent.cloned(),
+            source_span: source_span.clone(),
             additional_error_details: vec![],
             help_messages: vec![],
         }
     }
 }
 
-impl From<CustomError> for RibTypeError {
+impl From<CustomError> for RibTypeErrorInternal {
     fn from(value: CustomError) -> Self {
-        RibTypeError {
+        RibTypeErrorInternal {
             cause: value.message,
-            expr: value.expr,
-            immediate_parent: None,
+            source_span: value.source_span,
             additional_error_details: vec![],
             help_messages: value.help_message,
         }

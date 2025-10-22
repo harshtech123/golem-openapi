@@ -11,20 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 use test_r::test;
 
 use crate::Tracing;
 use anyhow::anyhow;
 use async_trait::async_trait;
-use golem_common::model::{ComponentId, TargetWorkerId};
+use golem_common::model::{ComponentId, WorkerId};
 use golem_rib_repl::{ComponentSource, RibRepl};
-use golem_rib_repl::{ReplDependencies, RibComponentMetadata, RibDependencyManager};
+use golem_rib_repl::{ReplComponentDependencies, RibDependencyManager};
 use golem_rib_repl::{RibReplConfig, WorkerFunctionInvoke};
 use golem_test_framework::config::{EnvBasedTestDependencies, TestDependencies};
 use golem_test_framework::dsl::TestDslUnsafe;
-use golem_wasm_ast::analysis::analysed_type::{f32, field, list, record, str, u32};
-use golem_wasm_rpc::{Value, ValueAndType};
-use rib::RibResult;
+use golem_wasm::analysis::analysed_type::{f32, field, list, record, str, u32};
+use golem_wasm::analysis::AnalysedType;
+use golem_wasm::{Value, ValueAndType};
+use rib::{ComponentDependency, ComponentDependencyKey, RibResult};
 use std::path::Path;
 use std::sync::Arc;
 use test_r::inherit_test_dep;
@@ -36,6 +38,28 @@ inherit_test_dep!(EnvBasedTestDependencies);
 #[test]
 #[tracing::instrument]
 async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
+    test_repl_invoking_functions(deps, Some("worker-repl-simple-test")).await;
+}
+
+#[test]
+#[tracing::instrument]
+async fn test_rib_repl_without_worker_param(deps: &EnvBasedTestDependencies) {
+    test_repl_invoking_functions(deps, None).await;
+}
+
+#[test]
+#[tracing::instrument]
+async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
+    test_repl_invoking_resource_methods(deps, Some("worker-repl-resource-test")).await;
+}
+
+#[test]
+#[tracing::instrument]
+async fn test_rib_repl_with_resource_without_param(deps: &EnvBasedTestDependencies) {
+    test_repl_invoking_resource_methods(deps, None).await;
+}
+
+async fn test_repl_invoking_functions(deps: &EnvBasedTestDependencies, worker_name: Option<&str>) {
     let mut rib_repl = RibRepl::bootstrap(RibReplConfig {
         history_file: None,
         dependency_manager: Arc::new(TestRibReplDependencyManager::new(deps.clone())),
@@ -51,9 +75,10 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
     .await
     .expect("Failed to bootstrap REPL");
 
-    let rib1 = r#"
-      let worker = instance("my_worker")
-    "#;
+    let rib1 = match worker_name {
+        Some(name) => format!(r#"let worker = instance("{name}")"#),
+        None => r#"let worker = instance()"#.to_string(),
+    };
 
     let rib2 = r#"
       let result = worker.add(1, 2)
@@ -77,7 +102,7 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
      "#;
 
     let result = rib_repl
-        .execute(rib1)
+        .execute(&rib1)
         .await
         .expect("Failed to process command");
 
@@ -97,12 +122,16 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
         result,
         Some(RibResult::Val(ValueAndType::new(
             Value::List(vec![]),
-            list(record(vec![
-                field("product-id", str()),
-                field("name", str()),
-                field("price", f32()),
-                field("quantity", u32()),
-            ],),),
+            list(
+                record(vec![
+                    field("product-id", str()),
+                    field("name", str()),
+                    field("price", f32()),
+                    field("quantity", u32()),
+                ])
+                .named("product-item")
+                .owned("golem:it/api")
+            ),
         )))
     );
 
@@ -129,19 +158,24 @@ async fn test_rib_repl(deps: &EnvBasedTestDependencies) {
                 Value::F32(10.0),
                 Value::U32(2),
             ])]),
-            list(record(vec![
-                field("product-id", str()),
-                field("name", str()),
-                field("price", f32()),
-                field("quantity", u32()),
-            ],)),
+            list(
+                record(vec![
+                    field("product-id", str()),
+                    field("name", str()),
+                    field("price", f32()),
+                    field("quantity", u32()),
+                ])
+                .named("product-item")
+                .owned("golem:it/api")
+            ),
         )))
     );
 }
 
-#[test]
-#[tracing::instrument]
-async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
+async fn test_repl_invoking_resource_methods(
+    deps: &EnvBasedTestDependencies,
+    worker_name: Option<&str>,
+) {
     let mut rib_repl = RibRepl::bootstrap(RibReplConfig {
         history_file: None,
         dependency_manager: Arc::new(TestRibReplDependencyManager::new(deps.clone())),
@@ -159,9 +193,10 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
     .await
     .expect("Failed to bootstrap REPL");
 
-    let rib1 = r#"
-      let worker = instance("my_worker")
-    "#;
+    let rib1 = match worker_name {
+        Some(name) => format!(r#"let worker = instance("{name}")"#),
+        None => r#"let worker = instance()"#.to_string(),
+    };
 
     let rib2 = r#"
       let resource = worker.cart("foo")
@@ -185,7 +220,7 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
      "#;
 
     let result = rib_repl
-        .execute(rib1)
+        .execute(&rib1)
         .await
         .expect("Failed to process command");
 
@@ -208,12 +243,16 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
         result,
         Some(RibResult::Val(ValueAndType::new(
             Value::List(vec![]),
-            list(record(vec![
-                field("product-id", str()),
-                field("name", str()),
-                field("price", f32()),
-                field("quantity", u32()),
-            ],),),
+            list(
+                record(vec![
+                    field("product-id", str()),
+                    field("name", str()),
+                    field("price", f32()),
+                    field("quantity", u32()),
+                ])
+                .named("product-item")
+                .owned("golem:it/api")
+            ),
         )))
     );
 
@@ -240,14 +279,18 @@ async fn test_rib_repl_with_resource(deps: &EnvBasedTestDependencies) {
                 Value::F32(10.0),
                 Value::U32(2),
             ])]),
-            list(record(vec![
-                field("product-id", str()),
-                field("name", str()),
-                field("price", f32()),
-                field("quantity", u32()),
-            ],)),
+            list(
+                record(vec![
+                    field("product-id", str()),
+                    field("name", str()),
+                    field("price", f32()),
+                    field("quantity", u32()),
+                ])
+                .named("product-item")
+                .owned("golem:it/api")
+            ),
         )))
-    );
+    )
 }
 
 struct TestRibReplDependencyManager {
@@ -262,7 +305,7 @@ impl TestRibReplDependencyManager {
 
 #[async_trait]
 impl RibDependencyManager for TestRibReplDependencyManager {
-    async fn get_dependencies(&self) -> anyhow::Result<ReplDependencies> {
+    async fn get_dependencies(&self) -> anyhow::Result<ReplComponentDependencies> {
         Err(anyhow!(
             "test will need to run with a single component".to_string()
         ))
@@ -272,23 +315,34 @@ impl RibDependencyManager for TestRibReplDependencyManager {
         &self,
         _source_path: &Path,
         component_name: String,
-    ) -> anyhow::Result<RibComponentMetadata> {
+    ) -> anyhow::Result<ComponentDependency> {
         let component_id = self
             .dependencies
+            .admin()
+            .await
             .component(component_name.as_str())
             .store()
             .await;
 
         let metadata = self
             .dependencies
+            .admin()
+            .await
             .get_latest_component_metadata(&component_id)
             .await;
 
-        Ok(RibComponentMetadata {
+        let component_dependency_key = ComponentDependencyKey {
             component_name,
             component_id: component_id.0,
-            metadata: metadata.exports,
-        })
+            component_version: 0,
+            root_package_name: metadata.root_package_name().clone(),
+            root_package_version: metadata.root_package_version().clone(),
+        };
+
+        Ok(ComponentDependency::new(
+            component_dependency_key,
+            metadata.exports().to_vec(),
+        ))
     }
 }
 
@@ -311,23 +365,26 @@ impl WorkerFunctionInvoke for TestRibReplWorkerFunctionInvoke {
         &self,
         component_id: Uuid,
         _component_name: &str,
-        worker_name: Option<String>,
+        worker_name: &str,
         function_name: &str,
         args: Vec<ValueAndType>,
-    ) -> anyhow::Result<ValueAndType> {
-        let target_worker_id = worker_name
-            .map(|w| TargetWorkerId {
-                component_id: ComponentId(component_id),
-                worker_name: Some(w),
-            })
-            .unwrap_or_else(|| TargetWorkerId {
-                component_id: ComponentId(component_id),
-                worker_name: None,
-            });
+        _return_type: Option<AnalysedType>,
+    ) -> anyhow::Result<Option<ValueAndType>> {
+        let worker_id = WorkerId {
+            component_id: ComponentId(component_id),
+            worker_name: worker_name.to_string(),
+        };
 
-        self.embedded_worker_executor
-            .invoke_and_await_typed(target_worker_id, function_name, args)
+        let result = self
+            .embedded_worker_executor
+            .admin()
             .await
-            .map_err(|e| anyhow!("Failed to invoke function: {:?}", e))
+            .invoke_and_await_typed(&worker_id, function_name, args)
+            .await;
+
+        Ok(result.map_err(|err| {
+            tracing::error!("Failed to invoke function: {:?}", err);
+            anyhow!("Failed to invoke function: {:?}", err)
+        })?)
     }
 }

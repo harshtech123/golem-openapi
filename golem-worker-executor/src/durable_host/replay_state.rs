@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::GolemError;
 use crate::services::oplog::{Oplog, OplogOps, OplogService};
 use golem_common::model::invocation_context::InvocationContextStack;
 use golem_common::model::oplog::{
     AtomicOplogIndex, LogLevel, OplogEntry, OplogIndex, PersistenceLevel,
 };
 use golem_common::model::regions::{DeletedRegions, OplogRegion};
-use golem_common::model::{IdempotencyKey, OwnedWorkerId};
-use golem_wasm_rpc::protobuf::type_annotated_value::TypeAnnotatedValue;
-use golem_wasm_rpc::Value;
+use golem_common::model::{ComponentVersion, IdempotencyKey, OwnedWorkerId};
+use golem_service_base::error::worker_executor::WorkerExecutorError;
+use golem_wasm::{Value, ValueAndType};
 use metrohash::MetroHash128;
 use std::collections::HashSet;
 use std::hash::Hasher;
@@ -30,7 +29,21 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
+pub enum ReplayEvent {
+    ReplayFinished,
+    UpdateReplayed { new_version: ComponentVersion },
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedFunctionInvoked {
+    pub function_name: String,
+    pub function_input: Vec<Value>,
+    pub idempotency_key: IdempotencyKey,
+    pub invocation_context: InvocationContextStack,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReplayState {
     owned_worker_id: OwnedWorkerId,
     oplog_service: Arc<dyn OplogService>,
@@ -38,16 +51,20 @@ pub struct ReplayState {
     replay_target: AtomicOplogIndex,
     /// The oplog index of the last replayed entry
     last_replayed_index: AtomicOplogIndex,
+    /// The oplog index of the last non-hint entry read
+    last_replayed_non_hint_index: AtomicOplogIndex,
     internal: Arc<RwLock<InternalReplayState>>,
     has_seen_logs: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct InternalReplayState {
     pub skipped_regions: DeletedRegions,
     pub next_skipped_region: Option<OplogRegion>,
     /// Hashes of log entries persisted since the last read non-hint oplog entry
     pub log_hashes: HashSet<(u64, u64)>,
+    /// Updates that were encountered while reading the oplog
+    pub pending_replay_events: Vec<ReplayEvent>,
 }
 
 impl ReplayState {
@@ -64,11 +81,13 @@ impl ReplayState {
             oplog_service,
             oplog,
             last_replayed_index: AtomicOplogIndex::from_oplog_index(OplogIndex::NONE),
+            last_replayed_non_hint_index: AtomicOplogIndex::from_oplog_index(OplogIndex::NONE),
             replay_target: AtomicOplogIndex::from_oplog_index(last_oplog_index),
             internal: Arc::new(RwLock::new(InternalReplayState {
                 skipped_regions,
                 next_skipped_region,
                 log_hashes: HashSet::new(),
+                pending_replay_events: Vec::new(),
             })),
             has_seen_logs: Arc::new(AtomicBool::new(false)),
         };
@@ -77,7 +96,10 @@ impl ReplayState {
         result
     }
 
-    pub fn switch_to_live(&mut self) {
+    pub async fn switch_to_live(&mut self) {
+        if !self.is_live() {
+            self.record_replay_event(ReplayEvent::ReplayFinished).await;
+        }
         self.last_replayed_index.set(self.replay_target.get());
     }
 
@@ -85,18 +107,16 @@ impl ReplayState {
         self.last_replayed_index.get()
     }
 
+    pub fn last_replayed_non_hint_index(&self) -> OplogIndex {
+        self.last_replayed_non_hint_index.get()
+    }
+
     pub fn replay_target(&self) -> OplogIndex {
         self.replay_target.get()
     }
 
-    pub async fn skipped_regions(&self) -> DeletedRegions {
-        let internal = self.internal.read().await;
-        internal.skipped_regions.clone()
-    }
-
-    pub async fn add_skipped_region(&mut self, region: OplogRegion) {
-        let mut internal = self.internal.write().await;
-        internal.skipped_regions.add(region);
+    pub fn set_replay_target(&mut self, new_target: OplogIndex) {
+        self.replay_target.set(new_target)
     }
 
     pub async fn is_in_skipped_region(&self, oplog_index: OplogIndex) -> bool {
@@ -112,6 +132,18 @@ impl ReplayState {
     /// Returns whether we are in replay mode where we are replaying old calls.
     pub fn is_replay(&self) -> bool {
         !self.is_live()
+    }
+
+    async fn record_replay_event(&mut self, event: ReplayEvent) {
+        self.internal
+            .write()
+            .await
+            .pending_replay_events
+            .push(event)
+    }
+
+    pub async fn take_new_replay_events(&mut self) -> Vec<ReplayEvent> {
+        std::mem::take(&mut self.internal.write().await.pending_replay_events)
     }
 
     /// Reads the next oplog entry, and skips every hint entry following it.
@@ -192,6 +224,7 @@ impl ReplayState {
 
         if condition(&entry) {
             self.skip_forward().await;
+            self.last_replayed_non_hint_index.set(read_idx);
 
             Some((read_idx, entry))
         } else {
@@ -227,7 +260,7 @@ impl ReplayState {
                         logs.insert(hash);
                     }
 
-                    // Moving the replay pointer
+                    // Moving the replay pointer. Leaving last_replayed_non_hint_index unchanged, because this is a hint entry.
                     self.last_replayed_index.set(last_read_idx);
                     // TODO: what to do with next_skipped_region if we jumped forward to end of persist-nothing zone?
                 }
@@ -284,6 +317,19 @@ impl ReplayState {
 
         let oplog_entries = self.read_oplog(read_idx, 1).await;
         let oplog_entry = oplog_entries.into_iter().next().unwrap();
+
+        // record side effects that need to be applied at the next opportunity
+        if let OplogEntry::SuccessfulUpdate { target_version, .. } = oplog_entry {
+            self.record_replay_event(ReplayEvent::UpdateReplayed {
+                new_version: target_version,
+            })
+            .await
+        }
+
+        if read_idx == self.replay_target.get() {
+            self.record_replay_event(ReplayEvent::ReplayFinished).await
+        }
+
         self.move_replay_idx(read_idx).await;
 
         oplog_entry
@@ -299,8 +345,13 @@ impl ReplayState {
         begin_idx: OplogIndex,
         check: impl Fn(&OplogEntry, OplogIndex) -> bool,
     ) -> Option<OplogIndex> {
-        self.lookup_oplog_entry_with_condition(begin_idx, check, |_, _| true)
+        match self
+            .lookup_oplog_entry_with_condition(begin_idx, check, |_, _| true)
             .await
+        {
+            OplogEntryLookupResult::Found { index, .. } => Some(index),
+            OplogEntryLookupResult::NotFound { .. } => None,
+        }
     }
 
     pub async fn lookup_oplog_entry_with_condition(
@@ -308,13 +359,32 @@ impl ReplayState {
         begin_idx: OplogIndex,
         end_check: impl Fn(&OplogEntry, OplogIndex) -> bool,
         for_all_intermediate: impl Fn(&OplogEntry, OplogIndex) -> bool,
-    ) -> Option<OplogIndex> {
+    ) -> OplogEntryLookupResult {
+        self.lookup_oplog_entry_with_condition_and_state(
+            begin_idx,
+            |entry, idx, ()| end_check(entry, idx),
+            |entry, idx, ()| for_all_intermediate(entry, idx),
+            (),
+            |_, _, ()| {},
+        )
+        .await
+    }
+
+    pub async fn lookup_oplog_entry_with_condition_and_state<State>(
+        &self,
+        begin_idx: OplogIndex,
+        end_check: impl Fn(&OplogEntry, OplogIndex, &State) -> bool,
+        for_all_intermediate: impl Fn(&OplogEntry, OplogIndex, &State) -> bool,
+        mut state: State,
+        mut update_state: impl FnMut(&OplogEntry, OplogIndex, &mut State),
+    ) -> OplogEntryLookupResult {
         let replay_target = self.replay_target.get();
         let mut start = self.last_replayed_index.get().next();
 
         const CHUNK_SIZE: u64 = 1024;
 
         let mut current_next_skip_region = self.internal.read().await.next_skipped_region.clone();
+        let mut violation = false;
 
         while start < replay_target {
             let entries = self
@@ -343,52 +413,37 @@ impl ReplayState {
                         .skipped_regions
                         .find_next_deleted_region(idx.next());
                 }
-                if end_check(entry, begin_idx) {
-                    return Some(*idx);
-                } else if !for_all_intermediate(entry, begin_idx) {
-                    return None;
+
+                update_state(entry, *idx, &mut state);
+
+                if end_check(entry, begin_idx, &state) {
+                    return OplogEntryLookupResult::Found {
+                        index: *idx,
+                        entry: Box::new(entry.clone()),
+                        violates_for_all: violation,
+                    };
+                }
+
+                if !for_all_intermediate(entry, begin_idx, &state) {
+                    violation = true;
                 }
             }
             start = start.range_end(entries.len() as u64).next();
         }
 
-        None
+        OplogEntryLookupResult::NotFound {
+            violates_for_all: violation,
+        }
     }
 
     // TODO: can we rewrite this on top of get_oplog_entry?
     pub async fn get_oplog_entry_exported_function_invoked(
         &mut self,
-    ) -> Result<Option<(String, Vec<Value>, IdempotencyKey, InvocationContextStack)>, GolemError>
-    {
+    ) -> Result<Option<ExportedFunctionInvoked>, WorkerExecutorError> {
         loop {
             if self.is_replay() {
                 let (_, oplog_entry) = self.get_oplog_entry().await;
                 match &oplog_entry {
-                    OplogEntry::ExportedFunctionInvokedV1 {
-                        function_name,
-                        idempotency_key,
-                        ..
-                    } => {
-                        let request: Vec<golem_wasm_rpc::protobuf::Val> = self
-                            .oplog
-                            .get_payload_of_entry(&oplog_entry)
-                            .await
-                            .expect("failed to deserialize function request payload")
-                            .unwrap();
-                        let request = request
-                            .into_iter()
-                            .map(|val| {
-                                val.try_into()
-                                    .expect("failed to decode serialized protobuf value")
-                            })
-                            .collect::<Vec<Value>>();
-                        break Ok(Some((
-                            function_name.to_string(),
-                            request,
-                            idempotency_key.clone(),
-                            InvocationContextStack::fresh(),
-                        )));
-                    }
                     OplogEntry::ExportedFunctionInvoked {
                         function_name,
                         idempotency_key,
@@ -397,7 +452,7 @@ impl ReplayState {
                         invocation_context: spans,
                         ..
                     } => {
-                        let request: Vec<golem_wasm_rpc::protobuf::Val> = self
+                        let request: Vec<golem_wasm::protobuf::Val> = self
                             .oplog
                             .get_payload_of_entry(&oplog_entry)
                             .await
@@ -414,18 +469,18 @@ impl ReplayState {
                         let invocation_context =
                             InvocationContextStack::from_oplog_data(trace_id, trace_state, spans);
 
-                        break Ok(Some((
-                            function_name.to_string(),
-                            request,
-                            idempotency_key.clone(),
+                        break Ok(Some(ExportedFunctionInvoked {
+                            function_name: function_name.to_string(),
+                            function_input: request,
+                            idempotency_key: idempotency_key.clone(),
                             invocation_context,
-                        )));
+                        }));
                     }
                     entry if entry.is_hint() => {}
                     _ => {
-                        break Err(GolemError::unexpected_oplog_entry(
+                        break Err(WorkerExecutorError::unexpected_oplog_entry(
                             "ExportedFunctionInvoked",
-                            format!("{:?}", oplog_entry),
+                            format!("{oplog_entry:?}"),
                         ));
                     }
                 }
@@ -438,13 +493,13 @@ impl ReplayState {
     // TODO: can we rewrite this on top of get_oplog_entry?
     pub async fn get_oplog_entry_exported_function_completed(
         &mut self,
-    ) -> Result<Option<TypeAnnotatedValue>, GolemError> {
+    ) -> Result<Option<Option<ValueAndType>>, WorkerExecutorError> {
         loop {
             if self.is_replay() {
                 let (_, oplog_entry) = self.get_oplog_entry().await;
                 match &oplog_entry {
                     OplogEntry::ExportedFunctionCompleted { .. } => {
-                        let response: TypeAnnotatedValue = self
+                        let response: Option<ValueAndType> = self
                             .oplog
                             .get_payload_of_entry(&oplog_entry)
                             .await
@@ -455,9 +510,9 @@ impl ReplayState {
                     }
                     entry if entry.is_hint() => {}
                     _ => {
-                        break Err(GolemError::unexpected_oplog_entry(
+                        break Err(WorkerExecutorError::unexpected_oplog_entry(
                             "ExportedFunctionCompleted",
-                            format!("{:?}", oplog_entry),
+                            format!("{oplog_entry:?}"),
                         ));
                     }
                 }
@@ -501,4 +556,17 @@ impl ReplayState {
             .into_values()
             .collect()
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum OplogEntryLookupResult {
+    Found {
+        index: OplogIndex,
+        entry: Box<OplogEntry>,
+        violates_for_all: bool,
+    },
+    NotFound {
+        violates_for_all: bool,
+    },
 }

@@ -19,7 +19,7 @@ pub mod sqlite;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use bytes::Bytes;
-use golem_common::model::AccountId;
+use golem_common::base_model::ProjectId;
 use golem_common::serialization::{deserialize, serialize};
 use std::fmt::Debug;
 
@@ -175,18 +175,26 @@ pub trait KeyValueStorage: Debug {
 }
 
 pub trait KeyValueStorageLabelledApi<T: KeyValueStorage + ?Sized> {
-    fn with(&self, svc_name: &'static str, api_name: &'static str) -> LabelledKeyValueStorage<T>;
+    fn with(
+        &self,
+        svc_name: &'static str,
+        api_name: &'static str,
+    ) -> LabelledKeyValueStorage<'_, T>;
 
     fn with_entity(
         &self,
         svc_name: &'static str,
         api_name: &'static str,
         entity_name: &'static str,
-    ) -> LabelledEntityKeyValueStorage<T>;
+    ) -> LabelledEntityKeyValueStorage<'_, T>;
 }
 
 impl<T: ?Sized + KeyValueStorage> KeyValueStorageLabelledApi<T> for T {
-    fn with(&self, svc_name: &'static str, api_name: &'static str) -> LabelledKeyValueStorage<T> {
+    fn with(
+        &self,
+        svc_name: &'static str,
+        api_name: &'static str,
+    ) -> LabelledKeyValueStorage<'_, T> {
         LabelledKeyValueStorage::new(svc_name, api_name, self)
     }
     fn with_entity(
@@ -194,7 +202,7 @@ impl<T: ?Sized + KeyValueStorage> KeyValueStorageLabelledApi<T> for T {
         svc_name: &'static str,
         api_name: &'static str,
         entity_name: &'static str,
-    ) -> LabelledEntityKeyValueStorage<T> {
+    ) -> LabelledEntityKeyValueStorage<'_, T> {
         LabelledEntityKeyValueStorage::new(svc_name, api_name, entity_name, self)
     }
 }
@@ -366,11 +374,22 @@ impl<'a, S: ?Sized + KeyValueStorage> LabelledEntityKeyValueStorage<'a, S> {
             .await
     }
 
-    pub async fn get<V: Decode>(
+    pub async fn get<V: Decode<()>>(
         &self,
         namespace: KeyValueStorageNamespace,
         key: &str,
     ) -> Result<Option<V>, String> {
+        match self.get_attempt_deserialize(namespace, key).await? {
+            Some(inner) => Ok(Some(inner?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_attempt_deserialize<V: Decode<()>>(
+        &self,
+        namespace: KeyValueStorageNamespace,
+        key: &str,
+    ) -> Result<Option<Result<V, String>>, String> {
         let maybe_bytes = self
             .storage
             .get(
@@ -382,7 +401,7 @@ impl<'a, S: ?Sized + KeyValueStorage> LabelledEntityKeyValueStorage<'a, S> {
             )
             .await?;
         if let Some(bytes) = maybe_bytes {
-            let value: V = deserialize(&bytes)?;
+            let value: Result<V, String> = deserialize(&bytes);
             Ok(Some(value))
         } else {
             Ok(None)
@@ -405,7 +424,7 @@ impl<'a, S: ?Sized + KeyValueStorage> LabelledEntityKeyValueStorage<'a, S> {
             .await
     }
 
-    pub async fn get_many<V: Decode>(
+    pub async fn get_many<V: Decode<()>>(
         &self,
         namespace: KeyValueStorageNamespace,
         keys: Vec<String>,
@@ -486,7 +505,7 @@ impl<'a, S: ?Sized + KeyValueStorage> LabelledEntityKeyValueStorage<'a, S> {
             .await
     }
 
-    pub async fn members_of_set<V: Decode>(
+    pub async fn members_of_set<V: Decode<()>>(
         &self,
         namespace: KeyValueStorageNamespace,
         key: &str,
@@ -549,7 +568,7 @@ impl<'a, S: ?Sized + KeyValueStorage> LabelledEntityKeyValueStorage<'a, S> {
             .await
     }
 
-    pub async fn get_sorted_set<V: Decode>(
+    pub async fn get_sorted_set<V: Decode<()>>(
         &self,
         namespace: KeyValueStorageNamespace,
         key: &str,
@@ -572,7 +591,7 @@ impl<'a, S: ?Sized + KeyValueStorage> LabelledEntityKeyValueStorage<'a, S> {
         Ok(values)
     }
 
-    pub async fn query_sorted_set<V: Decode>(
+    pub async fn query_sorted_set<V: Decode<()>>(
         &self,
         namespace: KeyValueStorageNamespace,
         key: &str,
@@ -606,7 +625,7 @@ pub enum KeyValueStorageNamespace {
     Promise,
     Schedule,
     UserDefined {
-        account_id: AccountId,
+        project_id: ProjectId,
         bucket: String,
     },
 }
