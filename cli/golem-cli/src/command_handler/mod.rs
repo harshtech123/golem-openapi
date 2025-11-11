@@ -19,6 +19,7 @@ use crate::command::{
     GolemCliCommand, GolemCliCommandParseResult, GolemCliFallbackCommand, GolemCliGlobalFlags,
     GolemCliSubcommand,
 };
+use crate::command::serve::ServeSubcommand;
 use crate::command_handler::api::cloud::certificate::ApiCloudCertificateCommandHandler;
 use crate::command_handler::api::cloud::domain::ApiCloudDomainCommandHandler;
 use crate::command_handler::api::cloud::ApiCloudCommandHandler;
@@ -363,6 +364,33 @@ impl<Hooks: CommandHandlerHooks + 'static> CommandHandler<Hooks> {
                     .await
             }
             GolemCliSubcommand::Completion { shell } => self.cmd_completion(shell),
+            GolemCliSubcommand::Serve { subcommand } => self.cmd_serve(subcommand).await,
+        }
+    }
+
+    async fn cmd_serve(&self, subcommand: ServeSubcommand) -> anyhow::Result<()> {
+        match subcommand {
+            ServeSubcommand::Run { args } => {
+                use crate::log::log_action;
+                let port = args.port();
+                log_action("Starting", &format!("MCP Server at port {}", port));
+                
+                // TODO: Implement actual MCP server logic here
+                println!("golem running MCP Server at port {}", port);
+                
+                // Keep the server running
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+            ServeSubcommand::Stop { } => {
+                use crate::log::log_action;
+                log_action("Stopping", "MCP Server");
+
+                // TODO: Implement actual MCP server logic here
+                println!("golem stopping MCP Server");
+                Ok(())
+            }
         }
     }
 

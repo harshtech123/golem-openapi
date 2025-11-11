@@ -18,6 +18,7 @@ use crate::command::cloud::CloudSubcommand;
 use crate::command::component::ComponentSubcommand;
 use crate::command::plugin::PluginSubcommand;
 use crate::command::profile::ProfileSubcommand;
+use crate::command::serve::ServeSubcommand;
 use crate::command::worker::AgentSubcommand;
 use crate::config::{BuildProfileName, ProfileName};
 use crate::log::LogColorize;
@@ -601,6 +602,11 @@ pub enum GolemCliSubcommand {
     Completion {
         /// Selects shell
         shell: clap_complete::Shell,
+    },
+    /// Start MCP (Model Context Protocol) server
+    Serve {
+        #[clap(subcommand)]
+        subcommand: ServeSubcommand,
     },
 }
 
@@ -1960,6 +1966,34 @@ pub mod server {
         },
         /// Clean the local server data directory
         Clean,
+    }
+}
+
+pub mod serve {
+    use clap::{Args, Subcommand};
+
+    #[derive(Debug, Args, Default)]
+    pub struct ServeArgs {
+        /// Port to run the MCP server on
+        #[clap(long, default_value = "3000")]
+        pub port: u16,
+    }
+
+    impl ServeArgs {
+        pub fn port(&self) -> u16 {
+            self.port
+        }
+    }
+
+    #[derive(Debug, Subcommand)]
+    pub enum ServeSubcommand {
+        /// Run MCP server
+        Run {
+            #[clap(flatten)]
+            args: ServeArgs,
+        },
+        /// Stop MCP server
+        Stop,
     }
 }
 
