@@ -23,20 +23,21 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use golem_common::config::RedisConfig;
-use golem_common::model::oplog::{LogLevel, SpanData, WorkerError};
+use golem_common::model::agent::AgentMode;
+use golem_common::model::oplog::{LogLevel, WorkerError};
 use golem_common::model::regions::OplogRegion;
-use golem_common::model::{AccountId, ComponentId, ComponentType, WorkerStatusRecord};
+use golem_common::model::{AccountId, ComponentId, WorkerStatusRecord};
 use golem_common::redis::RedisPool;
 use golem_common::tracing::{init_tracing, TracingConfig};
 
+use super::*;
 use crate::services::oplog::compressed::CompressedOplogArchiveService;
 use crate::services::oplog::multilayer::OplogArchiveService;
 use crate::storage::indexed::memory::InMemoryIndexedStorage;
 use crate::storage::indexed::redis::RedisIndexedStorage;
 use crate::storage::indexed::IndexedStorage;
 use golem_service_base::storage::blob::memory::InMemoryBlobStorage;
-
-use super::*;
+use golem_wasm::{FromValue, FromValueAndType, IntoValue, IntoValueAndType};
 
 struct Tracing;
 
@@ -54,320 +55,6 @@ fn tracing() -> Tracing {
     Tracing::init()
 }
 
-fn rounded_ts(ts: Timestamp) -> Timestamp {
-    Timestamp::from(ts.to_millis())
-}
-
-fn rounded_span_data(invocation_context: Vec<SpanData>) -> Vec<SpanData> {
-    invocation_context
-        .into_iter()
-        .map(|span_data| match span_data {
-            SpanData::ExternalSpan { span_id } => SpanData::ExternalSpan { span_id },
-            SpanData::LocalSpan {
-                span_id,
-                start,
-                parent_id,
-                linked_context,
-                attributes,
-                inherited,
-            } => SpanData::LocalSpan {
-                span_id,
-                start: rounded_ts(start),
-                parent_id,
-                linked_context: linked_context.map(rounded_span_data),
-                attributes,
-                inherited,
-            },
-        })
-        .collect()
-}
-
-pub fn rounded(entry: OplogEntry) -> OplogEntry {
-    match entry {
-        OplogEntry::Create {
-            timestamp,
-            worker_id,
-            component_version,
-            args,
-            env,
-            wasi_config_vars,
-            project_id,
-            created_by,
-            parent,
-            component_size,
-            initial_total_linear_memory_size,
-            initial_active_plugins,
-        } => OplogEntry::Create {
-            timestamp: rounded_ts(timestamp),
-            worker_id,
-            component_version,
-            args,
-            env,
-            wasi_config_vars,
-            project_id,
-            created_by,
-            parent,
-            component_size,
-            initial_total_linear_memory_size,
-            initial_active_plugins,
-        },
-        OplogEntry::ImportedFunctionInvoked {
-            timestamp,
-            function_name,
-            request,
-            response,
-            durable_function_type,
-        } => OplogEntry::ImportedFunctionInvoked {
-            timestamp: rounded_ts(timestamp),
-            function_name,
-            request,
-            response,
-            durable_function_type,
-        },
-        OplogEntry::ExportedFunctionInvoked {
-            timestamp,
-            function_name,
-            request,
-            idempotency_key,
-            trace_id,
-            trace_states,
-            invocation_context,
-        } => OplogEntry::ExportedFunctionInvoked {
-            timestamp: rounded_ts(timestamp),
-            function_name,
-            request,
-            idempotency_key,
-            trace_id,
-            trace_states,
-            invocation_context: rounded_span_data(invocation_context),
-        },
-        OplogEntry::ExportedFunctionCompleted {
-            timestamp,
-            response,
-            consumed_fuel,
-        } => OplogEntry::ExportedFunctionCompleted {
-            timestamp: rounded_ts(timestamp),
-            response,
-            consumed_fuel,
-        },
-        OplogEntry::Suspend { timestamp } => OplogEntry::Suspend {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::NoOp { timestamp } => OplogEntry::NoOp {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::Jump { timestamp, jump } => OplogEntry::Jump {
-            timestamp: rounded_ts(timestamp),
-            jump,
-        },
-        OplogEntry::Interrupted { timestamp } => OplogEntry::Interrupted {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::Exited { timestamp } => OplogEntry::Exited {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::ChangeRetryPolicy {
-            timestamp,
-            new_policy,
-        } => OplogEntry::ChangeRetryPolicy {
-            timestamp: rounded_ts(timestamp),
-            new_policy,
-        },
-        OplogEntry::BeginAtomicRegion { timestamp } => OplogEntry::BeginAtomicRegion {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::EndAtomicRegion {
-            timestamp,
-            begin_index,
-        } => OplogEntry::EndAtomicRegion {
-            timestamp: rounded_ts(timestamp),
-            begin_index,
-        },
-        OplogEntry::BeginRemoteWrite { timestamp } => OplogEntry::BeginRemoteWrite {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::EndRemoteWrite {
-            timestamp,
-            begin_index,
-        } => OplogEntry::EndRemoteWrite {
-            timestamp: rounded_ts(timestamp),
-            begin_index,
-        },
-        OplogEntry::PendingUpdate {
-            timestamp,
-            description,
-        } => OplogEntry::PendingUpdate {
-            timestamp: rounded_ts(timestamp),
-            description,
-        },
-        OplogEntry::SuccessfulUpdate {
-            timestamp,
-            target_version,
-            new_component_size,
-            new_active_plugins,
-        } => OplogEntry::SuccessfulUpdate {
-            timestamp: rounded_ts(timestamp),
-            target_version,
-            new_component_size,
-            new_active_plugins,
-        },
-        OplogEntry::FailedUpdate {
-            timestamp,
-            target_version,
-            details,
-        } => OplogEntry::FailedUpdate {
-            timestamp: rounded_ts(timestamp),
-            target_version,
-            details,
-        },
-        OplogEntry::Error {
-            timestamp,
-            error,
-            retry_from,
-        } => OplogEntry::Error {
-            timestamp: rounded_ts(timestamp),
-            error,
-            retry_from,
-        },
-        OplogEntry::PendingWorkerInvocation {
-            timestamp,
-            invocation,
-        } => OplogEntry::PendingWorkerInvocation {
-            timestamp: rounded_ts(timestamp),
-            invocation,
-        },
-        OplogEntry::GrowMemory { timestamp, delta } => OplogEntry::GrowMemory {
-            timestamp: rounded_ts(timestamp),
-            delta,
-        },
-        OplogEntry::CreateResource {
-            timestamp,
-            id,
-            resource_type_id,
-        } => OplogEntry::CreateResource {
-            timestamp: rounded_ts(timestamp),
-            id,
-            resource_type_id,
-        },
-        OplogEntry::DropResource {
-            timestamp,
-            id,
-            resource_type_id,
-        } => OplogEntry::DropResource {
-            timestamp: rounded_ts(timestamp),
-            id,
-            resource_type_id,
-        },
-        OplogEntry::Log {
-            timestamp,
-            level,
-            context,
-            message,
-        } => OplogEntry::Log {
-            timestamp: rounded_ts(timestamp),
-            level,
-            context,
-            message,
-        },
-        OplogEntry::Restart { timestamp } => OplogEntry::Restart {
-            timestamp: rounded_ts(timestamp),
-        },
-        OplogEntry::ActivatePlugin { timestamp, plugin } => OplogEntry::ActivatePlugin {
-            timestamp: rounded_ts(timestamp),
-            plugin,
-        },
-        OplogEntry::DeactivatePlugin { timestamp, plugin } => OplogEntry::DeactivatePlugin {
-            timestamp: rounded_ts(timestamp),
-            plugin,
-        },
-        OplogEntry::Revert {
-            timestamp,
-            dropped_region,
-        } => OplogEntry::Revert {
-            timestamp: rounded_ts(timestamp),
-            dropped_region,
-        },
-        OplogEntry::CancelPendingInvocation {
-            timestamp,
-            idempotency_key,
-        } => OplogEntry::CancelPendingInvocation {
-            timestamp: rounded_ts(timestamp),
-            idempotency_key,
-        },
-        OplogEntry::StartSpan {
-            timestamp,
-            span_id,
-            parent_id,
-            linked_context_id,
-            attributes,
-        } => OplogEntry::StartSpan {
-            timestamp: rounded_ts(timestamp),
-            span_id,
-            parent_id,
-            linked_context_id,
-            attributes,
-        },
-        OplogEntry::FinishSpan { timestamp, span_id } => OplogEntry::FinishSpan {
-            timestamp: rounded_ts(timestamp),
-            span_id,
-        },
-        OplogEntry::SetSpanAttribute {
-            timestamp,
-            span_id,
-            key,
-            value,
-        } => OplogEntry::SetSpanAttribute {
-            timestamp: rounded_ts(timestamp),
-            span_id,
-            key,
-            value,
-        },
-        OplogEntry::ChangePersistenceLevel { timestamp, level } => {
-            OplogEntry::ChangePersistenceLevel {
-                timestamp: rounded_ts(timestamp),
-                level,
-            }
-        }
-        OplogEntry::BeginRemoteTransaction {
-            timestamp,
-            transaction_id,
-            original_begin_index,
-        } => OplogEntry::BeginRemoteTransaction {
-            timestamp: rounded_ts(timestamp),
-            transaction_id,
-            original_begin_index,
-        },
-        OplogEntry::PreCommitRemoteTransaction {
-            timestamp,
-            begin_index,
-        } => OplogEntry::PreCommitRemoteTransaction {
-            timestamp: rounded_ts(timestamp),
-            begin_index,
-        },
-        OplogEntry::PreRollbackRemoteTransaction {
-            timestamp,
-            begin_index,
-        } => OplogEntry::PreRollbackRemoteTransaction {
-            timestamp: rounded_ts(timestamp),
-            begin_index,
-        },
-        OplogEntry::CommittedRemoteTransaction {
-            timestamp,
-            begin_index,
-        } => OplogEntry::CommittedRemoteTransaction {
-            timestamp: rounded_ts(timestamp),
-            begin_index,
-        },
-        OplogEntry::RolledBackRemoteTransaction {
-            timestamp,
-            begin_index,
-        } => OplogEntry::RolledBackRemoteTransaction {
-            timestamp: rounded_ts(timestamp),
-            begin_index,
-        },
-    }
-}
-
 fn default_last_known_status() -> read_only_lock::tokio::ReadOnlyLock<WorkerStatusRecord> {
     read_only_lock::tokio::ReadOnlyLock::new(Arc::new(tokio::sync::RwLock::new(
         WorkerStatusRecord::default(),
@@ -375,10 +62,10 @@ fn default_last_known_status() -> read_only_lock::tokio::ReadOnlyLock<WorkerStat
 }
 
 fn default_execution_status(
-    component_type: ComponentType,
+    agent_mode: AgentMode,
 ) -> read_only_lock::std::ReadOnlyLock<ExecutionStatus> {
     read_only_lock::std::ReadOnlyLock::new(Arc::new(RwLock::new(ExecutionStatus::Suspended {
-        component_type,
+        agent_mode,
         timestamp: Timestamp::now_utc(),
     })))
 }
@@ -404,16 +91,17 @@ async fn open_add_and_read_back(_tracing: &Tracing) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
 
-    let entry1 = rounded(OplogEntry::jump(OplogRegion {
+    let entry1 = OplogEntry::jump(OplogRegion {
         start: OplogIndex::from_u64(5),
         end: OplogIndex::from_u64(12),
-    }));
-    let entry2 = rounded(OplogEntry::suspend());
-    let entry3 = rounded(OplogEntry::exited());
+    })
+    .rounded();
+    let entry2 = OplogEntry::suspend().rounded();
+    let entry3 = OplogEntry::exited().rounded();
 
     let last_oplog_idx = oplog.current_oplog_index().await;
     oplog.add(entry1.clone()).await;
@@ -436,6 +124,55 @@ async fn open_add_and_read_back(_tracing: &Tracing) {
         entries.into_values().collect::<Vec<_>>(),
         vec![entry1, entry2, entry3]
     );
+}
+
+#[test]
+async fn open_add_and_read_back_many(_tracing: &Tracing) {
+    let indexed_storage = Arc::new(InMemoryIndexedStorage::new());
+    let blob_storage = Arc::new(InMemoryBlobStorage::new());
+    let oplog_service = PrimaryOplogService::new(indexed_storage, blob_storage, 1, 1, 100).await;
+    let account_id = AccountId {
+        value: "user1".to_string(),
+    };
+    let project_id = ProjectId::new_v4();
+    let worker_id = WorkerId {
+        component_id: ComponentId(Uuid::new_v4()),
+        worker_name: "test".to_string(),
+    };
+    let owned_worker_id = OwnedWorkerId::new(&project_id, &worker_id);
+    let last_oplog_index = oplog_service.get_last_index(&owned_worker_id).await;
+    let oplog = oplog_service
+        .open(
+            &owned_worker_id,
+            last_oplog_index,
+            WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
+            default_last_known_status(),
+            default_execution_status(AgentMode::Durable),
+        )
+        .await;
+
+    let entry1 = OplogEntry::jump(OplogRegion {
+        start: OplogIndex::from_u64(5),
+        end: OplogIndex::from_u64(12),
+    })
+    .rounded();
+    let entry2 = OplogEntry::suspend().rounded();
+    let entry3 = OplogEntry::exited().rounded();
+    let entry4 = OplogEntry::interrupted().rounded();
+
+    oplog.add(entry1.clone()).await;
+    oplog.add(entry2.clone()).await;
+    oplog.add(entry3.clone()).await;
+    oplog.commit(CommitLevel::Always).await;
+    oplog.add(entry4.clone()).await; // uncommitted entry
+
+    let entries = oplog
+        .read_many(OplogIndex::INITIAL, 4)
+        .await
+        .into_values()
+        .collect::<Vec<_>>();
+
+    assert_eq!(entries, vec![entry1, entry2, entry3, entry4]);
 }
 
 #[test]
@@ -473,16 +210,17 @@ async fn open_add_and_read_back_ephemeral(_tracing: &Tracing) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Ephemeral),
+            default_execution_status(AgentMode::Ephemeral),
         )
         .await;
 
-    let entry1 = rounded(OplogEntry::jump(OplogRegion {
+    let entry1 = OplogEntry::jump(OplogRegion {
         start: OplogIndex::from_u64(5),
         end: OplogIndex::from_u64(12),
-    }));
-    let entry2 = rounded(OplogEntry::suspend());
-    let entry3 = rounded(OplogEntry::exited());
+    })
+    .rounded();
+    let entry2 = OplogEntry::suspend().rounded();
+    let entry3 = OplogEntry::exited().rounded();
 
     let last_oplog_idx = oplog.current_oplog_index().await;
     oplog.add(entry1.clone()).await;
@@ -508,6 +246,69 @@ async fn open_add_and_read_back_ephemeral(_tracing: &Tracing) {
 }
 
 #[test]
+async fn open_add_and_read_back_many_ephemeral(_tracing: &Tracing) {
+    let indexed_storage = Arc::new(InMemoryIndexedStorage::new());
+    let blob_storage = Arc::new(InMemoryBlobStorage::new());
+    let primary_oplog_service = Arc::new(
+        PrimaryOplogService::new(indexed_storage.clone(), blob_storage.clone(), 1, 1, 100).await,
+    );
+    let secondary_layer: Arc<dyn OplogArchiveService> = Arc::new(
+        CompressedOplogArchiveService::new(indexed_storage.clone(), 1),
+    );
+    let tertiary_layer: Arc<dyn OplogArchiveService> =
+        Arc::new(BlobOplogArchiveService::new(blob_storage.clone(), 2));
+    let oplog_service = Arc::new(MultiLayerOplogService::new(
+        primary_oplog_service.clone(),
+        nev![secondary_layer.clone(), tertiary_layer.clone()],
+        10,
+        10,
+    ));
+
+    let account_id = AccountId {
+        value: "user1".to_string(),
+    };
+    let project_id = ProjectId::new_v4();
+    let worker_id = WorkerId {
+        component_id: ComponentId(Uuid::new_v4()),
+        worker_name: "test".to_string(),
+    };
+    let owned_worker_id = OwnedWorkerId::new(&project_id, &worker_id);
+    let last_oplog_index = oplog_service.get_last_index(&owned_worker_id).await;
+    let oplog = oplog_service
+        .open(
+            &owned_worker_id,
+            last_oplog_index,
+            WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
+            default_last_known_status(),
+            default_execution_status(AgentMode::Ephemeral),
+        )
+        .await;
+
+    let entry1 = OplogEntry::jump(OplogRegion {
+        start: OplogIndex::from_u64(5),
+        end: OplogIndex::from_u64(12),
+    })
+    .rounded();
+    let entry2 = OplogEntry::suspend().rounded();
+    let entry3 = OplogEntry::exited().rounded();
+    let entry4 = OplogEntry::interrupted().rounded();
+
+    oplog.add(entry1.clone()).await;
+    oplog.add(entry2.clone()).await;
+    oplog.add(entry3.clone()).await;
+    oplog.commit(CommitLevel::Always).await;
+    oplog.add(entry4.clone()).await; // uncommitted
+
+    let entries = oplog
+        .read_many(OplogIndex::INITIAL, 4)
+        .await
+        .into_values()
+        .collect::<Vec<_>>();
+
+    assert_eq!(entries, vec![entry1, entry2, entry3, entry4]);
+}
+
+#[test]
 async fn entries_with_small_payload(_tracing: &Tracing) {
     let indexed_storage = Arc::new(InMemoryIndexedStorage::new());
     let blob_storage = Arc::new(InMemoryBlobStorage::new());
@@ -529,56 +330,60 @@ async fn entries_with_small_payload(_tracing: &Tracing) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
 
     let last_oplog_idx = oplog.current_oplog_index().await;
-    let entry1 = rounded(
-        oplog
-            .add_imported_function_invoked(
-                "f1".to_string(),
-                &"request".to_string(),
-                &"response".to_string(),
-                DurableFunctionType::ReadRemote,
-            )
-            .await
-            .unwrap(),
-    );
-    let entry2 = rounded(
-        oplog
-            .add_exported_function_invoked(
-                "f2".to_string(),
-                &"request".to_string(),
-                IdempotencyKey::fresh(),
-                InvocationContextStack::fresh(),
-            )
-            .await
-            .unwrap(),
-    );
-    let entry3 = rounded(
-        oplog
-            .add_exported_function_completed(&"response".to_string(), 42)
-            .await
-            .unwrap(),
-    );
+    let entry1 = oplog
+        .add_imported_function_invoked(
+            HostFunctionName::Custom("f1".to_string()),
+            &HostRequest::Custom("request".into_value_and_type()),
+            &HostResponse::Custom("response".into_value_and_type()),
+            DurableFunctionType::ReadRemote,
+        )
+        .await
+        .unwrap()
+        .rounded();
+    let entry2 = oplog
+        .add_exported_function_invoked(
+            "f2".to_string(),
+            &vec!["request".into_value()],
+            IdempotencyKey::fresh(),
+            InvocationContextStack::fresh_rounded(),
+        )
+        .await
+        .unwrap()
+        .rounded();
+    let entry3 = oplog
+        .add_exported_function_completed(&Some("response".into_value_and_type()), 42)
+        .await
+        .unwrap()
+        .rounded();
 
     let desc = oplog
-        .create_snapshot_based_update_description(11, &[1, 2, 3])
+        .create_snapshot_based_update_description(11, vec![1, 2, 3])
         .await
         .unwrap();
-    let entry4 = rounded(OplogEntry::PendingUpdate {
+    let entry4 = OplogEntry::PendingUpdate {
         timestamp: Timestamp::now_utc(),
         description: desc.clone(),
-    });
+    }
+    .rounded();
     oplog.add(entry4.clone()).await;
 
     oplog.commit(CommitLevel::Always).await;
 
-    let r1 = oplog.read(last_oplog_idx.next()).await;
-    let r2 = oplog.read(last_oplog_idx.next().next()).await;
-    let r3 = oplog.read(last_oplog_idx.next().next().next()).await;
-    let r4 = oplog.read(last_oplog_idx.next().next().next().next()).await;
+    let r1 = oplog.read(last_oplog_idx.next()).await.rounded();
+    let r2 = oplog.read(last_oplog_idx.next().next()).await.rounded();
+    let r3 = oplog
+        .read(last_oplog_idx.next().next().next())
+        .await
+        .rounded();
+    let r4 = oplog
+        .read(last_oplog_idx.next().next().next().next())
+        .await
+        .rounded();
 
     assert_eq!(r1, entry1);
     assert_eq!(r2, entry2);
@@ -589,7 +394,10 @@ async fn entries_with_small_payload(_tracing: &Tracing) {
         .read(&owned_worker_id, last_oplog_idx.next(), 4)
         .await;
     assert_eq!(
-        entries.into_values().collect::<Vec<_>>(),
+        entries
+            .into_values()
+            .map(|entry| entry.rounded())
+            .collect::<Vec<_>>(),
         vec![
             entry1.clone(),
             entry2.clone(),
@@ -598,23 +406,47 @@ async fn entries_with_small_payload(_tracing: &Tracing) {
         ]
     );
 
-    let p1 = oplog
-        .get_payload_of_entry::<String>(&entry1)
-        .await
-        .unwrap()
-        .unwrap();
-    let p2 = oplog
-        .get_payload_of_entry::<String>(&entry2)
-        .await
-        .unwrap()
-        .unwrap();
-    let p3 = oplog
-        .get_payload_of_entry::<String>(&entry3)
-        .await
-        .unwrap()
-        .unwrap();
+    let p1 = match entry1 {
+        OplogEntry::ImportedFunctionInvoked { response, .. } => {
+            let response = oplog_service
+                .download_payload(&owned_worker_id, response)
+                .await
+                .unwrap();
+            match response {
+                HostResponse::Custom(vnt) => String::from_value_and_type(vnt).unwrap(),
+                _ => panic!("unexpected entry"),
+            }
+        }
+        _ => panic!("unexpected entry"),
+    };
+    let p2 = match entry2 {
+        OplogEntry::ExportedFunctionInvoked { request, .. } => {
+            let request = oplog_service
+                .download_payload(&owned_worker_id, request)
+                .await
+                .unwrap();
+            match request.first() {
+                Some(value) => String::from_value(value.clone()).unwrap(),
+                _ => panic!("unexpected entry"),
+            }
+        }
+        _ => panic!("unexpected entry"),
+    };
+    let p3 = match entry3 {
+        OplogEntry::ExportedFunctionCompleted { response, .. } => {
+            let response = oplog_service
+                .download_payload(&owned_worker_id, response)
+                .await
+                .unwrap();
+            match response {
+                Some(vnt) => String::from_value_and_type(vnt).unwrap(),
+                _ => panic!("unexpected entry"),
+            }
+        }
+        _ => panic!("unexpected entry"),
+    };
     let p4 = oplog
-        .get_upload_description_payload(&desc)
+        .get_upload_description_payload(desc)
         .await
         .unwrap()
         .unwrap();
@@ -646,7 +478,7 @@ async fn entries_with_large_payload(_tracing: &Tracing) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
 
@@ -656,51 +488,55 @@ async fn entries_with_large_payload(_tracing: &Tracing) {
     let large_payload4 = vec![3u8; 1024 * 1024];
 
     let last_oplog_idx = oplog.current_oplog_index().await;
-    let entry1 = rounded(
-        oplog
-            .add_imported_function_invoked(
-                "f1".to_string(),
-                &"request".to_string(),
-                &large_payload1,
-                DurableFunctionType::ReadRemote,
-            )
-            .await
-            .unwrap(),
-    );
-    let entry2 = rounded(
-        oplog
-            .add_exported_function_invoked(
-                "f2".to_string(),
-                &large_payload2,
-                IdempotencyKey::fresh(),
-                InvocationContextStack::fresh(),
-            )
-            .await
-            .unwrap(),
-    );
-    let entry3 = rounded(
-        oplog
-            .add_exported_function_completed(&large_payload3, 42)
-            .await
-            .unwrap(),
-    );
+    let entry1 = oplog
+        .add_imported_function_invoked(
+            HostFunctionName::Custom("f1".to_string()),
+            &HostRequest::Custom("request".into_value_and_type()),
+            &HostResponse::Custom(large_payload1.clone().into_value_and_type()),
+            DurableFunctionType::ReadRemote,
+        )
+        .await
+        .unwrap()
+        .rounded();
+    let entry2 = oplog
+        .add_exported_function_invoked(
+            "f2".to_string(),
+            &vec![large_payload2.clone().into_value()],
+            IdempotencyKey::fresh(),
+            InvocationContextStack::fresh_rounded(),
+        )
+        .await
+        .unwrap()
+        .rounded();
+    let entry3 = oplog
+        .add_exported_function_completed(&Some(large_payload3.clone().into_value_and_type()), 42)
+        .await
+        .unwrap()
+        .rounded();
 
     let desc = oplog
-        .create_snapshot_based_update_description(11, &large_payload4)
+        .create_snapshot_based_update_description(11, large_payload4.clone())
         .await
         .unwrap();
-    let entry4 = rounded(OplogEntry::PendingUpdate {
+    let entry4 = OplogEntry::PendingUpdate {
         timestamp: Timestamp::now_utc(),
         description: desc.clone(),
-    });
+    }
+    .rounded();
     oplog.add(entry4.clone()).await;
 
     oplog.commit(CommitLevel::Always).await;
 
-    let r1 = oplog.read(last_oplog_idx.next()).await;
-    let r2 = oplog.read(last_oplog_idx.next().next()).await;
-    let r3 = oplog.read(last_oplog_idx.next().next().next()).await;
-    let r4 = oplog.read(last_oplog_idx.next().next().next().next()).await;
+    let r1 = oplog.read(last_oplog_idx.next()).await.rounded();
+    let r2 = oplog.read(last_oplog_idx.next().next()).await.rounded();
+    let r3 = oplog
+        .read(last_oplog_idx.next().next().next())
+        .await
+        .rounded();
+    let r4 = oplog
+        .read(last_oplog_idx.next().next().next().next())
+        .await
+        .rounded();
 
     assert_eq!(r1, entry1);
     assert_eq!(r2, entry2);
@@ -711,7 +547,10 @@ async fn entries_with_large_payload(_tracing: &Tracing) {
         .read(&owned_worker_id, last_oplog_idx.next(), 4)
         .await;
     assert_eq!(
-        entries.into_values().collect::<Vec<_>>(),
+        entries
+            .into_values()
+            .map(|entry| entry.rounded())
+            .collect::<Vec<_>>(),
         vec![
             entry1.clone(),
             entry2.clone(),
@@ -720,23 +559,47 @@ async fn entries_with_large_payload(_tracing: &Tracing) {
         ]
     );
 
-    let p1 = oplog
-        .get_payload_of_entry::<Vec<u8>>(&entry1)
-        .await
-        .unwrap()
-        .unwrap();
-    let p2 = oplog
-        .get_payload_of_entry::<Vec<u8>>(&entry2)
-        .await
-        .unwrap()
-        .unwrap();
-    let p3 = oplog
-        .get_payload_of_entry::<Vec<u8>>(&entry3)
-        .await
-        .unwrap()
-        .unwrap();
+    let p1 = match entry1 {
+        OplogEntry::ImportedFunctionInvoked { response, .. } => {
+            let response = oplog_service
+                .download_payload(&owned_worker_id, response)
+                .await
+                .unwrap();
+            match response {
+                HostResponse::Custom(vnt) => Vec::<u8>::from_value_and_type(vnt).unwrap(),
+                _ => panic!("unexpected entry"),
+            }
+        }
+        _ => panic!("unexpected entry"),
+    };
+    let p2 = match entry2 {
+        OplogEntry::ExportedFunctionInvoked { request, .. } => {
+            let request = oplog_service
+                .download_payload(&owned_worker_id, request)
+                .await
+                .unwrap();
+            match request.first() {
+                Some(value) => Vec::<u8>::from_value(value.clone()).unwrap(),
+                _ => panic!("unexpected entry"),
+            }
+        }
+        _ => panic!("unexpected entry"),
+    };
+    let p3 = match entry3 {
+        OplogEntry::ExportedFunctionCompleted { response, .. } => {
+            let response = oplog_service
+                .download_payload(&owned_worker_id, response)
+                .await
+                .unwrap();
+            match response {
+                Some(vnt) => Vec::<u8>::from_value_and_type(vnt).unwrap(),
+                _ => panic!("unexpected entry"),
+            }
+        }
+        _ => panic!("unexpected entry"),
+    };
     let p4 = oplog
-        .get_upload_description_payload(&desc)
+        .get_upload_description_payload(desc)
         .await
         .unwrap()
         .unwrap();
@@ -838,23 +701,22 @@ async fn multilayer_transfers_entries_after_limit_reached(
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
     let mut entries = Vec::new();
 
     for i in 0..n {
-        let entry = rounded(
-            oplog
-                .add_imported_function_invoked(
-                    "test-function".to_string(),
-                    &"request".to_string(),
-                    &i,
-                    DurableFunctionType::ReadLocal,
-                )
-                .await
-                .unwrap(),
-        );
+        let entry = oplog
+            .add_imported_function_invoked(
+                HostFunctionName::Custom("test-function".to_string()),
+                &HostRequest::Custom(i.into_value_and_type()),
+                &HostResponse::Custom("response".into_value_and_type()),
+                DurableFunctionType::ReadLocal,
+            )
+            .await
+            .unwrap()
+            .rounded();
         oplog.commit(CommitLevel::Always).await;
         entries.push(entry);
     }
@@ -867,7 +729,7 @@ async fn multilayer_transfers_entries_after_limit_reached(
                 primary_oplog_service.get_last_index(&owned_worker_id).await,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await
             .length()
@@ -893,7 +755,7 @@ async fn multilayer_transfers_entries_after_limit_reached(
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -971,18 +833,19 @@ async fn read_from_archive_impl(use_blob: bool) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
 
     let timestamp = Timestamp::now_utc();
-    let entries: Vec<OplogEntry> = (0..100)
+    let mut entries: Vec<OplogEntry> = (0..100)
         .map(|i| {
-            rounded(OplogEntry::Error {
+            OplogEntry::Error {
                 timestamp,
                 error: WorkerError::Unknown(i.to_string()),
                 retry_from: OplogIndex::NONE,
-            })
+            }
+            .rounded()
         })
         .collect();
 
@@ -992,6 +855,14 @@ async fn read_from_archive_impl(use_blob: bool) {
         oplog.add(entry.clone()).await;
     }
     oplog.commit(CommitLevel::Always).await;
+    let uncommitted1 = OplogEntry::interrupted().rounded();
+    let uncommitted2 = OplogEntry::suspend().rounded();
+    oplog.add(uncommitted1.clone()).await;
+    oplog.add(uncommitted2.clone()).await;
+
+    entries.push(uncommitted1);
+    entries.push(uncommitted2);
+
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let primary_length = primary_oplog_service
@@ -1000,7 +871,7 @@ async fn read_from_archive_impl(use_blob: bool) {
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -1015,9 +886,18 @@ async fn read_from_archive_impl(use_blob: bool) {
     let first10 = oplog_service
         .read(&owned_worker_id, initial_oplog_idx.next(), 10)
         .await;
-    let original_first10 = entries.into_iter().take(10).collect::<Vec<_>>();
+    let original_first10 = entries.iter().take(10).cloned().collect::<Vec<_>>();
 
     assert_eq!(first10.into_values().collect::<Vec<_>>(), original_first10);
+
+    let last10 = oplog
+        .read_many(oplog.current_oplog_index().await.subtract(10).next(), 10)
+        .await
+        .into_values()
+        .collect::<Vec<_>>();
+
+    let original_last10 = entries.into_iter().rev().take(10).rev().collect::<Vec<_>>();
+    assert_eq!(last10, original_last10);
 }
 
 #[test]
@@ -1069,7 +949,7 @@ async fn read_initial_from_archive_impl(use_blob: bool) {
     let owned_worker_id = OwnedWorkerId::new(&project_id, &worker_id);
 
     let timestamp = Timestamp::now_utc();
-    let create_entry = rounded(OplogEntry::Create {
+    let create_entry = OplogEntry::Create {
         timestamp,
         worker_id: WorkerId {
             component_id: ComponentId(Uuid::new_v4()),
@@ -1087,7 +967,8 @@ async fn read_initial_from_archive_impl(use_blob: bool) {
         component_size: 0,
         initial_total_linear_memory_size: 0,
         initial_active_plugins: HashSet::new(),
-    });
+    }
+    .rounded();
 
     let oplog = oplog_service
         .create(
@@ -1095,7 +976,7 @@ async fn read_initial_from_archive_impl(use_blob: bool) {
             create_entry.clone(),
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
 
@@ -1222,7 +1103,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
     info!("FIRST OPEN DONE");
@@ -1230,11 +1111,12 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
     let timestamp = Timestamp::now_utc();
     let entries: Vec<OplogEntry> = (0..100)
         .map(|i| {
-            rounded(OplogEntry::Error {
+            OplogEntry::Error {
                 timestamp,
                 error: WorkerError::Unknown(i.to_string()),
                 retry_from: OplogIndex::NONE,
-            })
+            }
+            .rounded()
         })
         .collect();
 
@@ -1252,7 +1134,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -1274,7 +1156,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
                 last_oplog_index,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await
     } else if reopen == Reopen::Full {
@@ -1296,7 +1178,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
                 last_oplog_index,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await
     } else {
@@ -1305,11 +1187,12 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
 
     let entries: Vec<OplogEntry> = (100..1000)
         .map(|i| {
-            rounded(OplogEntry::Error {
+            OplogEntry::Error {
                 timestamp,
                 error: WorkerError::Unknown(i.to_string()),
                 retry_from: OplogIndex::NONE,
-            })
+            }
+            .rounded()
         })
         .collect();
 
@@ -1328,7 +1211,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -1350,7 +1233,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
                 last_oplog_index,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await
     } else if reopen == Reopen::Full {
@@ -1372,7 +1255,7 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
                 last_oplog_index,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await
     } else {
@@ -1380,11 +1263,14 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
     };
 
     oplog
-        .add(rounded(OplogEntry::Error {
-            timestamp,
-            error: WorkerError::Unknown("last".to_string()),
-            retry_from: OplogIndex::NONE,
-        }))
+        .add(
+            OplogEntry::Error {
+                timestamp,
+                error: WorkerError::Unknown("last".to_string()),
+                retry_from: OplogIndex::NONE,
+            }
+            .rounded(),
+        )
         .await;
     oplog.commit(CommitLevel::Always).await;
     drop(oplog);
@@ -1409,35 +1295,39 @@ async fn write_after_archive_impl(use_blob: bool, reopen: Reopen) {
 
     assert_eq!(
         entry1.get(&OplogIndex::INITIAL).unwrap().clone(),
-        rounded(OplogEntry::Error {
+        OplogEntry::Error {
             timestamp,
             error: WorkerError::Unknown("0".to_string()),
             retry_from: OplogIndex::NONE,
-        })
+        }
+        .rounded()
     );
     assert_eq!(
         entry2.get(&OplogIndex::from_u64(100)).unwrap().clone(),
-        rounded(OplogEntry::Error {
+        OplogEntry::Error {
             timestamp,
             error: WorkerError::Unknown("99".to_string()),
             retry_from: OplogIndex::NONE,
-        })
+        }
+        .rounded()
     );
     assert_eq!(
         entry3.get(&OplogIndex::from_u64(1000)).unwrap().clone(),
-        rounded(OplogEntry::Error {
+        OplogEntry::Error {
             timestamp,
             error: WorkerError::Unknown("999".to_string()),
             retry_from: OplogIndex::NONE,
-        })
+        }
+        .rounded()
     );
     assert_eq!(
         entry4.get(&OplogIndex::from_u64(1001)).unwrap().clone(),
-        rounded(OplogEntry::Error {
+        OplogEntry::Error {
             timestamp,
             error: WorkerError::Unknown("last".to_string()),
             retry_from: OplogIndex::NONE,
-        })
+        }
+        .rounded()
     );
 }
 
@@ -1496,7 +1386,7 @@ async fn empty_layer_gets_deleted_impl(use_blob: bool) {
             last_oplog_index,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await;
 
@@ -1508,11 +1398,12 @@ async fn empty_layer_gets_deleted_impl(use_blob: bool) {
         let timestamp = Timestamp::now_utc();
         let entries: Vec<OplogEntry> = (0..100)
             .map(|i| {
-                rounded(OplogEntry::Error {
+                OplogEntry::Error {
                     timestamp,
                     error: WorkerError::Unknown(i.to_string()),
                     retry_from: OplogIndex::NONE,
-                })
+                }
+                .rounded()
             })
             .collect();
 
@@ -1535,7 +1426,7 @@ async fn empty_layer_gets_deleted_impl(use_blob: bool) {
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -1607,11 +1498,12 @@ async fn scheduled_archive_impl(use_blob: bool) {
     let timestamp = Timestamp::now_utc();
     let entries: Vec<OplogEntry> = (0..100)
         .map(|i| {
-            rounded(OplogEntry::Error {
+            OplogEntry::Error {
                 timestamp,
                 error: WorkerError::Unknown(i.to_string()),
                 retry_from: OplogIndex::NONE,
-            })
+            }
+            .rounded()
         })
         .collect();
 
@@ -1624,7 +1516,7 @@ async fn scheduled_archive_impl(use_blob: bool) {
                 last_oplog_index,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await;
         for entry in &entries {
@@ -1647,7 +1539,7 @@ async fn scheduled_archive_impl(use_blob: bool) {
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -1677,7 +1569,7 @@ async fn scheduled_archive_impl(use_blob: bool) {
                 last_oplog_index,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await;
         let result = MultiLayerOplog::try_archive(&oplog).await;
@@ -1693,7 +1585,7 @@ async fn scheduled_archive_impl(use_blob: bool) {
             primary_oplog_service.get_last_index(&owned_worker_id).await,
             WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
             default_last_known_status(),
-            default_execution_status(ComponentType::Durable),
+            default_execution_status(AgentMode::Durable),
         )
         .await
         .length()
@@ -1754,13 +1646,13 @@ async fn multilayer_scan_for_component(_tracing: &Tracing) {
             1,
             Vec::new(),
             Vec::new(),
-            BTreeMap::new(),
             project_id.clone(),
             account_id.clone(),
             None,
             100,
             100,
             HashSet::new(),
+            BTreeMap::new(),
         );
 
         let owned_worker_id = OwnedWorkerId::new(&project_id, &worker_id);
@@ -1770,7 +1662,7 @@ async fn multilayer_scan_for_component(_tracing: &Tracing) {
                 create_entry,
                 WorkerMetadata::default(worker_id.clone(), account_id.clone(), project_id.clone()),
                 default_last_known_status(),
-                default_execution_status(ComponentType::Durable),
+                default_execution_status(AgentMode::Durable),
             )
             .await;
 

@@ -20,11 +20,10 @@ use golem_common::model::agent::wit_naming::ToWitNaming;
 use golem_common::model::agent::{AgentType, DataSchema, ElementSchema, NamedElementSchemas};
 use heck::{ToKebabCase, ToLowerCamelCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use moonbit_component_generator::{
-    to_moonbit_ident, MoonBitComponent, MoonBitPackage, Warning, WarningControl,
+    to_moonbit_ident, MoonBitComponent, MoonBitPackage, PackageName, Warning, WarningControl,
 };
 use std::fmt::Write;
 use std::path::Path;
-use wit_parser::PackageName;
 
 pub fn generate_moonbit_wrapper(
     ctx: AgentWrapperGeneratorContext,
@@ -1581,6 +1580,26 @@ mod tests {
     pub fn multimodal_untagged_variant_in_out() {
         let component_name = "example:bug".into();
         let agent_types = test::multimodal_untagged_variant_in_out();
+        let ctx = generate_agent_wrapper_wit(&component_name, &agent_types).unwrap();
+
+        let target = NamedTempFile::new().unwrap();
+        generate_moonbit_wrapper(ctx, target.path()).unwrap();
+    }
+
+    #[test]
+    pub fn char_type() {
+        let component_name = "example:bug".into();
+        let agent_types = test::char_type();
+        let ctx = generate_agent_wrapper_wit(&component_name, &agent_types).unwrap();
+
+        let target = NamedTempFile::new().unwrap();
+        generate_moonbit_wrapper(ctx, target.path()).unwrap();
+    }
+
+    #[test]
+    pub fn unit_result_type() {
+        let component_name = "example:bug".into();
+        let agent_types = test::unit_result_type();
         let ctx = generate_agent_wrapper_wit(&component_name, &agent_types).unwrap();
 
         let target = NamedTempFile::new().unwrap();

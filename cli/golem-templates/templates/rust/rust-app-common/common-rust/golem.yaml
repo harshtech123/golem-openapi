@@ -20,7 +20,7 @@ templates:
         sourceWit: .wit/wit
         generatedWit: ../../golem-temp/agents/{{ component_name | to_snake_case }}/wit-generated
         componentWasm: ../../golem-temp/agents/{{ component_name | to_snake_case }}_debug.static.wasm
-        linkedWasm: ../../golem-temp/components/{{ component_name | to_snake_case }}_debug.wasm
+        linkedWasm: ../../golem-temp/agents/{{ component_name | to_snake_case }}_debug.wasm
         clean:
         - src/bindings.rs
       release:
@@ -39,8 +39,8 @@ templates:
           to: ../../golem-temp/agents/{{ component_name | to_snake_case }}_release.static.wasm
         sourceWit: .wit/wit
         generatedWit: ../../golem-temp/agents/{{ component_name | to_snake_case }}/wit-generated
-        componentWasm: ./../golem-temp/agents/{{ component_name | to_snake_case }}_release.static.wasm
-        linkedWasm: ../../golem-temp/components/{{ component_name | to_snake_case }}_release.wasm
+        componentWasm: ../../golem-temp/agents/{{ component_name | to_snake_case }}_release.static.wasm
+        linkedWasm: ../../golem-temp/agents/{{ component_name | to_snake_case }}_release.wasm
         clean:
         - src/bindings.rs
     defaultProfile: debug

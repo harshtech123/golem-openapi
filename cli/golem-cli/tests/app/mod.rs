@@ -65,6 +65,7 @@ mod cmd {
     pub static COMPONENT: &str = "component";
     pub static DEPLOY: &str = "deploy";
     pub static GET: &str = "get";
+    pub static LIST: &str = "list";
     pub static INVOKE: &str = "invoke";
     pub static NEW: &str = "new";
     pub static PLUGIN: &str = "plugin";
@@ -465,7 +466,7 @@ impl TestContext {
                     security_token: Security::Empty,
                 },
             };
-            let timeout = Duration::from_secs(2);
+            let timeout = Duration::from_secs(10);
             let sleep_interval = Duration::from_millis(100);
             loop {
                 match client.healthcheck().await {

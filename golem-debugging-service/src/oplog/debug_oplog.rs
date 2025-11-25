@@ -14,8 +14,9 @@
 
 use crate::debug_session::{DebugSessionId, DebugSessions};
 use async_trait::async_trait;
-use bytes::Bytes;
-use golem_common::model::oplog::{OplogEntry, OplogIndex, OplogPayload, PersistenceLevel};
+use golem_common::model::oplog::{
+    OplogEntry, OplogIndex, PayloadId, PersistenceLevel, RawOplogPayload,
+};
 use golem_worker_executor::services::oplog::{CommitLevel, Oplog};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -116,8 +117,12 @@ impl Oplog for DebugOplog {
             .get(&self.oplog_state.debug_session_id)
             .await
             .expect("Internal Error. Read failed. Debug session not found");
-
         let playback_overrides = debug_session_data.playback_overrides.clone();
+
+        self.oplog_state
+            .debug_session
+            .update_oplog_index(&self.oplog_state.debug_session_id, oplog_index)
+            .await;
 
         Self::get_oplog_entry_applying_overrides(
             playback_overrides.overrides,
@@ -127,16 +132,30 @@ impl Oplog for DebugOplog {
         .await
     }
 
+    async fn read_many(&self, oplog_index: OplogIndex, n: u64) -> BTreeMap<OplogIndex, OplogEntry> {
+        let mut result = BTreeMap::new();
+        let mut current = oplog_index;
+        for _ in 0..n {
+            result.insert(current, self.read(current).await);
+            current = current.next();
+        }
+        result
+    }
+
     async fn length(&self) -> u64 {
         self.inner.length().await
     }
 
-    async fn upload_payload(&self, data: &[u8]) -> Result<OplogPayload, String> {
-        Ok(OplogPayload::Inline(data.to_vec()))
+    async fn upload_raw_payload(&self, data: Vec<u8>) -> Result<RawOplogPayload, String> {
+        self.inner.upload_raw_payload(data).await
     }
 
-    async fn download_payload(&self, payload: &OplogPayload) -> Result<Bytes, String> {
-        self.inner.download_payload(payload).await
+    async fn download_raw_payload(
+        &self,
+        payload_id: PayloadId,
+        md5_hash: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        self.inner.download_raw_payload(payload_id, md5_hash).await
     }
 
     async fn switch_persistence_level(&self, mode: PersistenceLevel) {

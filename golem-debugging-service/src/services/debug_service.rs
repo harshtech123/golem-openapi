@@ -589,7 +589,7 @@ impl DebugService for DebugServiceDefault {
             .await;
 
         self.debug_session
-            .update_oplog_index(debug_session_id.clone(), OplogIndex::NONE)
+            .update_oplog_index(&debug_session_id, OplogIndex::NONE)
             .await;
 
         // we restart regardless of the current status of the worker such that it restarts
@@ -690,8 +690,7 @@ impl DebugService for DebugServiceDefault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use golem_common::model::oplog::{OplogEntry, OplogPayload};
+    use golem_common::model::oplog::{OplogEntry, OplogPayload, PayloadId, RawOplogPayload};
     use golem_common::model::oplog::{OplogIndex, PersistenceLevel};
     use golem_common::model::Timestamp;
     use golem_worker_executor::services::oplog::CommitLevel;
@@ -778,7 +777,7 @@ mod tests {
             if oplog_index == OplogIndex::from_u64(self.invocation_completion_index) {
                 OplogEntry::ExportedFunctionCompleted {
                     timestamp: Timestamp::now_utc(),
-                    response: OplogPayload::Inline(Bytes::new().into()),
+                    response: OplogPayload::Inline(Box::new(None)),
                     consumed_fuel: 0,
                 }
             } else {
@@ -789,15 +788,33 @@ mod tests {
             }
         }
 
+        async fn read_many(
+            &self,
+            oplog_index: OplogIndex,
+            n: u64,
+        ) -> BTreeMap<OplogIndex, OplogEntry> {
+            let mut result = BTreeMap::new();
+            let mut current = oplog_index;
+            for _ in 0..n {
+                result.insert(current, self.read(current).await);
+                current = current.next();
+            }
+            result
+        }
+
         async fn length(&self) -> u64 {
             unimplemented!()
         }
 
-        async fn upload_payload(&self, _data: &[u8]) -> Result<OplogPayload, String> {
+        async fn upload_raw_payload(&self, _data: Vec<u8>) -> Result<RawOplogPayload, String> {
             unimplemented!()
         }
 
-        async fn download_payload(&self, _payload: &OplogPayload) -> Result<Bytes, String> {
+        async fn download_raw_payload(
+            &self,
+            _payload_id: PayloadId,
+            _md5_hash: Vec<u8>,
+        ) -> Result<Vec<u8>, String> {
             unimplemented!()
         }
 

@@ -111,7 +111,7 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
     async fn run_and_assert(ctx: &TestContext, func: &str, args: &[&str]) {
         let uuid = Uuid::new_v4().to_string();
 
-        let agent_constructor = format!("rust:agent/bar-agent(some(\"{uuid}\"))");
+        let agent_constructor = format!("rust:agent/foo-agent(some(\"{uuid}\"))");
 
         let mut cmd = vec![flag::YES, cmd::AGENT, cmd::INVOKE, &agent_constructor, func];
         cmd.extend_from_slice(args);
@@ -120,9 +120,28 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
         assert!(outputs.success(), "function {func} failed");
     }
 
-    run_and_assert(&ctx, "get-agent-id", &[]).await;
+    run_and_assert(&ctx, "get-id", &[]).await;
 
-    run_and_assert(&ctx, "fun-string", &["\"sample\""]).await;
+    run_and_assert(&ctx, "rust:agent/foo-agent.{fun-string}", &["\"sample\""]).await;
+
+    // A char type
+    run_and_assert(&ctx, "fun-char", &[r#"'a'"#]).await;
+
+    // Testing trigger invocation
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-string-fire-and-forget}",
+        &["\"sample\""],
+    )
+    .await;
+
+    // Testing scheduled invocation
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-string-later}",
+        &["\"sample\""],
+    )
+    .await;
 
     run_and_assert(&ctx, "fun-u8", &["42"]).await;
 
@@ -159,6 +178,7 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
         f32v: 3.14,
         f64v: 3.1415926535,
         boolv: true,
+        charv: 'a',
         stringv: "sample"
     }
     "#;
@@ -167,10 +187,26 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
 
     run_and_assert(&ctx, "fun-tuple-simple", &[r#"("sample", 3.14, true)"#]).await;
 
+    run_and_assert(
+        &ctx,
+        "fun-tuple-complex",
+        &[&format!("(\"sample\", 3.14, {all_primitives_arg}, true)")],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "fun-map",
+        &[r#"[("foo", 1), ("bar", 2), ("baz", 3)]"#],
+    )
+    .await;
+
     let collections_arg = r#"
     {
         list-u8: [1, 2, 3, 4, 5],
         list-str: ["foo", "bar", "baz"],
+        map-num: [("pi", 3.14), ("e", 2.71), ("phi", 1.61)],
+        map-text: [(1, "one"), (2, "two"), (3, "three")]
     }
     "#;
 
@@ -181,6 +217,7 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
         name: "test",
         value: 3.14,
         flag: true,
+        symbol: 't',
     }
     "#;
 
@@ -193,19 +230,23 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
             name: "inner",
             value: 2.71,
             flag: false,
+            symbol: 'i',
         },
         list: [
             {
                 name: "list1",
                 value: 1.61,
                 flag: true,
+                symbol: 'l',
             },
             {
                 name: "list2",
                 value: 0.577,
                 flag: false,
+                symbol: 'm',
             }
         ],
+        map: [("a", 1), ("b", 2)],
         option: some("optional value"),
         result: ok("result value")
     }
@@ -227,6 +268,7 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
             f32v: 1.1,
             f64v: 2.2,
             boolv: true,
+            charv: 'c',
             stringv: "complex"
         },
         options-results-bounds: {
@@ -246,12 +288,15 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
         },
         collections: {
             list-u8: [10, 20, 30],
-            list-str: ["x", "y", "z"]
+            list-str: ["x", "y", "z"],
+            map-num: [("a", 1.11), ("b", 2.22), ("c", 3.33)],
+            map-text: [(100, "hundred"), (200, "two hundred"), (300, "three hundred")]
         },
         simple-struct: {
             name: "comp_simple",
             value: 5.55,
             flag: false,
+            symbol: 's',
         },
         nested-struct: {
             id: "comp_nested",
@@ -259,8 +304,10 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
                 name: "comp_inner",
                 value: 6.66,
                 flag: true,
+                symbol: 'i',
             },
             list: [],
+            map: [],
             option: none,
             result: ok("nested result")
         },
@@ -277,25 +324,22 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
     // cli invoke gets confused with `fun-result` and `fun-result-unit-left` etc, and therefore fully qualified function name.
     run_and_assert(
         &ctx,
-        "rust:agent/bar-agent.{fun-result}",
+        "rust:agent/foo-agent.{fun-result}",
         &["ok(\"success\")"],
     )
     .await;
     run_and_assert(
         &ctx,
-        "rust:agent/bar-agent.{fun-result}",
+        "rust:agent/foo-agent.{fun-result}",
         &["err(\"failed\")"],
     )
     .await;
 
-    // TODO; Uncomment after fixing https://github.com/golemcloud/golem/issues/2274
-    // run_and_assert(&ctx, "r4ust:agent/bar-agent.{fun-result-unit-ok}", &["ok"]).await;
+    run_and_assert(&ctx, "rust:agent/foo-agent.{fun-result-unit-ok}", &["ok"]).await;
 
-    // TODO; Uncomment after fixing https://github.com/golemcloud/golem/issues/2274
-    //run_and_assert(&ctx, "rust:agent/bar-agent.{fun-result-unit-err}", &["err"]).await;
+    run_and_assert(&ctx, "rust:agent/foo-agent.{fun-result-unit-err}", &["err"]).await;
 
-    // TODO; Uncomment after fixing https://github.com/golemcloud/golem/issues/2279
-    // run_and_assert(&ctx, "rust:agent/bar-agent.{fun-result-unit-both}", &["ok"]).await;
+    run_and_assert(&ctx, "rust:agent/foo-agent.{fun-result-unit-both}", &["ok"]).await;
 
     let result_complex_arg = r#"
     ok({
@@ -304,8 +348,10 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
             name: "res_inner",
             value: 7.77,
             flag: false,
+            symbol: 'r',
         },
         list: [],
+        map: [],
         option: none,
         result: ok("result in nested")
     })
@@ -315,7 +361,7 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
 
     run_and_assert(
         &ctx,
-        "rust:agent/bar-agent.{fun-option}",
+        "rust:agent/foo-agent.{fun-option}",
         &["some(\"optional value\")"],
     )
     .await;
@@ -327,8 +373,10 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
             name: "opt_inner",
             value: 8.88,
             flag: true,
+            symbol: 'o',
         },
         list: [],
+        map: [],
         option: none,
         result: err("error in nested")
     })
@@ -336,12 +384,54 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
 
     run_and_assert(
         &ctx,
-        "rust:agent/bar-agent.{fun-option-complex}",
+        "rust:agent/foo-agent.{fun-option-complex}",
         &[option_complex_arg],
     )
     .await;
 
     run_and_assert(&ctx, "fun-enum-with-only-literals", &["a"]).await;
+
+    run_and_assert(
+        &ctx,
+        "fun-multi-modal",
+        &[r#"[text("foo"), text("foo"), data({id: 1, name: "foo"})]"#],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-unstructured-text}",
+        &[r#"url("foo")"#],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-unstructured-text}",
+        &[r#"inline({data: "foo", text-type: none})"#],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-unstructured-text-lc}",
+        &[r#"url("foo")"#],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-unstructured-text-lc}",
+        &[r#"inline({data: "foo", text-type: some({language-code: "en"})})"#],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-unstructured-binary}",
+        &[r#"url("foo")"#],
+    )
+    .await;
 }
 
 #[test]
@@ -382,7 +472,7 @@ async fn test_ts_counter() {
 // (post type extraction). This test ensures such issues are caught automatically
 // and act as a regression-test.
 #[test]
-async fn test_ts_code_first_complex() {
+async fn test_ts_code_first_with_rpc_and_all_types() {
     let mut ctx = TestContext::new();
 
     let app_name = "ts-code-first";

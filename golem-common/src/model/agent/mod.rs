@@ -42,16 +42,73 @@ use crate::model::component_metadata::ComponentMetadata;
 use crate::model::ComponentId;
 use async_trait::async_trait;
 use base64::Engine;
-use bincode::{Decode, Encode};
+use desert_rust::BinaryCodec;
 use golem_wasm::analysis::analysed_type::{case, str, tuple, variant};
 use golem_wasm::analysis::AnalysedType;
-use golem_wasm::{parse_value_and_type, print_value_and_type, IntoValue, Value, ValueAndType};
+use golem_wasm::{
+    parse_value_and_type, print_value_and_type, IntoValue, IntoValueAndType, Value, ValueAndType,
+};
 use golem_wasm_derive::{FromValue, IntoValue};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
-// NOTE: The primary reason for duplicating the model with handwritten Rust types is to avoid the need
-// to work with WitValue and WitType directly in the application code. Instead, we are converting them
-// to Value and AnalysedType which are much more ergonomic to work with.
+use std::str::FromStr;
+use std::sync::LazyLock;
+use uuid::Uuid;
+
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    BinaryCodec,
+    Serialize,
+    Deserialize,
+    IntoValue,
+    FromValue,
+    poem_openapi::Enum,
+)]
+#[repr(i32)]
+pub enum AgentMode {
+    Durable = 0,
+    Ephemeral = 1,
+}
+
+impl TryFrom<i32> for AgentMode {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AgentMode::Durable),
+            1 => Ok(AgentMode::Ephemeral),
+            _ => Err(format!("Unknown AgentMode: {value}")),
+        }
+    }
+}
+
+impl Display for AgentMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            AgentMode::Durable => "Durable",
+            AgentMode::Ephemeral => "Ephemeral",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for AgentMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Durable" => Ok(AgentMode::Durable),
+            "Ephemeral" => Ok(AgentMode::Ephemeral),
+            _ => Err(format!("Unknown AgentMode: {s}")),
+        }
+    }
+}
 
 #[derive(
     Debug,
@@ -60,12 +117,12 @@ use std::fmt::{Display, Formatter};
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConstructor {
@@ -82,12 +139,12 @@ pub struct AgentConstructor {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDependency {
@@ -97,7 +154,7 @@ pub struct AgentDependency {
     pub methods: Vec<AgentMethod>,
 }
 
-#[derive(Debug, Clone, Encode, Decode, IntoValue)]
+#[derive(Debug, Clone, BinaryCodec, IntoValue)]
 pub enum AgentError {
     InvalidInput(String),
     InvalidMethod(String),
@@ -139,12 +196,12 @@ impl Display for AgentError {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMethod {
@@ -162,12 +219,12 @@ pub struct AgentMethod {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentType {
@@ -176,6 +233,7 @@ pub struct AgentType {
     pub constructor: AgentConstructor,
     pub methods: Vec<AgentMethod>,
     pub dependencies: Vec<AgentDependency>,
+    pub mode: AgentMode,
 }
 
 impl AgentType {
@@ -191,12 +249,12 @@ impl AgentType {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryDescriptor {
@@ -209,14 +267,14 @@ pub struct BinaryDescriptor {
     PartialEq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Union,
 )]
 #[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
+#[desert(evolution())]
 pub enum BinaryReference {
     Url(Url),
     Inline(BinarySource),
@@ -237,12 +295,12 @@ impl Display for BinaryReference {
     PartialEq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct BinarySource {
@@ -268,12 +326,12 @@ impl Display for BinarySource {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryType {
@@ -287,12 +345,12 @@ pub struct BinaryType {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct NamedElementSchema {
@@ -307,12 +365,12 @@ pub struct NamedElementSchema {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct NamedElementSchemas {
@@ -334,14 +392,14 @@ impl NamedElementSchemas {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Union,
 )]
 #[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
+#[desert(evolution())]
 pub enum DataSchema {
     Tuple(NamedElementSchemas),
     Multimodal(NamedElementSchemas),
@@ -356,9 +414,10 @@ impl DataSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode, poem_openapi::Union)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, BinaryCodec, poem_openapi::Union)]
 #[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
+#[desert(evolution())]
 pub enum DataValue {
     Tuple(ElementValues),
     Multimodal(NamedElementValues),
@@ -501,8 +560,9 @@ impl IntoValue for DataValue {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode, IntoValue, poem_openapi::Object,
+    Debug, Clone, PartialEq, Serialize, Deserialize, BinaryCodec, IntoValue, poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct ElementValues {
@@ -524,8 +584,9 @@ impl Display for ElementValues {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode, IntoValue, poem_openapi::Object,
+    Debug, Clone, PartialEq, Serialize, Deserialize, BinaryCodec, IntoValue, poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct NamedElementValues {
@@ -546,7 +607,8 @@ impl Display for NamedElementValues {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode, poem_openapi::Object)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, BinaryCodec, poem_openapi::Object)]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct NamedElementValue {
@@ -571,10 +633,11 @@ impl IntoValue for NamedElementValue {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode, IntoValue, poem_openapi::Union,
+    Debug, Clone, PartialEq, Serialize, Deserialize, BinaryCodec, IntoValue, poem_openapi::Union,
 )]
 #[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
+#[desert(evolution())]
 pub enum ElementValue {
     ComponentModel(#[wit_field(convert = golem_wasm::WitValue)] ValueAndType),
     UnstructuredText(TextReference),
@@ -591,9 +654,14 @@ impl ElementValue {
             }
             ElementSchema::UnstructuredText(_) => {
                 if s.starts_with('"') && s.ends_with('"') {
+                    let string_value = parse_value_and_type(&str(), s)?;
+                    let data = match string_value.value {
+                        Value::String(data) => data,
+                        _ => unreachable!(),
+                    };
                     Ok(ElementValue::UnstructuredText(TextReference::Inline(
                         TextSource {
-                            data: s[1..s.len() - 1].to_string(),
+                            data,
                             text_type: None,
                         },
                     )))
@@ -601,10 +669,14 @@ impl ElementValue {
                     if let Some((prefix, rest)) = s.split_once(']') {
                         if rest.starts_with('"') && rest.ends_with('"') {
                             let language_code = &prefix[1..];
-                            let data = &rest[1..rest.len() - 1];
+                            let string_value = parse_value_and_type(&str(), rest)?;
+                            let data = match string_value.value {
+                                Value::String(data) => data,
+                                _ => unreachable!(),
+                            };
                             Ok(ElementValue::UnstructuredText(TextReference::Inline(
                                 TextSource {
-                                    data: data.to_string(),
+                                    data,
                                     text_type: Some(TextType {
                                         language_code: language_code.to_string(),
                                     }),
@@ -681,14 +753,14 @@ impl Display for ElementValue {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Union,
 )]
 #[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
+#[desert(evolution())]
 pub enum ElementSchema {
     ComponentModel(ComponentModelElementSchema),
     UnstructuredText(TextDescriptor),
@@ -702,12 +774,12 @@ pub enum ElementSchema {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentModelElementSchema {
@@ -721,12 +793,12 @@ pub struct ComponentModelElementSchema {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct TextDescriptor {
@@ -739,14 +811,14 @@ pub struct TextDescriptor {
     PartialEq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Union,
 )]
 #[oai(discriminator_name = "type", one_of = true)]
 #[serde(tag = "type")]
+#[desert(evolution())]
 pub enum TextReference {
     Url(Url),
     Inline(TextSource),
@@ -756,7 +828,9 @@ impl Display for TextReference {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             TextReference::Url(url) => write!(f, "{url}"),
-            TextReference::Inline(text_source) => write!(f, "{text_source}"),
+            TextReference::Inline(text_source) => {
+                write!(f, "{text_source}")
+            }
         }
     }
 }
@@ -767,12 +841,12 @@ impl Display for TextReference {
     PartialEq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct Url {
@@ -791,12 +865,12 @@ impl Display for Url {
     PartialEq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct TextSource {
@@ -806,9 +880,11 @@ pub struct TextSource {
 
 impl Display for TextSource {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let encoded_data = print_value_and_type(&self.data.clone().into_value_and_type())
+            .unwrap_or_else(|_| self.data.clone());
         match &self.text_type {
-            None => write!(f, "\"{}\"", self.data),
-            Some(text_type) => write!(f, "[{}]\"{}\"", text_type.language_code, self.data),
+            None => write!(f, "{}", encoded_data),
+            Some(text_type) => write!(f, "[{}]{}", text_type.language_code, encoded_data),
         }
     }
 }
@@ -820,12 +896,12 @@ impl Display for TextSource {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct TextType {
@@ -839,12 +915,12 @@ pub struct TextType {
     Eq,
     Serialize,
     Deserialize,
-    Encode,
-    Decode,
+    BinaryCodec,
     IntoValue,
     FromValue,
     poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTypes {
@@ -852,8 +928,17 @@ pub struct AgentTypes {
 }
 
 #[derive(
-    Debug, Clone, Encode, Decode, Serialize, Deserialize, IntoValue, FromValue, poem_openapi::Object,
+    Debug,
+    Clone,
+    PartialEq,
+    BinaryCodec,
+    Serialize,
+    Deserialize,
+    IntoValue,
+    FromValue,
+    poem_openapi::Object,
 )]
+#[desert(evolution())]
 #[oai(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub struct RegisteredAgentType {
@@ -868,15 +953,17 @@ pub struct RegisteredAgentType {
 pub struct AgentId {
     pub agent_type: String,
     pub parameters: DataValue,
+    pub phantom_id: Option<Uuid>,
     wrapper_agent_type: String,
 }
 
 impl AgentId {
-    pub fn new(agent_type: String, parameters: DataValue) -> Self {
+    pub fn new(agent_type: String, parameters: DataValue, phantom_id: Option<Uuid>) -> Self {
         let wrapper_agent_type = agent_type.to_wit_naming();
         Self {
             agent_type,
             parameters,
+            phantom_id,
             wrapper_agent_type,
         }
     }
@@ -889,30 +976,36 @@ impl AgentId {
         s: impl AsRef<str>,
         resolver: impl AgentTypeResolver,
     ) -> Result<(Self, AgentType), String> {
+        static AGENT_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^([^(]+)\((.*)\)(?:\[([^\]]+)\])?$").expect("Invalid agent ID regex")
+        });
+
         let s = s.as_ref();
 
-        if let Some((agent_type, param_list)) = s.split_once('(') {
-            if let Some(param_list) = param_list.strip_suffix(')') {
-                let agent_type = resolver.resolve_agent_type_by_wrapper_name(agent_type)?;
-                let value = DataValue::parse(param_list, &agent_type.constructor.input_schema)?;
-                Ok((
-                    AgentId {
-                        agent_type: agent_type.type_name.clone(),
-                        wrapper_agent_type: agent_type.type_name.to_wit_naming(),
-                        parameters: value,
-                    },
-                    agent_type,
-                ))
-            } else {
-                Err(format!(
-                    "Unexpected agent-id format - missing closing ')', got: {s}"
-                ))
-            }
-        } else {
-            Err(format!(
-                "Unexpected agent-id format - must be 'agent-type(...)', got: {s}"
-            ))
-        }
+        let captures = AGENT_ID_REGEX.captures(s).ok_or_else(|| {
+            format!("Unexpected agent-id format - must be 'agent-type(...)' or 'agent-type(...)[uuid]', got: {s}")
+        })?;
+
+        let agent_type_name = captures.get(1).unwrap().as_str();
+        let param_list = captures.get(2).unwrap().as_str();
+        let phantom_id = captures
+            .get(3)
+            .map(|m| Uuid::parse_str(m.as_str()))
+            .transpose()
+            .map_err(|e| format!("Invalid UUID in phantom ID: {e}"))?;
+
+        let agent_type = resolver.resolve_agent_type_by_wrapper_name(agent_type_name)?;
+        let value = DataValue::parse(param_list, &agent_type.constructor.input_schema)?;
+
+        Ok((
+            AgentId {
+                agent_type: agent_type.type_name.clone(),
+                wrapper_agent_type: agent_type.type_name.to_wit_naming(),
+                parameters: value,
+                phantom_id,
+            },
+            agent_type,
+        ))
     }
 
     pub fn wrapper_agent_type(&self) -> &str {
@@ -927,7 +1020,11 @@ impl Display for AgentId {
             "{}({})",
             self.wrapper_agent_type,
             self.parameters.to_compact_string()
-        )
+        )?;
+        if let Some(phantom_id) = &self.phantom_id {
+            write!(f, "[{phantom_id}]")?;
+        }
+        Ok(())
     }
 }
 
