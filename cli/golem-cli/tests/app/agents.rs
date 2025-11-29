@@ -31,7 +31,7 @@ async fn test_rust_counter() {
             flag::YES,
             cmd::AGENT,
             cmd::INVOKE,
-            &format!("app:counter/counter({{ id: \"{uuid}\" }})"),
+            &format!("app:counter/counter-agent(\"{uuid}\")"),
             "increment",
         ])
         .await;
@@ -393,8 +393,15 @@ async fn test_rust_code_first_with_rpc_and_all_types() {
 
     run_and_assert(
         &ctx,
-        "fun-multi-modal",
+        "rust:agent/foo-agent.{fun-multi-modal}",
         &[r#"[text("foo"), text("foo"), data({id: 1, name: "foo"})]"#],
+    )
+    .await;
+
+    run_and_assert(
+        &ctx,
+        "rust:agent/foo-agent.{fun-multi-modal-basic}",
+        &[r#"[text(url("foo"))]"#],
     )
     .await;
 
@@ -613,7 +620,7 @@ async fn test_ts_code_first_with_rpc_and_all_types() {
     run_and_assert(&ctx, "fun-unstructured-binary", &["url(\"foo\")"]).await;
 
     // Multimodal
-    run_and_assert(&ctx, "fun-multimodal", &["[input-text({val: \"foo\"})]"]).await;
+    run_and_assert(&ctx, "fun-multimodal", &["[text(\"foo\")]"]).await;
 
     // Union that has only literals
     run_and_assert(&ctx, "fun-union-with-only-literals", &["bar"]).await;
